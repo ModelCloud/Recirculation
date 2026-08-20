@@ -12,7 +12,8 @@ license = {text = "Apache-2.0"}
 dependencies = ["torch>=2.1"]
 
 [project.optional-dependencies]
-eval = ["datasets>=2.18", "pyyaml>=6", "transformers>=4.45"]
+eval = ["datasets>=2.18", "pyyaml>=6", "transformers>=5.0"]
+mlx = ["mlx>=0.31.2", "mlx-lm>=0.31.3"]
 dev = ["pytest>=8", "ruff>=0.6"]
 
 [tool.pytest.ini_options]

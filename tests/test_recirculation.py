@@ -6,6 +6,29 @@ from torch import nn
 from recirculation import RecirculationConfig, RecirculationController
 
 
+def test_mlx_forward_error_gate_accepts_exact_and_rejects_excess_error():
+    mx = __import__("mlx.core", fromlist=["core"])
+    from recirculation.mlx_backend import measure_forward_error
+
+    reference = mx.array([1.0, 2.0, 3.0])
+    exact = measure_forward_error(reference, reference)
+    exact.require()
+    excessive = measure_forward_error(reference, reference + 0.01)
+    with __import__("pytest").raises(RuntimeError, match="exceeds limit"):
+        excessive.require()
+
+
+def test_mlx_reference_mixture_matches_published_norm_ratio_equation():
+    mx = __import__("mlx.core", fromlist=["core"])
+    from recirculation.mlx_backend import mix_reference
+
+    destination = mx.array([[[3.0, 4.0]]])
+    source = mx.array([[[0.0, 2.0]]])
+    config = RecirculationConfig(source_layer=2, destination_layer=0, alpha=0.1)
+    mixed = mix_reference(destination, source, config)
+    assert mx.allclose(mixed, mx.array([[[2.7, 4.1]]])).item()
+
+
 class _BiasLayer(nn.Module):
     def __init__(self, value: float):
         super().__init__()

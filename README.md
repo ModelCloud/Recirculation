@@ -92,6 +92,16 @@ python scripts/sweep_gsm8k.py \
 The controller currently supports batch size 1 and the one-path, one-iteration variant. Adaptive alpha, multiple paths,
 and multiple recirculation iterations are outside this reproduction.
 
+## MLX optimization policy
+
+`recirculation.mlx_backend.MLXRecirculator` is the exact MLX-LM reference path. It walks a loaded decoder one token at
+a time, updates the ordinary per-layer KV caches, mixes the previous token's source after the destination block, and
+retains the current source for the next token.
+
+Every optimized forward must be compared against this unfused reference over the full accumulated sequence. The gate
+is `max(relative L2 error, normalized maximum error) <= 2e-3`. A faster result that exceeds this limit must not be
+promoted or documented as an accepted optimization.
+
 ## Citation
 
 ```bibtex
