@@ -102,6 +102,18 @@ Every optimized forward must be compared against this unfused reference over the
 is `max(relative L2 error, normalized maximum error) <= 2e-3`. A faster result that exceeds this limit must not be
 promoted or documented as an accepted optimization.
 
+Install the MLX backend on Apple Silicon with `python -m pip install -e '.[mlx,dev]'`.
+
+| Accepted step | Workload | Median before | Median after | Speedup | Error rate |
+|---|---|---:|---:|---:|---:|
+| Compiled exact norm/mix | 64-token prefill | 375.94 ms | 368.08 ms | 1.021x | 0.0 |
+| Recurrent prefix snapshot | 8 x (64 shared + 16 unique) | 2,954.94 ms | 885.35 ms | 3.338x | 0.0 |
+| Final-token vocabulary projection | 64-token prefill | 369.72 ms | 289.62 ms | 1.277x | 0.0 |
+
+The combined release gate on 128 real Llama tokens improved from 753.72 ms to 579.69 ms (`1.300x`) with error rate
+`0.0`; see `results/mlx_combined_release_gate_m4_128_tokens.json`. Timings are warmed wall-clock measurements on the
+local Apple M4 GPU and should be remeasured on other Apple Silicon variants.
+
 ### Accepted optimization 1: compiled exact norm/mix
 
 `CompiledNormMix` uses `mx.compile` on the unchanged reference expression. On the test Apple M4, the isolated

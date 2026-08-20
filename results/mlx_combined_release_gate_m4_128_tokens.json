@@ -1,0 +1,12 @@
+{
+  "forward_error": {"max_absolute": 0.0, "normalized_max": 0.0, "relative_l2": 0.0},
+  "forward_error_limit": 0.002,
+  "forward_error_rate": 0.0,
+  "optimized_median_ms": 579.686875,
+  "optimized_ms": [578.912625, 579.686875, 580.034],
+  "reference_median_ms": 753.721041,
+  "reference_ms": [753.721041, 752.984583, 753.7295],
+  "repetitions": 3,
+  "speedup": 1.3002209874080728,
+  "tokens": 128
+}
