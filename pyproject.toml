@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "recirculation-reproduction"
+version = "0.1.0"
+description = "Independent inference-time implementation of transformer recirculation"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "Apache-2.0"}
+dependencies = ["torch>=2.1"]
+
+[project.optional-dependencies]
+eval = ["datasets>=2.18", "pyyaml>=6", "transformers>=4.45"]
+dev = ["pytest>=8", "ruff>=0.6"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 119
+target-version = "py310"

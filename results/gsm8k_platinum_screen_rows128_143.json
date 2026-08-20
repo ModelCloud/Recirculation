@@ -1,0 +1,20 @@
+{
+  "evaluation_seconds": 1112.1528207500014,
+  "settings": {
+    "candidates": [[10, 3, 0.1], [11, 4, 0.1], [12, 5, 0.1], [13, 6, 0.1]],
+    "dataset": "madrylab/gsm8k-platinum",
+    "device": "mps",
+    "fewshot_count": 8,
+    "max_new_tokens": 128,
+    "model": "meta-llama/Llama-3.2-1B-Instruct",
+    "row_start": 128,
+    "rows": 16
+  },
+  "baseline": {"flexible_accuracy": 0.375, "flexible_correct": 6, "rows": 16},
+  "candidates": {
+    "source10_destination3_alpha0.1": {"flexible_accuracy": 0.375, "flexible_correct": 6, "delta_correct": 0},
+    "source11_destination4_alpha0.1": {"flexible_accuracy": 0.3125, "flexible_correct": 5, "delta_correct": -1},
+    "source12_destination5_alpha0.1": {"flexible_accuracy": 0.4375, "flexible_correct": 7, "delta_correct": 1},
+    "source13_destination6_alpha0.1": {"flexible_accuracy": 0.3125, "flexible_correct": 5, "delta_correct": -1}
+  }
+}
