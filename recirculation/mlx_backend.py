@@ -30,6 +30,12 @@ class ForwardError:
             raise RuntimeError(f"forward accumulation error {self.rate:.6g} exceeds limit {limit:.6g}")
 
 
+@dataclass(frozen=True)
+class MLXPrefillSnapshot:
+    cache_states: tuple
+    pending_source: mx.array
+
+
 def measure_forward_error(reference: mx.array, candidate: mx.array) -> ForwardError:
     """Measure an optimized accumulated forward against the unfused MLX oracle."""
 
@@ -93,6 +99,23 @@ class MLXRecirculator:
     def make_cache(self):
         return self.model.make_cache()
 
+    def snapshot(self, cache, pending_source: mx.array) -> MLXPrefillSnapshot:
+        """Capture KV state and delayed source so an exact prefix can be reused."""
+
+        states = tuple(layer_cache.state for layer_cache in cache)
+        mx.eval(*(array for state in states for array in state), pending_source)
+        return MLXPrefillSnapshot(states, pending_source)
+
+    def restore(self, snapshot: MLXPrefillSnapshot):
+        """Restore a prefix into fresh cache objects without recomputing it."""
+
+        cache = self.make_cache()
+        if len(cache) != len(snapshot.cache_states):
+            raise ValueError("snapshot layer count differs from model cache")
+        for layer_cache, state in zip(cache, snapshot.cache_states):
+            layer_cache.state = state
+        return cache, snapshot.pending_source
+
     def step(self, token: mx.array, cache, pending_source: mx.array | None = None):
         """Process exactly one token and return logits plus the source for the next token."""
 
@@ -139,11 +162,16 @@ class MLXRecirculator:
         mx.eval(logits, pending_source)
         return logits, cache, pending_source, mx.concatenate(collected, axis=1)
 
+    def prefill_from_snapshot(self, tokens: Sequence[int] | mx.array, snapshot: MLXPrefillSnapshot):
+        cache, pending_source = self.restore(snapshot)
+        return self.prefill(tokens, cache=cache, pending_source=pending_source)
+
 
 __all__ = [
     "MAX_FORWARD_ERROR",
     "CompiledNormMix",
     "ForwardError",
+    "MLXPrefillSnapshot",
     "MLXRecirculator",
     "measure_forward_error",
     "mix_reference",

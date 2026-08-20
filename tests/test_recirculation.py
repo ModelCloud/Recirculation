@@ -51,6 +51,15 @@ def test_mlx_compiled_mixture_passes_128_step_accumulation_gate():
     error.require()
 
 
+def test_mlx_prefill_snapshot_holds_cache_and_pending_source():
+    mx = __import__("mlx.core", fromlist=["core"])
+    from recirculation.mlx_backend import MLXPrefillSnapshot
+
+    snapshot = MLXPrefillSnapshot(((mx.array([1.0]), mx.array([2.0])),), mx.array([3.0]))
+    assert snapshot.cache_states[0][0].item() == 1.0
+    assert snapshot.pending_source.item() == 3.0
+
+
 class _BiasLayer(nn.Module):
     def __init__(self, value: float):
         super().__init__()

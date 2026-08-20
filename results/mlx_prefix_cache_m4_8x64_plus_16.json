@@ -1,0 +1,13 @@
+{
+  "cached_median_ms": 885.3474170027766,
+  "cached_ms": [885.2183750059339, 885.3474170027766, 910.4371669964166],
+  "forward_error": {"max_absolute": 0.0, "normalized_max": 0.0, "relative_l2": 0.0},
+  "forward_error_rate": 0.0,
+  "full_median_ms": 2954.939540999476,
+  "full_ms": [2912.098958004208, 2977.8165419993456, 2954.939540999476],
+  "prefix_tokens": 64,
+  "repetitions": 3,
+  "requests": 8,
+  "speedup": 3.337604520271852,
+  "suffix_tokens": 16
+}

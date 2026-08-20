@@ -110,6 +110,14 @@ prefill improved from 375.94 ms to 368.08 ms median (`1.021x`). The accumulated 
 under the metrics above. See `results/mlx_compiled_mix_m4_64_tokens.json` and reproduce with
 `scripts/benchmark_mlx_prefill.py`.
 
+### Accepted optimization 2: exact recirculated prefix snapshots
+
+`MLXRecirculator.snapshot` stores both the per-layer KV state and the pending deep-layer source activation. Restoring
+only the KV tensors would be incorrect because the first suffix token also depends on the final prefix source. Across
+eight requests sharing 64 prefix tokens and carrying 16 unique suffix tokens, warmed median time improved from
+2,954.94 ms to 885.35 ms (`3.338x`) on the test Apple M4. Final logits were bit-identical (error rate `0.0`). See
+`results/mlx_prefix_cache_m4_8x64_plus_16.json` and `scripts/benchmark_mlx_prefix_cache.py`.
+
 ## Citation
 
 ```bibtex
