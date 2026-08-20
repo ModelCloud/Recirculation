@@ -2,12 +2,18 @@
 
 ## Paper and authors
 
-This independent reproduction is based on
+This best-effort independent reproduction is based on
 [Recirculation](https://arxiv.org/html/2608.17981v1) by **Michael C. Mozer, Shoaib Ahmed Siddiqui, Danny Sawyer,
 Sunny Sanyal, and Rosanne Liu**. Their central contribution is a training-free inference method that feeds a small,
 norm-matched amount of each token's deeper representation back into a shallower layer, giving the model a recurrent
 state across token steps while retaining first-pass readout. The implementation, validation, and optimization in this
-repository all build on that method. This is not the authors' official implementation.
+repository all build on that method.
+
+This repository is **not** the authors' official implementation, a reference implementation, or an authoritative
+statement of the method, and it does not claim to be correct. The code may contain bugs, misunderstandings, or
+behavioral differences from the paper. Until the authors release source code, development here will continue as a
+best-effort attempt to reproduce the publicly described method; results should be treated as provisional and
+independently verified.
 
 ## Progress
 
