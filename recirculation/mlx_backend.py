@@ -116,7 +116,7 @@ class MLXRecirculator:
             layer_cache.state = state
         return cache, snapshot.pending_source
 
-    def step(self, token: mx.array, cache, pending_source: mx.array | None = None):
+    def step(self, token: mx.array, cache, pending_source: mx.array | None = None, *, project_logits: bool = True):
         """Process exactly one token and return logits plus the source for the next token."""
 
         if token.ndim == 1:
@@ -139,6 +139,8 @@ class MLXRecirculator:
                 hidden = self.mixer(hidden, pending_source, self.config)
             if index == self.config.source_layer:
                 next_source = hidden
+        if not project_logits:
+            return None, next_source
         hidden = decoder.norm(hidden)
         if self.model.args.tie_word_embeddings:
             logits = decoder.embed_tokens.as_linear(hidden)
@@ -146,7 +148,14 @@ class MLXRecirculator:
             logits = self.model.lm_head(hidden)
         return logits, next_source
 
-    def prefill(self, tokens: Sequence[int] | mx.array, *, cache=None, pending_source=None):
+    def prefill(
+        self,
+        tokens: Sequence[int] | mx.array,
+        *,
+        cache=None,
+        pending_source=None,
+        collect_logits: bool = False,
+    ):
         """Serially prefill tokens, preserving the paper's recurrence across prompt steps."""
 
         if isinstance(tokens, mx.array):
@@ -154,17 +163,29 @@ class MLXRecirculator:
         cache = self.make_cache() if cache is None else cache
         logits = None
         collected = []
-        for token in tokens:
-            logits, pending_source = self.step(mx.array([[int(token)]], dtype=mx.int32), cache, pending_source)
-            collected.append(logits)
+        tokens = list(tokens)
+        for index, token in enumerate(tokens):
+            project_logits = collect_logits or index == len(tokens) - 1
+            logits, pending_source = self.step(
+                mx.array([[int(token)]], dtype=mx.int32),
+                cache,
+                pending_source,
+                project_logits=project_logits,
+            )
+            if logits is not None:
+                collected.append(logits)
         if logits is None:
             raise ValueError("prefill requires at least one token")
         mx.eval(logits, pending_source)
         return logits, cache, pending_source, mx.concatenate(collected, axis=1)
 
-    def prefill_from_snapshot(self, tokens: Sequence[int] | mx.array, snapshot: MLXPrefillSnapshot):
+    def prefill_from_snapshot(
+        self, tokens: Sequence[int] | mx.array, snapshot: MLXPrefillSnapshot, *, collect_logits: bool = False
+    ):
         cache, pending_source = self.restore(snapshot)
-        return self.prefill(tokens, cache=cache, pending_source=pending_source)
+        return self.prefill(
+            tokens, cache=cache, pending_source=pending_source, collect_logits=collect_logits
+        )
 
 
 __all__ = [

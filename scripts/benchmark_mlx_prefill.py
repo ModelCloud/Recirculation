@@ -21,7 +21,7 @@ def _time_prefill(runner, tokens, repetitions):
     trace = None
     for _ in range(repetitions):
         started = time.perf_counter_ns()
-        *_, trace = runner.prefill(tokens)
+        *_, trace = runner.prefill(tokens, collect_logits=True)
         mx.eval(trace)
         times.append((time.perf_counter_ns() - started) / 1e6)
     return times, trace

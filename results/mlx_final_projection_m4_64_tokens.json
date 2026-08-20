@@ -1,0 +1,11 @@
+{
+  "all_logits_median_ms": 369.723542,
+  "all_logits_ms": [371.270125, 369.943417, 368.428875, 369.723542, 368.524833],
+  "final_only_median_ms": 289.619,
+  "final_only_ms": [289.800875, 288.973292, 290.300667, 288.969417, 289.619],
+  "forward_error": {"max_absolute": 0.0, "normalized_max": 0.0, "relative_l2": 0.0},
+  "forward_error_rate": 0.0,
+  "repetitions": 5,
+  "speedup": 1.2765859353150173,
+  "tokens": 64
+}

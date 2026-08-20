@@ -118,6 +118,14 @@ eight requests sharing 64 prefix tokens and carrying 16 unique suffix tokens, wa
 2,954.94 ms to 885.35 ms (`3.338x`) on the test Apple M4. Final logits were bit-identical (error rate `0.0`). See
 `results/mlx_prefix_cache_m4_8x64_plus_16.json` and `scripts/benchmark_mlx_prefix_cache.py`.
 
+### Accepted optimization 3: project only final prefill logits
+
+Intermediate prompt logits do not feed attention, KV state, or recirculation. The optimized prefill therefore runs the
+final RMSNorm and vocabulary projection only for the last prompt token. For 64 tokens, warmed median time improved from
+369.72 ms to 289.62 ms (`1.277x`) on the test Apple M4. Final logits were bit-identical (error rate `0.0`). Diagnostic
+callers can retain the slower all-token trace with `collect_logits=True`. See
+`results/mlx_final_projection_m4_64_tokens.json` and `scripts/benchmark_mlx_final_projection.py`.
+
 ## Citation
 
 ```bibtex

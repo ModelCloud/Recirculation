@@ -35,14 +35,16 @@ def main() -> int:
     ]
 
     def full_prefill():
-        output = mx.concatenate([runner.prefill(prefix + suffix)[0] for suffix in suffixes])
+        output = mx.concatenate([runner.prefill(prefix + suffix, collect_logits=True)[0] for suffix in suffixes])
         mx.eval(output)
         return output
 
     def cached_prefill():
-        _, cache, pending_source, _ = runner.prefill(prefix)
+        _, cache, pending_source, _ = runner.prefill(prefix, collect_logits=True)
         snapshot = runner.snapshot(cache, pending_source)
-        output = mx.concatenate([runner.prefill_from_snapshot(suffix, snapshot)[0] for suffix in suffixes])
+        output = mx.concatenate(
+            [runner.prefill_from_snapshot(suffix, snapshot, collect_logits=True)[0] for suffix in suffixes]
+        )
         mx.eval(output)
         return output
 
