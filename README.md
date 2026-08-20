@@ -2,6 +2,7 @@
 
 ## Progress
 
+- 2026-08-20 — Corrected CUDA same-token replay reached **4.533x prefill speedup** within the `2e-3` error gate.
 - 2026-08-20 — Corrected recirculation to replay each token's own upper stack and replace its upper-layer KV state.
 - 2026-08-20 — With zero feedback, replay now matches ordinary serial inference exactly in Torch and MLX.
 
@@ -85,8 +86,9 @@ Detailed benchmark outputs and settings are available under [`results/`](results
 ## CUDA prefill
 
 The CUDA backend preserves token-serial KV-cache updates while fusing the two L2 reductions, source normalization, and
-residual mixture into one Triton kernel. CUDA performance results produced before the same-token replay correction are
-withdrawn and must be rerun against the corrected scheduler.
+residual mixture into one Triton kernel. Fixed-length CUDA Graph replay includes the corrected same-token upper-stack
+pass and KV replacement. On Llama 3.2 1B, the corrected 128-token benchmark measured `4.533x` speedup with accumulated
+forward error `0.001206`, below the `0.002` release gate. Earlier CUDA measurements used the withdrawn scheduler.
 
 ```bash
 python -m pip install -e '.[cuda,eval,dev]'

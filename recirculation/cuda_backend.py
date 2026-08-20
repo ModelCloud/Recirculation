@@ -88,11 +88,13 @@ def _norm_mix_kernel(
         destination_norm = tl.sqrt(tl.sum(destination * destination, axis=0))
         source_norm = tl.sqrt(tl.sum(source * source, axis=0))
         # Match the eager oracle's dtype boundaries. PyTorch casts each norm
-        # back to the residual dtype before division and rounds the scaled
-        # source before applying alpha.
+        # back to the residual dtype after clamping in FP32, then rounds the
+        # scaled source before applying alpha.
+        destination_norm = tl.maximum(destination_norm, 1.1920928955078125e-7)
+        source_norm = tl.maximum(source_norm, 1.1920928955078125e-7)
         destination_norm = destination_norm.to(element_type)
         source_norm = source_norm.to(element_type)
-        scale = (destination_norm / tl.maximum(source_norm, 1.0e-12)).to(element_type)
+        scale = (destination_norm / source_norm).to(element_type)
         source = (source * scale).to(element_type)
     destination_term = (beta * destination).to(element_type)
     source_term = (alpha * source).to(element_type)
@@ -169,7 +171,7 @@ class CUDAPrefillRunner:
         attention_mask: torch.Tensor | None = None,
         collect_logits: bool = False,
     ):
-        """Return final logits, KV cache, pending source, and optionally every token's logits."""
+        """Return final logits, KV cache, pending same-token replay, and optionally every token's logits."""
 
         device = next(self.model.parameters()).device
         if not isinstance(tokens, torch.Tensor):
@@ -211,7 +213,7 @@ class CUDAPrefillRunner:
             pending = self.controller._pending
             if logits is None or pending is None:  # pragma: no cover - guarded by model/config validation
                 raise RuntimeError("prefill did not produce logits and pending replay state")
-            return logits, cache, pending.source.detach(), torch.cat(collected, dim=1)
+            return logits, cache, pending, torch.cat(collected, dim=1)
         finally:
             self.controller.detach()
 
@@ -248,6 +250,8 @@ class CUDAGraphedPrefill:
         if attention_mask.shape != self.static_tokens.shape:
             raise ValueError("attention_mask must have the same shape as tokens")
         self.static_attention_mask = attention_mask.to(device=device).clone()
+        if not bool(self.static_attention_mask.all()):
+            raise ValueError("graphed same-token replay currently requires an unpadded batch")
 
         warmup_stream = torch.cuda.Stream(device=device)
         warmup_stream.wait_stream(torch.cuda.current_stream(device))
@@ -276,6 +280,8 @@ class CUDAGraphedPrefill:
         else:
             if attention_mask.shape != self.static_attention_mask.shape:
                 raise ValueError("attention_mask must have the captured token shape")
+            if not bool(attention_mask.all()):
+                raise ValueError("graphed same-token replay currently requires an unpadded batch")
             self.static_attention_mask.copy_(attention_mask.to(device=self.static_attention_mask.device))
         self.graph.replay()
         return self.outputs

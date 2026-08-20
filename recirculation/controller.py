@@ -167,10 +167,10 @@ class RecirculationController:
         for layer in past_key_values.layers[first_upper_layer:]:
             layer.crop(-1)
         hidden_states = self._mix(self._pending.destination, self._pending.source)
-        position_ids = torch.tensor(
-            [[sequence_length - 1]], dtype=torch.long, device=hidden_states.device
-        )
-        if not bool(attention_mask[:, :sequence_length].all()):
+        # Construct directly on-device so fixed-length replay remains CUDA graph capture-safe.
+        position_ids = torch.full((1, 1), sequence_length - 1, dtype=torch.long, device=hidden_states.device)
+        capturing = hidden_states.is_cuda and torch.cuda.is_current_stream_capturing()
+        if not capturing and not bool(attention_mask[:, :sequence_length].all()):
             raise ValueError("paper-exact replay currently requires an unpadded batch")
         position_embeddings = decoder.rotary_emb(hidden_states, position_ids=position_ids)
         self._in_second_pass = True

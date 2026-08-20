@@ -63,15 +63,20 @@ def main() -> None:
     graph_error = measure_forward_error(reference_logits[:, -1:, :], graph_logits)
     graph_error.require()
     replay_tokens = torch.roll(token_ids, shifts=1, dims=1)
-    replay_reference = fused.prefill(replay_tokens)[0]
-    replay_candidate = graphed.prefill(replay_tokens)[0]
-    replay_input_error = measure_forward_error(replay_reference, replay_candidate)
+    replay_reference = fused.prefill(replay_tokens)
+    replay_candidate = graphed.prefill(replay_tokens)
+    replay_input_error = measure_forward_error(replay_reference[0], replay_candidate[0])
     replay_input_error.require()
-    reference.prefill(token_ids[:, :8])
+    replay_pending_reference = torch.cat((replay_reference[2].destination, replay_reference[2].source), dim=-1)
+    replay_pending_candidate = torch.cat((replay_candidate[2].destination, replay_candidate[2].source), dim=-1)
+    replay_pending_error = measure_forward_error(replay_pending_reference, replay_pending_candidate)
+    replay_pending_error.require()
+    reference.prefill(token_ids)
     reference_ms = time_prefill(reference, token_ids, args.repetitions)
     optimized_ms = time_prefill(graphed, token_ids, args.repetitions)
     result = {
         "model": str(args.model),
+        "scheduler": "same-token replay with upper-layer KV replacement",
         "tokens": token_ids.shape[1],
         "repetitions": args.repetitions,
         "reference_ms": reference_ms,
@@ -86,6 +91,8 @@ def main() -> None:
         "graphed_final_error_rate": graph_error.rate,
         "graphed_new_input_error": replay_input_error.__dict__,
         "graphed_new_input_error_rate": replay_input_error.rate,
+        "graphed_new_input_pending_error": replay_pending_error.__dict__,
+        "graphed_new_input_pending_error_rate": replay_pending_error.rate,
     }
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)

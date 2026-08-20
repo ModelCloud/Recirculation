@@ -1,41 +1,48 @@
 {
   "forward_error": {
-    "max_absolute": 0.03125,
-    "normalized_max": 0.001088139281828074,
-    "relative_l2": 0.0011488464222459823
+    "max_absolute": 0.03515625,
+    "normalized_max": 0.0011885895404120444,
+    "relative_l2": 0.0012057291544662857
   },
   "forward_error_limit": 0.002,
-  "forward_error_rate": 0.0011488464222459823,
+  "forward_error_rate": 0.0012057291544662857,
   "graphed_final_error": {
-    "max_absolute": 0.0185546875,
-    "normalized_max": 0.0007626846499678869,
-    "relative_l2": 0.000988132466412896
-  },
-  "graphed_final_error_rate": 0.000988132466412896,
-  "graphed_new_input_error": {
     "max_absolute": 0.01171875,
-    "normalized_max": 0.0004820051413881748,
-    "relative_l2": 0.000632638594055011
+    "normalized_max": 0.0004860661049902787,
+    "relative_l2": 0.0007491304618234343
   },
-  "graphed_new_input_error_rate": 0.000632638594055011,
+  "graphed_final_error_rate": 0.0007491304618234343,
+  "graphed_new_input_error": {
+    "max_absolute": 0.015625,
+    "normalized_max": 0.0006451612903225806,
+    "relative_l2": 0.000690347096413333
+  },
+  "graphed_new_input_error_rate": 0.000690347096413333,
+  "graphed_new_input_pending_error": {
+    "max_absolute": 0.00390625,
+    "normalized_max": 0.0014347202295552368,
+    "relative_l2": 0.0012991685926035945
+  },
+  "graphed_new_input_pending_error_rate": 0.0014347202295552368,
   "model": "/local-models/Llama-3.2-1B-Instruct",
-  "optimized_median_ms": 399.8060608282685,
+  "optimized_median_ms": 624.975886195898,
   "optimized_ms": [
-    406.0547621920705,
-    397.1174294129014,
-    399.8060608282685,
-    397.1492499113083,
-    401.49603970348835
+    638.8454968109727,
+    624.975886195898,
+    624.9741837382317,
+    624.9215230345726,
+    625.0638645142317
   ],
-  "reference_median_ms": 1593.8318809494376,
+  "reference_median_ms": 2833.0054068937898,
   "reference_ms": [
-    1593.8318809494376,
-    1614.5467991009355,
-    1599.400257691741,
-    1571.7284390702844,
-    1571.7782424762845
+    2823.7381046637893,
+    2833.0054068937898,
+    2847.500266507268,
+    2863.1596751511097,
+    2832.917639054358
   ],
   "repetitions": 5,
-  "speedup": 3.9865125547309983,
+  "scheduler": "same-token replay with upper-layer KV replacement",
+  "speedup": 4.532983542993509,
   "tokens": 128
 }

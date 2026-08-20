@@ -20,6 +20,18 @@ def test_cuda_fused_mixture_passes_forward_error_gate():
     error.require()
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_cuda_fused_mixture_matches_reference_epsilon_boundaries():
+    from recirculation.cuda_backend import FusedNormMix, measure_forward_error, mix_reference
+
+    destination = torch.tensor([[[1.0, -1.0]]], device="cuda", dtype=torch.float32)
+    source = torch.tensor([[[1e-10, -1e-10]]], device="cuda", dtype=torch.float32)
+    reference = mix_reference(destination, source, 0.1, 0.9, True)
+    candidate = FusedNormMix()(destination, source, 0.1, 0.9, True)
+    error = measure_forward_error(reference, candidate)
+    error.require(limit=1e-6)
+
+
 def test_mlx_forward_error_gate_accepts_exact_and_rejects_excess_error():
     mx = pytest.importorskip("mlx.core")
     from recirculation.mlx_backend import measure_forward_error
