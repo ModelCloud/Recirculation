@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import math
 import sys
 import threading
 from collections.abc import Sequence
@@ -20,11 +21,14 @@ try:
 except ImportError as error:  # pragma: no cover - depends on the CUDA installation
     raise ImportError("The CUDA backend requires Triton. Install the 'cuda' extra.") from error
 
-from .controller import RecirculationConfig, RecirculationController, _mixing_coefficients
+from .controller import RecirculationConfig, RecirculationController, _mixing_coefficients, torch_mix_reference
 
 MAX_FORWARD_ERROR = 2e-3
 LOG = LogBar.shared()
 _CUDA_GRAPH_CAPTURE_LOCK = threading.Lock()
+# Preserve the existing CUDA-backend API while making the Torch implementation
+# the sole eager reference and fallback.
+mix_reference = torch_mix_reference
 
 
 def log_concurrency_mode() -> bool:
@@ -48,16 +52,25 @@ def log_concurrency_mode() -> bool:
 @dataclass(frozen=True)
 class ForwardError:
     max_absolute: float
+    mean_absolute: float
     relative_l2: float
     normalized_max: float
 
     @property
     def rate(self) -> float:
-        return max(self.relative_l2, self.normalized_max)
+        return max(self.max_absolute, self.relative_l2, self.normalized_max)
 
     def require(self, limit: float = MAX_FORWARD_ERROR) -> None:
-        if self.rate > limit:
-            raise RuntimeError(f"forward accumulation error {self.rate:.6g} exceeds limit {limit:.6g}")
+        if not math.isfinite(limit) or limit < 0:
+            raise ValueError("forward error limit must be finite and non-negative")
+        metrics = (self.max_absolute, self.mean_absolute, self.relative_l2, self.normalized_max)
+        if not all(math.isfinite(value) for value in metrics) or self.rate > limit:
+            raise RuntimeError(
+                "forward accumulation error exceeds limit "
+                f"{limit:.6g}: max_absolute={self.max_absolute:.6g}, "
+                f"mean_absolute={self.mean_absolute:.6g}, "
+                f"relative_l2={self.relative_l2:.6g}, normalized_max={self.normalized_max:.6g}"
+            )
 
 
 @dataclass(frozen=True)
@@ -93,32 +106,20 @@ def _snapshot_cuda_state(cache, pending: CUDARecirculationState) -> CUDAPrefillS
 def measure_forward_error(reference: torch.Tensor, candidate: torch.Tensor) -> ForwardError:
     """Measure an optimized accumulated forward against the PyTorch oracle."""
 
+    if reference.shape != candidate.shape:
+        raise ValueError("reference and candidate must have the same shape")
+    if reference.numel() == 0:
+        raise ValueError("forward error requires non-empty tensors")
     reference = reference.float()
     candidate = candidate.float()
     difference = (reference - candidate).abs()
     max_absolute = difference.max().item()
+    mean_absolute = difference.mean().item()
     reference_l2 = torch.linalg.vector_norm(reference).item()
     relative_l2 = torch.linalg.vector_norm(difference).item() / max(reference_l2, 1e-12)
     reference_max = reference.abs().max().item()
     normalized_max = max_absolute / max(reference_max, 1e-12)
-    return ForwardError(max_absolute, relative_l2, normalized_max)
-
-
-def mix_reference(
-    destination: torch.Tensor,
-    source: torch.Tensor,
-    alpha: float,
-    beta: float,
-    normalize_source: bool,
-) -> torch.Tensor:
-    """Published norm-ratio mixture expressed with ordinary PyTorch ops."""
-
-    source = source.to(device=destination.device, dtype=destination.dtype)
-    if normalize_source:
-        destination_norm = destination.float().norm(dim=-1, keepdim=True).clamp_min(torch.finfo(torch.float32).eps)
-        source_norm = source.float().norm(dim=-1, keepdim=True).clamp_min(torch.finfo(torch.float32).eps)
-        source = source * (destination_norm.to(source.dtype) / source_norm.to(source.dtype))
-    return beta * destination + alpha * source
+    return ForwardError(max_absolute, mean_absolute, relative_l2, normalized_max)
 
 
 @triton.jit
@@ -142,14 +143,11 @@ def _norm_mix_kernel(
     if normalize_source:
         destination_norm = tl.sqrt(tl.sum(destination * destination, axis=0))
         source_norm = tl.sqrt(tl.sum(source * source, axis=0))
-        # Match the eager oracle's dtype boundaries. PyTorch casts each norm
-        # back to the residual dtype after clamping in FP32, then rounds the
-        # scaled source before applying alpha.
-        destination_norm = tl.maximum(destination_norm, 1.1920928955078125e-7)
-        source_norm = tl.maximum(source_norm, 1.1920928955078125e-7)
+        # Match the Torch oracle's dtype boundaries. Each FP32 norm is cast
+        # back to the residual dtype before division and source scaling.
         destination_norm = destination_norm.to(element_type)
         source_norm = source_norm.to(element_type)
-        scale = (destination_norm / source_norm).to(element_type)
+        scale = tl.where(source_norm > 0.0, destination_norm / source_norm, 0.0).to(element_type)
         source = (source * scale).to(element_type)
     destination_term = (beta * destination).to(element_type)
     source_term = (alpha * source).to(element_type)

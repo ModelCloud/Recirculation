@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
@@ -18,16 +19,25 @@ MAX_FORWARD_ERROR = 2e-3
 @dataclass(frozen=True)
 class ForwardError:
     max_absolute: float
+    mean_absolute: float
     relative_l2: float
     normalized_max: float
 
     @property
     def rate(self) -> float:
-        return max(self.relative_l2, self.normalized_max)
+        return max(self.max_absolute, self.relative_l2, self.normalized_max)
 
     def require(self, limit: float = MAX_FORWARD_ERROR) -> None:
-        if self.rate > limit:
-            raise RuntimeError(f"forward accumulation error {self.rate:.6g} exceeds limit {limit:.6g}")
+        if not math.isfinite(limit) or limit < 0:
+            raise ValueError("forward error limit must be finite and non-negative")
+        metrics = (self.max_absolute, self.mean_absolute, self.relative_l2, self.normalized_max)
+        if not all(math.isfinite(value) for value in metrics) or self.rate > limit:
+            raise RuntimeError(
+                "forward accumulation error exceeds limit "
+                f"{limit:.6g}: max_absolute={self.max_absolute:.6g}, "
+                f"mean_absolute={self.mean_absolute:.6g}, "
+                f"relative_l2={self.relative_l2:.6g}, normalized_max={self.normalized_max:.6g}"
+            )
 
 
 @dataclass(frozen=True)
@@ -44,17 +54,22 @@ class MLXPrefillSnapshot:
 
 
 def measure_forward_error(reference: mx.array, candidate: mx.array) -> ForwardError:
-    """Measure an optimized accumulated forward against the unfused MLX oracle."""
+    """Measure an optimized MLX forward against values from the Torch oracle."""
 
+    if reference.shape != candidate.shape:
+        raise ValueError("reference and candidate must have the same shape")
+    if math.prod(reference.shape) == 0:
+        raise ValueError("forward error requires non-empty arrays")
     reference = reference.astype(mx.float32)
     candidate = candidate.astype(mx.float32)
     difference = mx.abs(reference - candidate)
     max_absolute = float(mx.max(difference).item())
+    mean_absolute = float(mx.mean(difference).item())
     reference_l2 = float(mx.linalg.norm(reference).item())
     relative_l2 = float(mx.linalg.norm(difference).item()) / max(reference_l2, 1e-12)
     reference_max = float(mx.max(mx.abs(reference)).item())
     normalized_max = max_absolute / max(reference_max, 1e-12)
-    return ForwardError(max_absolute, relative_l2, normalized_max)
+    return ForwardError(max_absolute, mean_absolute, relative_l2, normalized_max)
 
 
 def _mix_expression(
@@ -66,10 +81,23 @@ def _mix_expression(
 ) -> mx.array:
     source = source.astype(destination.dtype)
     if normalize_source:
-        destination_norm = mx.linalg.norm(destination.astype(mx.float32), axis=-1, keepdims=True)
-        source_norm = mx.linalg.norm(source.astype(mx.float32), axis=-1, keepdims=True)
-        source = source * (destination_norm / mx.maximum(source_norm, mx.array(1e-12))).astype(source.dtype)
-    return beta * destination + alpha * source
+        destination_norm = mx.linalg.norm(destination.astype(mx.float32), axis=-1, keepdims=True).astype(
+            destination.dtype
+        )
+        source_norm = mx.linalg.norm(source.astype(mx.float32), axis=-1, keepdims=True).astype(source.dtype)
+        scale = mx.where(source_norm > 0, destination_norm / source_norm, mx.zeros_like(source_norm))
+        source = source * scale
+    # Torch applies Python scalar coefficients in FP32, rounds each product to
+    # the residual dtype, and then performs the residual addition. Express the
+    # same boundaries explicitly because MLX otherwise casts scalars to FP16.
+    destination_term = (destination.astype(mx.float32) * beta).astype(destination.dtype)
+    source_term = (source.astype(mx.float32) * alpha).astype(destination.dtype)
+    return (destination_term + source_term).astype(destination.dtype)
+
+
+def _validate_mix_inputs(destination: mx.array, source: mx.array) -> None:
+    if destination.ndim < 1 or destination.shape != source.shape:
+        raise ValueError("source and destination must have the same non-scalar shape")
 
 
 def mix_reference(
@@ -78,14 +106,15 @@ def mix_reference(
     config: RecirculationConfig,
     token_position: int | None = None,
 ) -> mx.array:
-    """Published convex/non-convex norm-ratio mixture using ordinary MLX ops."""
+    """Eager MLX mirror of :func:`torch_mix_reference`."""
 
+    _validate_mix_inputs(destination, source)
     alpha, beta = _mixing_coefficients(config, token_position)
     return _mix_expression(destination, source, alpha, beta, config.normalize_source)
 
 
 class CompiledNormMix:
-    """MLX-compiled form of the exact norm-ratio reference expression."""
+    """MLX-compiled mirror of the normative Torch norm-ratio expression."""
 
     def __init__(self, config: RecirculationConfig):
         self.config = config
@@ -105,6 +134,7 @@ class CompiledNormMix:
     ) -> mx.array:
         if config != self.config:
             raise ValueError("compiled mixer configuration cannot change after compilation")
+        _validate_mix_inputs(destination, source)
         alpha, beta = _mixing_coefficients(config, token_position)
         return self._compiled(destination, source, alpha, beta)
 
@@ -120,8 +150,8 @@ class MLXRecirculator:
     ):
         if not hasattr(model, "model") or not hasattr(model.model, "layers"):
             raise TypeError("MLX recirculation requires an MLX-LM decoder model")
-        if config.source_layer >= len(model.model.layers):
-            raise ValueError("source layer is outside the decoder")
+        if not 0 <= config.destination_layer < config.source_layer < len(model.model.layers):
+            raise ValueError("recirculation layers are outside the decoder or are not ordered destination < source")
         self.model = model
         self.config = config
         self.mixer = mixer

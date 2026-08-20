@@ -4,9 +4,10 @@
 
 This is the one-path, one-iteration variant from "Recirculation". The
 controller operates through decoder-layer hooks and does not modify model
-weights or checkpoint tensors. The controller's ``generate`` method performs serial prefill and cached
- decoding. Each token is replayed from the destination through the upper stack
- using its own first-pass source and destination activations.
+weights or checkpoint tensors. The controller's ``generate`` method is the
+normative Torch implementation: it performs serial prefill and cached decoding,
+replaying each token from the destination through the upper stack using that
+token's own first-pass source and destination activations.
 """
 
 from __future__ import annotations
@@ -32,6 +33,8 @@ class RecirculationConfig:
     iterations: int = 1
 
     def __post_init__(self) -> None:
+        if self.source_layer < 0 or self.destination_layer < 0:
+            raise ValueError("Recirculation layer indices must be non-negative.")
         if self.source_layer <= self.destination_layer:
             raise ValueError("Recirculation source_layer must be deeper than destination_layer.")
         if not 0.0 <= self.alpha <= 1.0:
@@ -69,6 +72,37 @@ def _mixing_coefficients(config: RecirculationConfig, token_position: int | None
     if config.beta == 1.0 - config.alpha:
         beta = 1.0 - strength
     return float(strength), float(beta)
+
+
+def torch_mix_reference(
+    destination: torch.Tensor,
+    source: torch.Tensor,
+    alpha: float,
+    beta: float,
+    normalize_source: bool,
+) -> torch.Tensor:
+    """Apply the paper's residual mixture using ordinary Torch operations.
+
+    This function is the numerical oracle for accelerated backends. For the
+    paper's undefined zero-source-norm edge case, the normalized source is
+    defined as zero; every backend must mirror that policy.
+    """
+
+    if destination.ndim < 1 or destination.shape != source.shape:
+        raise ValueError("source and destination must have the same non-scalar shape")
+    if not destination.is_floating_point() or not source.is_floating_point():
+        raise TypeError("source and destination must be floating-point tensors")
+    source = source.to(device=destination.device, dtype=destination.dtype)
+    if normalize_source:
+        destination_norm = destination.float().norm(dim=-1, keepdim=True).to(destination.dtype)
+        source_norm = source.float().norm(dim=-1, keepdim=True).to(destination.dtype)
+        scale = torch.where(
+            source_norm > 0,
+            destination_norm / source_norm,
+            torch.zeros_like(source_norm),
+        )
+        source = source * scale
+    return beta * destination + alpha * source
 
 
 def _find_decoder_layers(model: nn.Module) -> nn.ModuleList:
@@ -145,17 +179,10 @@ class RecirculationController:
         return output
 
     def _mix(self, destination: torch.Tensor, source: torch.Tensor, token_position: int) -> torch.Tensor:
-        source = source.to(device=destination.device, dtype=destination.dtype)
         strength, beta = _mixing_coefficients(self.config, token_position)
         if self._mixer is not None:
             return self._mixer(destination, source, strength, beta, self.config.normalize_source)
-        if self.config.normalize_source:
-            destination_norm = (
-                destination.float().norm(dim=-1, keepdim=True).clamp_min(torch.finfo(torch.float32).eps)
-            )
-            source_norm = source.float().norm(dim=-1, keepdim=True).clamp_min(torch.finfo(torch.float32).eps)
-            source = source * (destination_norm.to(source.dtype) / source_norm.to(source.dtype))
-        return beta * destination + strength * source
+        return torch_mix_reference(destination, source, strength, beta, self.config.normalize_source)
 
     def _source_hook(self, _module: nn.Module, _args: tuple[Any, ...], output: Any):
         hidden_states = _hidden_states_from_output(output)
@@ -260,6 +287,8 @@ class RecirculationController:
         was_active = self._active
         if not was_active:
             self.attach()
+        else:
+            self.reset()
         try:
             prompt_length = input_ids.shape[1]
             generated = input_ids.clone()
@@ -310,4 +339,4 @@ class RecirculationController:
         self.detach()
 
 
-__all__ = ["RecirculationConfig", "RecirculationController"]
+__all__ = ["RecirculationConfig", "RecirculationController", "torch_mix_reference"]

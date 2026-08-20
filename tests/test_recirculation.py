@@ -6,29 +6,95 @@ import pytest
 import torch
 from torch import nn
 
-from recirculation import RecirculationConfig, RecirculationController
+from recirculation import RecirculationConfig, RecirculationController, torch_mix_reference
+
+
+@pytest.mark.parametrize(
+    ("source_layer", "destination_layer"),
+    ((-1, -2), (2, -1)),
+)
+def test_recirculation_config_rejects_negative_layer_indices(source_layer, destination_layer):
+    with pytest.raises(ValueError, match="non-negative"):
+        RecirculationConfig(source_layer=source_layer, destination_layer=destination_layer)
+
+
+@pytest.mark.parametrize(
+    ("beta", "normalize_source", "expected"),
+    (
+        (0.9, True, [[[2.7, 4.1]]]),
+        (1.0, True, [[[3.0, 4.5]]]),
+        (0.9, False, [[[2.7, 3.8]]]),
+    ),
+)
+def test_torch_reference_matches_published_mixture_equations(beta, normalize_source, expected):
+    destination = torch.tensor([[[3.0, 4.0]]])
+    source = torch.tensor([[[0.0, 2.0]]])
+
+    mixed = torch_mix_reference(destination, source, 0.1, beta, normalize_source)
+
+    torch.testing.assert_close(mixed, torch.tensor(expected), rtol=0, atol=3e-7)
+
+
+def test_torch_reference_zero_norm_policy_preserves_paper_equation_where_defined():
+    source = torch.tensor([[[1.0, -1.0]]])
+    zero_destination = torch.zeros_like(source)
+    destination = torch.tensor([[[3.0, 4.0]]])
+    zero_source = torch.zeros_like(destination)
+
+    torch.testing.assert_close(
+        torch_mix_reference(zero_destination, source, 0.1, 0.9, True),
+        zero_destination,
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        torch_mix_reference(destination, zero_source, 0.1, 0.9, True),
+        0.9 * destination,
+        rtol=0,
+        atol=0,
+    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
-def test_cuda_fused_mixture_passes_forward_error_gate():
-    from recirculation.cuda_backend import FusedNormMix, measure_forward_error, mix_reference
+def test_cuda_fused_mixture_passes_128_step_torch_accumulation_gate():
+    from recirculation.cuda_backend import FusedNormMix, measure_forward_error
 
     torch.manual_seed(7)
-    destination = torch.randn(4, 1, 2048, device="cuda", dtype=torch.float16)
-    source = torch.randn_like(destination)
-    reference = mix_reference(destination, source, 0.1, 0.9, True)
-    candidate = FusedNormMix()(destination, source, 0.1, 0.9, True)
-    error = measure_forward_error(reference, candidate)
+    source_reference = torch.randn(4, 1, 2048, device="cuda", dtype=torch.float16)
+    source_candidate = source_reference.clone()
+    reference = torch.randn_like(source_reference)
+    candidate = reference.clone()
+    fused = FusedNormMix()
+    reference_trace = []
+    candidate_trace = []
+    for _ in range(128):
+        reference = torch_mix_reference(reference, source_reference, 0.1, 0.9, True)
+        candidate = fused(candidate, source_candidate, 0.1, 0.9, True)
+        reference_trace.append(reference)
+        candidate_trace.append(candidate)
+        source_reference = 0.997 * source_reference + 0.003 * reference
+        source_candidate = 0.997 * source_candidate + 0.003 * candidate
+    error = measure_forward_error(torch.cat(reference_trace, dim=1), torch.cat(candidate_trace, dim=1))
     error.require()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
-def test_cuda_fused_mixture_matches_reference_epsilon_boundaries():
-    from recirculation.cuda_backend import FusedNormMix, measure_forward_error, mix_reference
+@pytest.mark.parametrize(
+    ("destination_values", "source_values"),
+    (
+        ((0.0, 0.0), (1.0, -1.0)),
+        ((1.0, -1.0), (0.0, 0.0)),
+        ((1.0, -1.0), (1e-10, -1e-10)),
+    ),
+)
+def test_cuda_fused_mixture_matches_torch_zero_and_tiny_norm_boundaries(
+    destination_values, source_values
+):
+    from recirculation.cuda_backend import FusedNormMix, measure_forward_error
 
-    destination = torch.tensor([[[1.0, -1.0]]], device="cuda", dtype=torch.float32)
-    source = torch.tensor([[[1e-10, -1e-10]]], device="cuda", dtype=torch.float32)
-    reference = mix_reference(destination, source, 0.1, 0.9, True)
+    destination = torch.tensor([[destination_values]], device="cuda", dtype=torch.float32)
+    source = torch.tensor([[source_values]], device="cuda", dtype=torch.float32)
+    reference = torch_mix_reference(destination, source, 0.1, 0.9, True)
     candidate = FusedNormMix()(destination, source, 0.1, 0.9, True)
     error = measure_forward_error(reference, candidate)
     error.require(limit=1e-6)
@@ -58,6 +124,7 @@ def test_cuda_fused_ramp_matches_published_zero_based_schedule():
 
 
 def test_cuda_graph_rejects_ramping_that_exceeds_changed_input_gate():
+    pytest.importorskip("triton")
     from recirculation.cuda_backend import CUDAGraphedPrefill
 
     runner = SimpleNamespace(
@@ -70,7 +137,7 @@ def test_cuda_graph_rejects_ramping_that_exceeds_changed_input_gate():
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
 def test_cuda_concurrent_stacks_match_sequential_scheduler(monkeypatch):
     transformers = pytest.importorskip("transformers")
-    from recirculation.cuda_backend import CUDAConcurrentRunner, CUDAPrefillRunner
+    from recirculation.cuda_backend import CUDAConcurrentRunner, CUDAPrefillRunner, measure_forward_error
 
     monkeypatch.setattr(__import__("sys"), "_is_gil_enabled", lambda: True)
 
@@ -91,16 +158,25 @@ def test_cuda_concurrent_stacks_match_sequential_scheduler(monkeypatch):
     )
     config = RecirculationConfig(source_layer=2, destination_layer=0, alpha=0.1, ramp_tokens=2)
     tokens = torch.tensor([[1, 2, 3, 4]], device="cuda")
-    reference = CUDAPrefillRunner(model, config).prefill(tokens, collect_logits=True)
+    reference_runner = CUDAPrefillRunner(model, config, fused=False)
+    reference = reference_runner.prefill(tokens, collect_logits=True)
     concurrent = CUDAConcurrentRunner(model, config)
     try:
         candidate = concurrent.prefill(tokens, collect_logits=True)
     finally:
         concurrent.close()
 
-    torch.testing.assert_close(candidate[3], reference[3], rtol=0, atol=0)
-    torch.testing.assert_close(candidate[2].destination, reference[2].destination, rtol=0, atol=0)
-    torch.testing.assert_close(candidate[2].source, reference[2].source, rtol=0, atol=0)
+    measure_forward_error(reference[3], candidate[3]).require()
+    measure_forward_error(reference[2].destination, candidate[2].destination).require()
+    measure_forward_error(reference[2].source, candidate[2].source).require()
+    reference_snapshot = reference_runner.snapshot(reference[1], reference[2])
+    candidate_snapshot = concurrent.snapshot(candidate[1], candidate[2])
+    for reference_layer, candidate_layer in zip(reference_snapshot.cache_data, candidate_snapshot.cache_data):
+        for reference_value, candidate_value in zip(reference_layer, candidate_layer):
+            if torch.is_tensor(reference_value):
+                measure_forward_error(reference_value, candidate_value).require()
+            else:
+                assert reference_value == candidate_value
     assert candidate[2].token_position == reference[2].token_position == 3
     assert concurrent.lower_stream.priority == -3
     assert concurrent.replay_stream.priority == -3
@@ -283,19 +359,68 @@ def test_mlx_forward_error_gate_accepts_exact_and_rejects_excess_error():
     exact = measure_forward_error(reference, reference)
     exact.require()
     excessive = measure_forward_error(reference, reference + 0.01)
-    with __import__("pytest").raises(RuntimeError, match="exceeds limit"):
+    with pytest.raises(RuntimeError, match="exceeds limit"):
         excessive.require()
+    absolute_only = measure_forward_error(mx.array([1000.0]), mx.array([1000.003]))
+    assert absolute_only.relative_l2 < 2e-3
+    assert absolute_only.normalized_max < 2e-3
+    assert absolute_only.max_absolute > 2e-3
+    with pytest.raises(RuntimeError, match="max_absolute"):
+        absolute_only.require()
 
 
 def test_mlx_reference_mixture_matches_published_norm_ratio_equation():
     mx = pytest.importorskip("mlx.core")
-    from recirculation.mlx_backend import mix_reference
+    from recirculation.mlx_backend import measure_forward_error, mix_reference
 
-    destination = mx.array([[[3.0, 4.0]]])
-    source = mx.array([[[0.0, 2.0]]])
+    torch_destination = torch.tensor([[[3.0, 4.0]]])
+    torch_source = torch.tensor([[[0.0, 2.0]]])
+    destination = mx.array(torch_destination.numpy())
+    source = mx.array(torch_source.numpy())
     config = RecirculationConfig(source_layer=2, destination_layer=0, alpha=0.1)
-    mixed = mix_reference(destination, source, config)
-    assert mx.allclose(mixed, mx.array([[[2.7, 4.1]]])).item()
+    reference = torch_mix_reference(torch_destination, torch_source, 0.1, 0.9, True)
+    candidate = mix_reference(destination, source, config)
+
+    measure_forward_error(mx.array(reference.numpy()), candidate).require(limit=1e-6)
+
+
+def test_mlx_mixture_rejects_shapes_rejected_by_torch_reference():
+    mx = pytest.importorskip("mlx.core")
+    from recirculation.mlx_backend import CompiledNormMix, mix_reference
+
+    config = RecirculationConfig(source_layer=2, destination_layer=0, alpha=0.1)
+    destination = mx.zeros((1, 1, 4))
+    source = mx.zeros((1, 1, 3))
+    with pytest.raises(ValueError, match="same non-scalar shape"):
+        mix_reference(destination, source, config)
+    with pytest.raises(ValueError, match="same non-scalar shape"):
+        CompiledNormMix(config)(destination, source, config)
+
+
+@pytest.mark.parametrize(
+    ("destination_values", "source_values"),
+    (
+        ((0.0, 0.0), (1.0, -1.0)),
+        ((1.0, -1.0), (0.0, 0.0)),
+        ((1.0, -1.0), (1e-10, -1e-10)),
+    ),
+)
+def test_mlx_mixture_matches_torch_zero_and_tiny_norm_boundaries(destination_values, source_values):
+    mx = pytest.importorskip("mlx.core")
+    from recirculation.mlx_backend import CompiledNormMix, measure_forward_error
+
+    torch_destination = torch.tensor([[destination_values]], dtype=torch.float32)
+    torch_source = torch.tensor([[source_values]], dtype=torch.float32)
+    config = RecirculationConfig(source_layer=2, destination_layer=0, alpha=0.1)
+    reference = torch_mix_reference(torch_destination, torch_source, 0.1, 0.9, True)
+    compiled = CompiledNormMix(config)
+    candidate = compiled(
+        mx.array(torch_destination.numpy()),
+        mx.array(torch_source.numpy()),
+        config,
+    )
+
+    measure_forward_error(mx.array(reference.numpy()), candidate).require(limit=1e-6)
 
 
 def test_mlx_ramp_matches_published_zero_based_schedule():
@@ -325,23 +450,30 @@ def test_mlx_ramp_matches_published_zero_based_schedule():
 
 def test_mlx_compiled_mixture_passes_128_step_accumulation_gate():
     mx = pytest.importorskip("mlx.core")
-    from recirculation.mlx_backend import CompiledNormMix, measure_forward_error, mix_reference
+    from recirculation.mlx_backend import CompiledNormMix, measure_forward_error
 
-    mx.random.seed(7)
+    torch.manual_seed(7)
     config = RecirculationConfig(source_layer=12, destination_layer=5, alpha=0.1)
-    source = mx.random.normal((1, 1, 2048)).astype(mx.float16)
-    reference = mx.random.normal((1, 1, 2048)).astype(mx.float16)
-    candidate = reference
+    source_reference = torch.randn(1, 1, 2048, dtype=torch.float16)
+    source_candidate = mx.array(source_reference.numpy())
+    reference = torch.randn(1, 1, 2048, dtype=torch.float16)
+    candidate = mx.array(reference.numpy())
     compiled = CompiledNormMix(config)
     reference_trace = []
     candidate_trace = []
     for _ in range(128):
-        reference = mix_reference(reference, source, config)
-        candidate = compiled(candidate, source, config)
+        reference = torch_mix_reference(reference, source_reference, 0.1, 0.9, True)
+        candidate = compiled(candidate, source_candidate, config)
         reference_trace.append(reference)
         candidate_trace.append(candidate)
-        source = 0.997 * source + 0.003 * reference
-    error = measure_forward_error(mx.concatenate(reference_trace), mx.concatenate(candidate_trace))
+        source_reference = 0.997 * source_reference + 0.003 * reference
+        source_term = (source_candidate.astype(mx.float32) * 0.997).astype(source_candidate.dtype)
+        candidate_term = (candidate.astype(mx.float32) * 0.003).astype(candidate.dtype)
+        source_candidate = (source_term + candidate_term).astype(source_candidate.dtype)
+        mx.eval(candidate, source_candidate)
+    reference_array = mx.array(torch.cat(reference_trace, dim=1).float().numpy())
+    candidate_array = mx.concatenate(candidate_trace, axis=1)
+    error = measure_forward_error(reference_array, candidate_array)
     error.require()
 
 

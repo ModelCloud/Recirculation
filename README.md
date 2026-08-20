@@ -11,6 +11,7 @@ repository all build on that method. This is not the authors' official implement
 
 ## Progress
 
+- 2026-08-20 — Torch is now the single reference for MLX and CUDA accuracy checks.
 - 2026-08-20 — Locked disjoint evaluation completed at 59/128 baseline and 67/128 with recirculation.
 - 2026-08-20 — CUDA screening jointly evaluates historical final-answer and full-solution perplexity, then applies
   the real correct-to-wrong penalty during paired generation.
@@ -20,27 +21,27 @@ repository all build on that method. This is not the authors' official implement
 - 2026-08-20 — Corrected recirculation to replay each token's own upper stack and replace its upper-layer KV state.
 - 2026-08-20 — With zero feedback, replay now matches ordinary serial inference exactly in Torch and MLX.
 
-The code aims to remain as faithful to the upstream method as possible. Backend implementations may differ slightly,
-especially during inference, where MLX, CUDA, ROCm, and their underlying hardware impose different execution and
-kernel constraints. Such backend-specific differences should preserve the published mathematical and state behavior
-and need to meet accuracy standards.
+The Torch path is the absolute reference for the published mathematical and state behavior. MLX and CUDA may use
+hardware-specific execution, but their outputs are checked against Torch and need to meet accuracy standards.
 
 For token `t`, let `d_t` and `s_t` be its first-pass residual-stream outputs at the destination and deeper source
 decoder blocks. Decoder-block indices are zero-based. The default implementation applies the paper's per-token L2
 norm matching and convex mixture:
 
 ```text
-s_hat_t = ||d_t||_2 / max(||s_t||_2, epsilon) * s_t
+s_hat_t = ||d_t||_2 / ||s_t||_2 * s_t          # when ||s_t||_2 > 0
+s_hat_t = 0                                     # zero-source-norm edge case
 alpha_t = alpha                                  # ramp disabled
 alpha_t = min(t / ramp_tokens, 1) * alpha       # ramp enabled
 beta_t = 1 - alpha_t                            # default convex mixture
 d_mix_t = beta_t * d_t + alpha_t * s_hat_t
 ```
 
-Backend epsilon guards handle zero-norm numerical edge cases. If a non-convex `beta` is supplied explicitly, it
-remains fixed while `alpha_t` ramps. The mixed state acts as token `t`'s replacement output at the destination and is
-replayed from block `destination + 1` through the final decoder block. That replay replaces token `t`'s KV entries in
-those upper blocks; readout still uses the token's first-pass logits, as specified by the paper.
+The paper does not define division by a zero source norm, so Torch defines that normalized source as zero and the
+accelerated backends mirror it. If a non-convex `beta` is supplied explicitly, it remains fixed while `alpha_t` ramps.
+The mixed state acts as token `t`'s replacement output at the destination and is replayed from block
+`destination + 1` through the final decoder block. That replay replaces token `t`'s KV entries in those upper blocks;
+readout still uses the token's first-pass logits, as specified by the paper.
 
 An ordinary all-token parallel prefill is therefore not equivalent: token `t`'s corrected upper state must be ready
 before token `t+1` enters block `destination + 1`. The reference Torch and MLX paths execute this dependency serially.
