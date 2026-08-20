@@ -162,6 +162,32 @@ def _generate_cuda_graph_prefill(graph, runner, tokenizer, prompt_ids, device, m
     return _generation_result(tokenizer, continuation, until)
 
 
+@torch.inference_mode()
+def _generate_cuda_from_snapshot(runner, snapshot, tokenizer, suffix_ids, device, max_new_tokens, until):
+    """Restore a shared prefix and generate from the row-specific suffix."""
+    suffix = torch.tensor([suffix_ids], dtype=torch.long, device=device)
+    logits, cache, pending, _ = runner.prefill_from_snapshot(suffix, snapshot)
+    continuation = []
+    for _ in range(max_new_tokens):
+        token = logits[:, -1, :].argmax(dim=-1, keepdim=True)
+        value = int(token.item())
+        continuation.append(value)
+        if value == int(tokenizer.eos_token_id):
+            break
+        logits, cache, pending = runner.step(token, cache, pending)
+    return _generation_result(tokenizer, continuation, until)
+
+
+def _common_prefix_length(samples) -> int:
+    length = min(len(sample["prompt_ids"]) for sample in samples)
+    first = samples[0]["prompt_ids"]
+    for position in range(length):
+        value = first[position]
+        if any(sample["prompt_ids"][position] != value for sample in samples[1:]):
+            return position
+    return length
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default="meta-llama/Llama-3.2-1B-Instruct")
@@ -210,6 +236,12 @@ def main() -> int:
         "--cuda-compile-runner",
         action="store_true",
         help="Compile recirculation lower/upper stacks with CUDA graph trees disabled.",
+    )
+    parser.add_argument(
+        "--cuda-shared-prefix",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Prefill the common CUDA prompt prefix once per candidate and restore it for every row.",
     )
     parser.add_argument("--top-k", type=int, default=5)
     parser.add_argument(
@@ -395,6 +427,45 @@ def main() -> int:
         config = RecirculationConfig(source_layer=source, destination_layer=destination, alpha=alpha)
         arm = _arm_name(source, destination, alpha)
         if device.type == "cuda":
+            common_prefix_length = _common_prefix_length(samples) if args.cuda_shared_prefix else 0
+            prefix_snapshot = None
+            if common_prefix_length:
+                prefix = torch.tensor(
+                    [samples[0]["prompt_ids"][:common_prefix_length]], dtype=torch.long, device=device
+                )
+                _, prefix_cache, prefix_pending, _ = candidate_runners[arm].prefill(prefix)
+                prefix_snapshot = candidate_runners[arm].snapshot(prefix_cache, prefix_pending)
+                print(
+                    f"candidate {candidate_index + 1}/{len(args.candidate)} {arm} shared_prefix={common_prefix_length}",
+                    flush=True,
+                )
+            if prefix_snapshot is not None:
+                for sample_index, sample in enumerate(samples):
+                    suffix = sample["prompt_ids"][common_prefix_length:]
+                    if not suffix:
+                        raise RuntimeError("shared prefix consumed the entire prompt")
+                    sample[arm] = _generate_cuda_from_snapshot(
+                        candidate_runners[arm],
+                        prefix_snapshot,
+                        tokenizer,
+                        suffix,
+                        device,
+                        args.max_new_tokens,
+                        until,
+                    )
+                    maybe_status(f"candidate-{candidate_index}")
+                    if (sample_index + 1) % 4 == 0:
+                        correct = sum(
+                            numbers_equal(s[arm]["numeric_answer"], s["gold_answer"])
+                            for s in samples[: sample_index + 1]
+                        )
+                        print(
+                            f"candidate {candidate_index + 1}/{len(args.candidate)} {arm} "
+                            f"rows={sample_index + 1} correct={correct}",
+                            flush=True,
+                        )
+                maybe_status(f"candidate-{candidate_index + 1}", force=True)
+                continue
             groups = {}
             for sample in samples:
                 groups.setdefault(len(sample["prompt_ids"]), []).append(sample)
@@ -584,6 +655,8 @@ def main() -> int:
             "cuda_python_threads": args.cuda_python_threads,
             "cuda_static_cache": args.cuda_static_cache,
             "cuda_compile_runner": args.cuda_compile_runner,
+            "cuda_shared_prefix": args.cuda_shared_prefix,
+            "common_prefix_tokens": _common_prefix_length(samples),
         },
         "seconds": time.perf_counter() - started,
         "summaries": summaries,
