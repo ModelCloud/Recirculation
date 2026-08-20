@@ -2,7 +2,7 @@
 
 ## Progress
 
-- 2026-08-20 — Two-stack CUDA execution overlapped replay/current work for **1.065x lower latency** with zero error.
+- 2026-08-20 — Two-stack CUDA execution is enabled only when free-threaded Python reports `GIL=0`.
 - 2026-08-20 — Ramping now follows the paper's zero-based 10-step schedule exactly.
 - 2026-08-20 — Corrected CUDA same-token replay reached **4.533x prefill speedup** within the `2e-3` error gate.
 - 2026-08-20 — Corrected recirculation to replay each token's own upper stack and replace its upper-layer KV state.
@@ -106,13 +106,15 @@ python scripts/benchmark_cuda_prefill.py \
 
 `CUDAConcurrentRunner` implements the paper's two-stack schedule: token `t-1` replays the upper stack on one CUDA
 stream while token `t` runs through the destination layer on another, and the streams join before token `t` enters
-its upper stack. Persistent Python worker threads enqueue the disjoint branches concurrently; this works on standard
-Python because PyTorch releases the GIL around CUDA operations and is also compatible with free-threaded Python.
+its upper stack. Persistent Python worker threads enqueue the disjoint branches concurrently. The runner is enabled
+only when `sys._is_gil_enabled()` reports `False`; otherwise LogBar emits guidance and construction fails before any
+threads or streams are allocated. Use a free-threaded build such as CPython 3.14t with `-X gil=0` or `PYTHON_GIL=0`.
 Readout remains on the token's first pass, as specified by the paper. The current API supports batch-one, unpadded
 inference.
 
-On the available GIL-enabled Python build, the 128-token Llama 3.2 1B benchmark improved sequential fused CUDA from
-`2643.35 ms` to `2481.09 ms` (`1.065x`) with zero measured logits or pending-state error.
+The development benchmark recorded `1.065x` speedup with zero measured logits or pending-state error, but it used a
+GIL-enabled runtime before this guard was introduced. New concurrency benchmarks require `GIL=0` and record the
+detected runtime state in their output.
 
 ```bash
 python scripts/benchmark_cuda_concurrent.py \

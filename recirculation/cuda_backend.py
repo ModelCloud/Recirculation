@@ -10,6 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
 import torch
+from logbar import LogBar
 from transformers import DynamicCache
 
 try:
@@ -21,6 +22,24 @@ except ImportError as error:  # pragma: no cover - depends on the CUDA installat
 from .controller import RecirculationConfig, RecirculationController, _mixing_coefficients
 
 MAX_FORWARD_ERROR = 2e-3
+LOG = LogBar.shared()
+
+
+def require_gil_disabled() -> None:
+    """Enable concurrent CUDA scheduling only on a free-threaded Python runtime."""
+
+    gil_enabled = bool(getattr(sys, "_is_gil_enabled", lambda: True)())
+    if gil_enabled:
+        message = (
+            "GIL=1 detected: CUDAConcurrentRunner is disabled. For faster parallel inference, use a free-threaded "
+            "Python build with the GIL disabled, such as CPython 3.14t with -X gil=0 or PYTHON_GIL=0."
+        )
+        LOG.warn.once(message)
+        raise RuntimeError(message)
+    LOG.info.once(
+        "GIL=0 detected: CUDAConcurrentRunner is enabled for faster parallel inference with Python workers and "
+        "CUDA streams."
+    )
 
 
 @dataclass(frozen=True)
@@ -249,6 +268,7 @@ class CUDAConcurrentRunner:
         *,
         fused: bool = True,
     ):
+        require_gil_disabled()
         if not hasattr(model, "get_decoder") or model.get_output_embeddings() is None:
             raise TypeError("concurrent CUDA inference requires a Hugging Face causal language model")
         device = next(model.parameters()).device
@@ -265,7 +285,7 @@ class CUDAConcurrentRunner:
         self.lower_stream = torch.cuda.Stream(device=device)
         self.replay_stream = torch.cuda.Stream(device=device)
         self.executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="recirculation-cuda")
-        self.gil_enabled = bool(getattr(sys, "_is_gil_enabled", lambda: True)())
+        self.gil_enabled = False
 
     def close(self) -> None:
         self.executor.shutdown(wait=True)
@@ -531,4 +551,5 @@ __all__ = [
     "FusedNormMix",
     "measure_forward_error",
     "mix_reference",
+    "require_gil_disabled",
 ]

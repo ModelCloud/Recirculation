@@ -15,7 +15,12 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from recirculation import RecirculationConfig
-from recirculation.cuda_backend import CUDAConcurrentRunner, CUDAPrefillRunner, measure_forward_error
+from recirculation.cuda_backend import (
+    CUDAConcurrentRunner,
+    CUDAPrefillRunner,
+    measure_forward_error,
+    require_gil_disabled,
+)
 
 
 def time_prefill(runner, tokens, repetitions):
@@ -40,6 +45,7 @@ def main() -> None:
     parser.add_argument("--ramp-tokens", type=int, default=0)
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
+    require_gil_disabled()
 
     tokenizer = AutoTokenizer.from_pretrained(args.model, local_files_only=True)
     model = (

@@ -68,9 +68,11 @@ def test_cuda_graph_rejects_ramping_that_exceeds_changed_input_gate():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
-def test_cuda_concurrent_stacks_match_sequential_scheduler():
+def test_cuda_concurrent_stacks_match_sequential_scheduler(monkeypatch):
     transformers = pytest.importorskip("transformers")
     from recirculation.cuda_backend import CUDAConcurrentRunner, CUDAPrefillRunner
+
+    monkeypatch.setattr(__import__("sys"), "_is_gil_enabled", lambda: False)
 
     model = (
         transformers.LlamaForCausalLM(
@@ -100,6 +102,14 @@ def test_cuda_concurrent_stacks_match_sequential_scheduler():
     torch.testing.assert_close(candidate[2].destination, reference[2].destination, rtol=0, atol=0)
     torch.testing.assert_close(candidate[2].source, reference[2].source, rtol=0, atol=0)
     assert candidate[2].token_position == reference[2].token_position == 3
+
+
+def test_cuda_concurrent_runner_rejects_gil_enabled_python(monkeypatch):
+    from recirculation.cuda_backend import CUDAConcurrentRunner
+
+    monkeypatch.setattr(__import__("sys"), "_is_gil_enabled", lambda: True)
+    with pytest.raises(RuntimeError, match="GIL=1 detected"):
+        CUDAConcurrentRunner(None, RecirculationConfig(source_layer=2, destination_layer=0))
 
 
 def test_mlx_forward_error_gate_accepts_exact_and_rejects_excess_error():

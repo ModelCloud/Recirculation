@@ -9,7 +9,7 @@ description = "Independent inference-time implementation of transformer recircul
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "Apache-2.0"}
-dependencies = ["torch>=2.1"]
+dependencies = ["logbar>=0.4.10", "torch>=2.1"]
 
 [project.optional-dependencies]
 eval = ["datasets>=2.18", "pyyaml>=6", "transformers>=5.0"]
