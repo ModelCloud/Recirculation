@@ -61,6 +61,17 @@ available for future searches. See [`results/`](results/) for the complete recor
 
 This is a **13.56% relative accuracy increase**. The search rows and evaluation rows are disjoint.
 
+| Evaluation detail | Value |
+|---|---|
+| Model | [`meta-llama/Llama-3.2-1B-Instruct`](https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct), dense and unquantized |
+| Dataset | [`madrylab/gsm8k-platinum`](https://huggingface.co/datasets/madrylab/gsm8k-platinum), configuration `main`, split `test` |
+| Path search | Test rows 272–303 (32 rows) |
+| Alpha search | Test rows 304–335 (32 rows) |
+| Locked evaluation | Test rows 144–271 (128 rows) |
+| Evaluation toolkit | [Evalution](https://github.com/ModelCloud/Evalution) `0.0.7`, GSM8K-Platinum `cot_llama`, primary metric `acc,num` |
+
+The path search, alpha search, and locked evaluation ranges are pairwise disjoint.
+
 ## Install and test
 
 Python 3.10 or newer is required.
