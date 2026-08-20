@@ -1,0 +1,74 @@
+{
+  "alpha": 0.2,
+  "concurrent_median_ms": 2941.9643068686128,
+  "concurrent_ms": [
+    2960.6485441327095,
+    2923.280069604516
+  ],
+  "cuda_streams": 2,
+  "destination_layer": 2,
+  "graphed_logits_error": {
+    "max_absolute": 0.0,
+    "mean_absolute": 0.0,
+    "normalized_max": 0.0,
+    "relative_l2": 0.0
+  },
+  "graphed_logits_error_rate": 0.0,
+  "graphed_median_ms": 620.1937538571656,
+  "graphed_ms": [
+    620.5260315909982,
+    619.861476123333
+  ],
+  "graphed_new_input_error": {
+    "max_absolute": 0.0,
+    "mean_absolute": 0.0,
+    "normalized_max": 0.0,
+    "relative_l2": 0.0
+  },
+  "graphed_new_input_error_rate": 0.0,
+  "graphed_new_input_pending_error": {
+    "max_absolute": 0.0,
+    "mean_absolute": 0.0,
+    "normalized_max": 0.0,
+    "relative_l2": 0.0
+  },
+  "graphed_new_input_pending_error_rate": 0.0,
+  "graphed_pending_error": {
+    "max_absolute": 0.0,
+    "mean_absolute": 0.0,
+    "normalized_max": 0.0,
+    "relative_l2": 0.0
+  },
+  "graphed_pending_error_rate": 0.0,
+  "graphed_speedup_vs_eager_concurrent": 4.7436213095854,
+  "graphed_speedup_vs_sequential": 4.903925439924361,
+  "implementation_commit": "695bc05e00ff859b751d2f4c786bee0d90329116",
+  "logits_error": {
+    "max_absolute": 0.0,
+    "mean_absolute": 0.0,
+    "normalized_max": 0.0,
+    "relative_l2": 0.0
+  },
+  "logits_error_rate": 0.0,
+  "model": "/local-models/Llama-3.2-1B-Instruct",
+  "pending_error": {
+    "max_absolute": 0.0,
+    "mean_absolute": 0.0,
+    "normalized_max": 0.0,
+    "relative_l2": 0.0
+  },
+  "pending_error_rate": 0.0,
+  "pending_token_position": 127,
+  "python_gil_enabled": true,
+  "python_worker_threads": 2,
+  "ramp_tokens": 0,
+  "repetitions": 2,
+  "sequential_median_ms": 3041.3839272223413,
+  "sequential_ms": [
+    3046.7759454622865,
+    3035.991908982396
+  ],
+  "source_layer": 8,
+  "speedup": 1.0337936188150254,
+  "tokens": 128
+}
