@@ -52,6 +52,10 @@ from recirculation.screening import (
 from scripts.eval_gsm8k_platinum import _gold_answer, _prompt_ids, _task_contract
 
 LOG = LogBar.shared()
+MODEL_DTYPES = {
+    "float16": torch.float16,
+    "bfloat16": torch.bfloat16,
+}
 
 
 def _common_prefix_length(prompts):
@@ -95,6 +99,7 @@ def _baseline_contract(args, *, common_prefix_tokens: int, objectives) -> dict:
     return {
         "scoring_schema": "dual_objective_v1",
         "model": args.model,
+        "dtype": args.dtype,
         "dataset": args.dataset,
         "dataset_config": args.dataset_config,
         "task_config": str(args.task_config.resolve()),
@@ -315,6 +320,12 @@ def main() -> int:
     parser.add_argument("--dataset", default="madrylab/gsm8k-platinum")
     parser.add_argument("--dataset-config", default="main")
     parser.add_argument(
+        "--dtype",
+        choices=tuple(MODEL_DTYPES),
+        default="float16",
+        help="Model and residual dtype. Baseline artifacts are dtype-specific.",
+    )
+    parser.add_argument(
         "--corpus",
         action="append",
         choices=("c4", "pg19"),
@@ -427,7 +438,7 @@ def main() -> int:
         AutoModelForCausalLM.from_pretrained(
             args.model,
             local_files_only=local_files_only,
-            dtype=torch.float16,
+            dtype=MODEL_DTYPES[args.dtype],
             attn_implementation="eager",
         )
         .eval()
@@ -559,6 +570,7 @@ def main() -> int:
         expected_settings = {
             "scoring_schema": "dual_objective_v1",
             "model": args.model,
+            "dtype": args.dtype,
             "dataset": args.dataset,
             "row_start": args.row_start,
             "rows": args.rows,
@@ -646,6 +658,7 @@ def main() -> int:
         "scoring_schema": "dual_objective_v1",
         "split_role": "tuning",
         "model": args.model,
+        "dtype": args.dtype,
         "dataset": args.dataset,
         "corpora": args.corpus,
         "corpus_counts": corpus_counts,

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import pytest
+import torch
 
 from recirculation.screening import (
     DEFAULT_PATH_ALPHA,
@@ -14,10 +15,15 @@ from recirculation.screening import (
     screen_result_key,
     summarize_paired_losses,
 )
+from scripts.screen_cuda_recirculation import MODEL_DTYPES
 
 
 def test_path_search_starts_at_conservative_alpha():
     assert DEFAULT_PATH_ALPHA == 0.05
+
+
+def test_cuda_screening_exposes_fp16_and_bf16_model_dtypes():
+    assert MODEL_DTYPES == {"float16": torch.float16, "bfloat16": torch.bfloat16}
 
 
 def test_gsm8k_solution_target_keeps_reasoning_and_removes_calculator_annotations():

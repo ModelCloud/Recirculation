@@ -49,6 +49,8 @@ def _screen_base(args, output: Path) -> list[str]:
         args.model,
         "--dataset",
         args.dataset,
+        "--dtype",
+        args.dtype,
         "--row-start",
         str(args.row_start),
         "--rows",
@@ -77,6 +79,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default="/local-models/Llama-3.2-1B-Instruct")
     parser.add_argument("--dataset", default="madrylab/gsm8k-platinum")
+    parser.add_argument("--dtype", choices=("float16", "bfloat16"), default="float16")
     parser.add_argument("--row-start", type=int, default=272)
     parser.add_argument("--rows", type=int, default=32)
     parser.add_argument("--forbid-range", action="append", default=["0:272", "304:336"])
