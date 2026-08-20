@@ -195,6 +195,12 @@ def main() -> int:
         action="store_true",
         help="Compile the CUDA model with max-autotune before evaluation.",
     )
+    parser.add_argument(
+        "--cuda-python-threads",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use Python worker threads to enqueue the two CUDA streams per decode step.",
+    )
     parser.add_argument("--top-k", type=int, default=5)
     parser.add_argument(
         "--harm-weight",
@@ -305,6 +311,7 @@ def main() -> int:
             _arm_name(source, destination, alpha): CUDAConcurrentRunner(
                 model,
                 RecirculationConfig(source_layer=source, destination_layer=destination, alpha=alpha),
+                use_python_threads=args.cuda_python_threads,
             )
             for source, destination, alpha in args.candidate
         }
@@ -542,6 +549,7 @@ def main() -> int:
             "cuda_graph_max_tokens": args.cuda_graph_max_tokens,
             "cuda_compile_requested": args.cuda_compile,
             "cuda_compile_used": compile_used,
+            "cuda_python_threads": args.cuda_python_threads,
         },
         "seconds": time.perf_counter() - started,
         "summaries": summaries,
