@@ -461,7 +461,9 @@ class CUDAConcurrentRunner:
         )
 
     def _position(self, hidden: torch.Tensor, token_position: int):
-        position_ids = torch.full((1, 1), token_position, dtype=torch.long, device=self.device)
+        position_ids = torch.full(
+            (hidden.shape[0], 1), token_position, dtype=torch.long, device=self.device
+        )
         return position_ids, self.decoder.rotary_emb(hidden, position_ids=position_ids)
 
     def _run_lower(self, token: torch.Tensor, cache, token_position: int):
@@ -531,8 +533,8 @@ class CUDAConcurrentRunner:
         token = token.to(device=self.device, dtype=torch.long)
         if token.ndim == 1:
             token = token.unsqueeze(0)
-        if token.shape != (1, 1):
-            raise ValueError("step requires one token with shape [1, 1]")
+        if token.ndim != 2 or token.shape[1] != 1 or token.shape[0] < 1:
+            raise ValueError("step requires tokens with shape [batch, 1]")
         cache = DynamicCache(config=self.model.config) if cache is None else cache
         token_position = cache.get_seq_length()
         main_stream = torch.cuda.current_stream(self.device)
@@ -591,8 +593,8 @@ class CUDAConcurrentRunner:
         tokens = tokens.to(device=self.device, dtype=torch.long)
         if tokens.ndim == 1:
             tokens = tokens.unsqueeze(0)
-        if tokens.ndim != 2 or tokens.shape[0] != 1 or tokens.shape[1] == 0:
-            raise ValueError("prefill requires tokens with shape [sequence] or [1, sequence]")
+        if tokens.ndim != 2 or tokens.shape[0] < 1 or tokens.shape[1] == 0:
+            raise ValueError("prefill requires tokens with shape [sequence] or [batch, sequence]")
         logits = None
         collected = []
         for position in range(tokens.shape[1]):

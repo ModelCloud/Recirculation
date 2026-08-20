@@ -27,7 +27,7 @@ from recirculation import (
 from recirculation.screening import paired_selection_entry, proxy_shortlist
 from scripts.eval_gsm8k_platinum import (
     _generate,
-    _generate_cuda,
+    _generation_result,
     _gold_answer,
     _prompt_ids,
     _summary,
@@ -130,6 +130,22 @@ def _write_status(path: Path, payload: dict) -> None:
     temporary.replace(path)
 
 
+@torch.inference_mode()
+def _generate_cuda_batch(runner, tokenizer, prompt_ids_batch, device, max_new_tokens: int, until):
+    """Generate a same-length prompt batch with one CUDA runner invocation."""
+    input_ids = torch.tensor(prompt_ids_batch, dtype=torch.long, device=device)
+    generated = runner.generate(
+        input_ids,
+        max_new_tokens=max_new_tokens,
+        eos_token_id=int(tokenizer.eos_token_id),
+    )
+    prefix_length = input_ids.shape[1]
+    return [
+        _generation_result(tokenizer, row[prefix_length:].detach().cpu().tolist(), until)
+        for row in generated
+    ]
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default="meta-llama/Llama-3.2-1B-Instruct")
@@ -169,6 +185,12 @@ def main() -> int:
     )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--status-every", type=float, default=60.0, help="Seconds between live status table updates.")
+    parser.add_argument(
+        "--cuda-batch-size",
+        type=int,
+        default=4,
+        help="Same-length prompt batch size for CUDA candidate generation.",
+    )
     args = parser.parse_args()
     if args.screen_results is not None and args.candidate is not None:
         parser.error("use either --screen-results or --candidate, not both")
@@ -178,6 +200,8 @@ def main() -> int:
         parser.error("max-correct-to-wrong must be non-negative")
     if args.status_every <= 0:
         parser.error("status-every must be positive")
+    if args.cuda_batch_size < 1:
+        parser.error("cuda-batch-size must be positive")
     selected_screen_items = {}
     if args.screen_results is not None:
         screen = json.loads(args.screen_results.read_text(encoding="utf-8"))
@@ -285,17 +309,38 @@ def main() -> int:
     for candidate_index, (source, destination, alpha) in enumerate(args.candidate):
         config = RecirculationConfig(source_layer=source, destination_layer=destination, alpha=alpha)
         arm = _arm_name(source, destination, alpha)
-        for sample_index, sample in enumerate(samples):
-            if device.type == "cuda":
-                sample[arm] = _generate_cuda(
-                    candidate_runners[arm],
-                    tokenizer,
-                    sample["prompt_ids"],
-                    device,
-                    args.max_new_tokens,
-                    until,
-                )
-            else:
+        if device.type == "cuda":
+            groups = {}
+            for sample in samples:
+                groups.setdefault(len(sample["prompt_ids"]), []).append(sample)
+            completed = 0
+            for group in groups.values():
+                for start in range(0, len(group), args.cuda_batch_size):
+                    batch = group[start : start + args.cuda_batch_size]
+                    results = _generate_cuda_batch(
+                        candidate_runners[arm],
+                        tokenizer,
+                        [sample["prompt_ids"] for sample in batch],
+                        device,
+                        args.max_new_tokens,
+                        until,
+                    )
+                    for sample, result in zip(batch, results):
+                        sample[arm] = result
+                        completed += 1
+                        maybe_status(f"candidate-{candidate_index}")
+                    if completed % 4 == 0 or completed == len(samples):
+                        correct = sum(
+                            numbers_equal(s[arm]["numeric_answer"], s["gold_answer"])
+                            for s in samples
+                            if arm in s
+                        )
+                        print(
+                            f"candidate {candidate_index + 1}/{len(args.candidate)} {arm} rows={completed} correct={correct}",
+                            flush=True,
+                        )
+        else:
+            for sample_index, sample in enumerate(samples):
                 with RecirculationController(model, config) as controller:
                     sample[arm] = _generate(
                         model,
@@ -306,16 +351,16 @@ def main() -> int:
                         until,
                         controller=controller,
                     )
-            maybe_status(f"candidate-{candidate_index}")
-            if (sample_index + 1) % 4 == 0:
-                correct = sum(
-                    numbers_equal(sample[arm]["numeric_answer"], sample["gold_answer"])
-                    for sample in samples[: sample_index + 1]
-                )
-                print(
-                    f"candidate {candidate_index + 1}/{len(args.candidate)} {arm} rows={sample_index + 1} correct={correct}",
-                    flush=True,
-                )
+                maybe_status(f"candidate-{candidate_index}")
+                if (sample_index + 1) % 4 == 0:
+                    correct = sum(
+                        numbers_equal(sample[arm]["numeric_answer"], sample["gold_answer"])
+                        for sample in samples[: sample_index + 1]
+                    )
+                    print(
+                        f"candidate {candidate_index + 1}/{len(args.candidate)} {arm} rows={sample_index + 1} correct={correct}",
+                        flush=True,
+                    )
 
         maybe_status(f"candidate-{candidate_index + 1}", force=True)
 
