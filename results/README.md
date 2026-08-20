@@ -7,3 +7,7 @@ New path tuning and accuracy evaluation are pending for the corrected implementa
 rerun after the correction and identifies the same-token replay scheduler explicitly. The CUDA concurrency artifact
 compares mathematically equivalent sequential and two-stream schedules on the corrected implementation.
 It was collected on a GIL-enabled development runtime before `CUDAConcurrentRunner` was restricted to `GIL=0`.
+
+The three-mode latency comparison in
+[`cuda_dense_vs_recirculation_128_tokens.md`](cuda_dense_vs_recirculation_128_tokens.md) records tested commit IDs,
+fresh dense/sequential timings, and the provenance and limitations of the historical parallel measurement.
