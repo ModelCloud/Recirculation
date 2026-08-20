@@ -131,7 +131,8 @@ inference on Apple Silicon and NVIDIA hardware. Accelerated paths are checked ag
 to meet accuracy standards. CUDA screening evaluates all valid `source > destination` pairs by default, without a
 layer-distance cap. Each candidate step jointly scores complete solutions and the historical final-answer-only
 continuation; proxy regressions are kept distinct from actual accuracy flips, which require paired generation on the
-disjoint evaluation stage.
+disjoint evaluation stage. Multiprocess screens can use `--native-baseline PATH`: prepare it once with
+`--baseline-only`, then every worker validates and reuses the same per-row baseline instead of recomputing alpha zero.
 
 Install with `python -m pip install -e '.[mlx,dev]'` for MLX or `python -m pip install -e '.[cuda,eval,dev]'` for CUDA.
 Reproduction commands and benchmark details are kept under [`results/`](results/).

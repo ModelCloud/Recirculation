@@ -84,6 +84,62 @@ def _implementation_commit() -> str:
     return completed.stdout.strip()
 
 
+def _baseline_contract(args, *, common_prefix_tokens: int, objectives) -> dict:
+    return {
+        "scoring_schema": "dual_objective_v1",
+        "model": args.model,
+        "dataset": args.dataset,
+        "dataset_config": args.dataset_config,
+        "task_config": str(args.task_config.resolve()),
+        "row_start": args.row_start,
+        "rows": args.rows,
+        "target_mode": args.target_mode,
+        "common_prefix_tokens": common_prefix_tokens,
+        "objectives": sorted(objectives),
+    }
+
+
+def _load_native_baseline(path: Path, expected_contract: dict):
+    artifact = json.loads(path.read_text(encoding="utf-8"))
+    actual_contract = artifact.get("contract", {})
+    mismatches = {
+        key: (actual_contract.get(key), value)
+        for key, value in expected_contract.items()
+        if actual_contract.get(key) != value
+    }
+    if mismatches:
+        raise ValueError(f"shared native baseline does not match this screen: {mismatches}")
+    objectives = artifact.get("objectives", {})
+    if set(objectives) != set(expected_contract["objectives"]):
+        raise ValueError("shared native baseline objective set is incomplete")
+    native_nll = {objective: list(values["row_nll_totals"]) for objective, values in objectives.items()}
+    native_counts = {objective: list(values["row_target_counts"]) for objective, values in objectives.items()}
+    if any(len(native_nll[objective]) != expected_contract["rows"] for objective in objectives):
+        raise ValueError("shared native baseline row count is incomplete")
+    return artifact, native_nll, native_counts
+
+
+def _write_native_baseline(path: Path, *, contract: dict, implementation_commit: str, native, nll, counts):
+    artifact = {
+        "implementation_commit": implementation_commit,
+        "contract": contract,
+        "seconds": native["seconds"],
+        "objectives": {
+            objective: {
+                "row_nll_totals": nll[objective],
+                "row_target_counts": counts[objective],
+                "target_nll": sum(nll[objective]) / sum(counts[objective]),
+                "target_tokens": sum(counts[objective]),
+            }
+            for objective in nll
+        },
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temporary.write_text(json.dumps(artifact, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    temporary.replace(path)
+
+
 def _write_report(path, *, status, implementation_commit, settings, started, results, total, elapsed_offset=0.0):
     default_objective = "final_answer" if results and "final_answer" in results[0]["objectives"] else "full_solution"
     ordered_results = sorted(
@@ -274,6 +330,17 @@ def main() -> int:
     parser.add_argument("--tail-quantile", type=float, default=0.9)
     parser.add_argument("--tail-weight", type=float, default=1.0)
     parser.add_argument("--harm-tolerance", type=float, default=0.0)
+    parser.add_argument(
+        "--native-baseline",
+        type=Path,
+        default=None,
+        help="Load a validated shared baseline artifact, or write it after computing when absent.",
+    )
+    parser.add_argument(
+        "--baseline-only",
+        action="store_true",
+        help="Prepare --native-baseline once and exit before scoring candidates.",
+    )
     parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument(
         "--empty-cache-every",
@@ -316,6 +383,8 @@ def main() -> int:
         parser.error("tail-weight and harm-tolerance must be non-negative")
     if args.empty_cache_every < 0:
         parser.error("empty-cache-every must be non-negative")
+    if args.baseline_only and args.native_baseline is None:
+        parser.error("--baseline-only requires --native-baseline")
 
     torch.set_num_threads(int(os.environ["OMP_NUM_THREADS"]))
     local_files_only = not args.allow_download
@@ -356,6 +425,11 @@ def main() -> int:
                 tokenizer(gold_answer, add_special_tokens=False).input_ids,
             )
         contexts.append(row)
+    baseline_contract = _baseline_contract(
+        args,
+        common_prefix_tokens=common_length,
+        objectives=contexts[0],
+    )
 
     layer_count = len(model.get_decoder().layers)
     paths = args.path
@@ -389,6 +463,9 @@ def main() -> int:
             "tail_quantile": args.tail_quantile,
             "tail_weight": args.tail_weight,
             "harm_tolerance": args.harm_tolerance,
+            "shared_native_baseline": (
+                str(args.native_baseline.resolve()) if args.native_baseline is not None else None
+            ),
         }
         mismatches = {
             key: (previous_settings.get(key), value)
@@ -418,23 +495,50 @@ def main() -> int:
                 f"at commit {resumed_from_commit}"
             )
     if not results:
-        native_candidate = (paths[0][0], paths[0][1], 0.0)
-        LOG.info(f"Scoring paired native alpha=0 baseline with path {paths[0][0]}->{paths[0][1]}")
-        native = _score_candidate(
-            model,
-            prefix,
-            contexts,
-            native_candidate,
-            args.scheduler,
-            args.python_threads,
-            args.row_batch_size,
-            int(tokenizer.pad_token_id or tokenizer.eos_token_id),
-            args.graph_prefix,
-        )
-        native_nll = native.pop("row_nll_totals")
-        native_counts = native.pop("row_target_counts")
-        if args.empty_cache_every:
-            torch.cuda.empty_cache()
+        baseline_path = args.native_baseline.expanduser().resolve() if args.native_baseline is not None else None
+        if baseline_path is not None and baseline_path.exists():
+            artifact, native_nll, native_counts = _load_native_baseline(baseline_path, baseline_contract)
+            native = {
+                "source_layer": None,
+                "destination_layer": None,
+                "alpha": 0.0,
+                "seconds": float(artifact["seconds"]),
+                "shared_artifact": str(baseline_path),
+                "artifact_commit": artifact.get("implementation_commit"),
+            }
+            LOG.info(f"Loaded shared dual-objective native baseline from {baseline_path}")
+        else:
+            native_candidate = (paths[0][0], paths[0][1], 0.0)
+            LOG.info(f"Scoring paired native alpha=0 baseline with path {paths[0][0]}->{paths[0][1]}")
+            native = _score_candidate(
+                model,
+                prefix,
+                contexts,
+                native_candidate,
+                args.scheduler,
+                args.python_threads,
+                args.row_batch_size,
+                int(tokenizer.pad_token_id or tokenizer.eos_token_id),
+                args.graph_prefix,
+            )
+            native_nll = native.pop("row_nll_totals")
+            native_counts = native.pop("row_target_counts")
+            if baseline_path is not None:
+                _write_native_baseline(
+                    baseline_path,
+                    contract=baseline_contract,
+                    implementation_commit=implementation_commit,
+                    native=native,
+                    nll=native_nll,
+                    counts=native_counts,
+                )
+                native["shared_artifact"] = str(baseline_path)
+                LOG.info(f"Wrote shared dual-objective native baseline to {baseline_path}")
+            if args.empty_cache_every:
+                torch.cuda.empty_cache()
+    if args.baseline_only:
+        LOG.info("Shared native baseline is ready; baseline-only run complete")
+        return 0
     settings = {
         "scoring_schema": "dual_objective_v1",
         "split_role": "tuning",
@@ -457,6 +561,7 @@ def main() -> int:
         "tail_quantile": args.tail_quantile,
         "tail_weight": args.tail_weight,
         "harm_tolerance": args.harm_tolerance,
+        "shared_native_baseline": str(args.native_baseline.resolve()) if args.native_baseline is not None else None,
         "resume": args.resume,
         "resumed_from_commit": resumed_from_commit,
         "empty_cache_every": args.empty_cache_every,
