@@ -15,6 +15,10 @@ from pathlib import Path
 from logbar import LogBar
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT))
+
+from recirculation.screening import proxy_shortlist
+
 LOG = LogBar.shared()
 
 
@@ -52,9 +56,9 @@ def _screen_base(args, output: Path) -> list[str]:
         "--row-batch-size",
         str(args.row_batch_size),
         "--candidate-workers",
-        "1",
+        str(args.candidate_workers),
         "--target-mode",
-        "full_solution",
+        "dual",
         "--tail-quantile",
         str(args.tail_quantile),
         "--tail-weight",
@@ -91,13 +95,29 @@ def main() -> int:
     parser.add_argument("--holdout-row-start", type=int, default=304)
     parser.add_argument("--holdout-rows", type=int, default=32)
     parser.add_argument("--row-batch-size", type=int, default=32)
+    parser.add_argument(
+        "--candidate-workers",
+        type=int,
+        default=1,
+        help="Concurrent candidates in one process; keep at 1 because model hooks are process-global.",
+    )
     parser.add_argument("--tail-quantile", type=float, default=0.9)
     parser.add_argument("--tail-weight", type=float, default=1.0)
     parser.add_argument("--output-dir", type=Path, default=REPO_ROOT / "results/cuda_screening_funnel")
     parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
-    if min(args.rows, args.top_paths, args.e2e_top_k, args.holdout_rows, args.row_batch_size) < 1:
+    if (
+        min(
+            args.rows,
+            args.top_paths,
+            args.e2e_top_k,
+            args.holdout_rows,
+            args.row_batch_size,
+            args.candidate_workers,
+        )
+        < 1
+    ):
         parser.error("row counts, shortlist sizes, and row batch size must be positive")
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -115,7 +135,7 @@ def main() -> int:
 
     stage1_report = json.loads(stage1.read_text(encoding="utf-8"))
     top_paths = []
-    for result in stage1_report["results"]:
+    for result in proxy_shortlist(stage1_report["results"], args.top_paths):
         path = (int(result["source_layer"]), int(result["destination_layer"]))
         if path not in top_paths:
             top_paths.append(path)

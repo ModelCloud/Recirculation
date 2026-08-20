@@ -8,6 +8,12 @@ import math
 import re
 
 _CALCULATOR_ANNOTATION = re.compile(r"<<[^<>]*>>")
+PROXY_RANKINGS = (
+    ("final_answer_perplexity", "final_answer", False),
+    ("final_answer_robust", "final_answer", True),
+    ("full_solution_perplexity", "full_solution", False),
+    ("full_solution_robust", "full_solution", True),
+)
 
 
 def gsm8k_solution_target(answer: str, final_answer: str) -> str:
@@ -100,6 +106,62 @@ def screen_result_key(result: dict) -> tuple[float, float, float]:
         float(result.get("target_nll", result.get("answer_nll", math.inf))),
         float(result.get("alpha", math.inf)),
     )
+
+
+def perplexity_result_key(result: dict) -> tuple[float, float, float]:
+    """Sort candidates solely by aggregate target perplexity/NLL."""
+
+    return (
+        float(result.get("target_perplexity", math.inf)),
+        float(result.get("target_nll", result.get("answer_nll", math.inf))),
+        float(result.get("alpha", math.inf)),
+    )
+
+
+def objective_result_key(result: dict, objective: str, *, robust: bool) -> tuple[float, float, float]:
+    """Sort a dual-objective candidate by plain perplexity or robust paired loss."""
+
+    summary = result["objectives"][objective]
+    primary = summary["screen_score"] if robust else summary["target_perplexity"]
+    return float(primary), float(summary["target_nll"]), float(result.get("alpha", math.inf))
+
+
+def proxy_shortlist(results: list[dict], limit: int) -> list[dict]:
+    """Round-robin the four proxy rankings into one unique candidate shortlist."""
+
+    if limit < 1:
+        raise ValueError("shortlist limit must be positive")
+    available_objectives = set(results[0].get("objectives", {})) if results else set()
+    rankings = [
+        sorted(
+            results,
+            key=lambda result, objective=objective, robust=robust: objective_result_key(
+                result, objective, robust=robust
+            ),
+        )
+        for _, objective, robust in PROXY_RANKINGS
+        if objective in available_objectives
+    ]
+    selected = []
+    selected_keys = set()
+    depth = 0
+    while len(selected) < min(limit, len(results)):
+        added = False
+        for ranking in rankings:
+            if depth >= len(ranking):
+                continue
+            item = ranking[depth]
+            key = (item["source_layer"], item["destination_layer"], item["alpha"])
+            if key not in selected_keys:
+                selected.append(item)
+                selected_keys.add(key)
+                added = True
+                if len(selected) == min(limit, len(results)):
+                    break
+        depth += 1
+        if not added and depth >= max(map(len, rankings), default=0):
+            break
+    return selected
 
 
 def paired_selection_entry(

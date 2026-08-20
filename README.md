@@ -12,7 +12,8 @@ repository all build on that method. This is not the authors' official implement
 ## Progress
 
 - 2026-08-20 — Locked disjoint evaluation completed at 59/128 baseline and 67/128 with recirculation.
-- 2026-08-20 — CUDA screening now evaluates full solutions and paired end-to-end outcomes.
+- 2026-08-20 — CUDA screening jointly evaluates historical final-answer and full-solution perplexity, then applies
+  the real correct-to-wrong penalty during paired generation.
 - 2026-08-20 — Two-stack CUDA execution supports both GIL-enabled and free-threaded Python.
 - 2026-08-20 — The paper's zero-based ten-step ramp is now available with `ramp_tokens=10`.
 - 2026-08-20 — Corrected CUDA same-token replay reached **4.533x prefill speedup** while meeting accuracy standards.
@@ -51,8 +52,10 @@ branches before `t+1` enters the upper stack. The intervention changes neither m
 Results produced before the same-token replay correction measured a different delayed cross-token intervention and
 are withdrawn as recirculation evidence. The initial corrected candidate was selected by final-answer likelihood. On
 128 disjoint rows, Evalution scored the baseline at 59 correct and recirculation at 67 correct; the positive estimate
-is still statistically noise-consistent, so the candidate remains provisional. A full-solution screening funnel is
-available for future searches. See [`results/`](results/) for the complete record.
+is still statistically noise-consistent, so the candidate remains provisional. The CUDA screening funnel now scores
+the historical final-answer continuation and the complete gold solution in the same candidate batch. It retains plain
+perplexity and harmed-row-penalized rankings for both objectives, sends their union to paired generation, and only then
+applies the actual correct-to-wrong flip penalty. See [`results/`](results/) for the complete record.
 
 | Arm | Configuration | Correct | Accuracy | Change vs. baseline |
 |---|---|---:|---:|---:|
@@ -125,8 +128,10 @@ this reproduction.
 
 The repository includes semi-optimized MLX and CUDA paths that speed up path/alpha screening and recirculation
 inference on Apple Silicon and NVIDIA hardware. Accelerated paths are checked against the reference behavior and need
-to meet accuracy standards. CUDA screening can score full solutions and verify finalists with paired generation on a
-separate holdout.
+to meet accuracy standards. CUDA screening evaluates all valid `source > destination` pairs by default, without a
+layer-distance cap. Each candidate step jointly scores complete solutions and the historical final-answer-only
+continuation; proxy regressions are kept distinct from actual accuracy flips, which require paired generation on the
+disjoint evaluation stage.
 
 Install with `python -m pip install -e '.[mlx,dev]'` for MLX or `python -m pip install -e '.[cuda,eval,dev]'` for CUDA.
 Reproduction commands and benchmark details are kept under [`results/`](results/).

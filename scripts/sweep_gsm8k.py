@@ -24,7 +24,7 @@ from recirculation import (
     RecirculationConfig,
     RecirculationController,
 )
-from recirculation.screening import paired_selection_entry
+from recirculation.screening import paired_selection_entry, proxy_shortlist
 from scripts.eval_gsm8k_platinum import (
     _generate,
     _gold_answer,
@@ -128,11 +128,21 @@ def main() -> int:
         parser.error("top-k must be positive and harm-weight must be at least 1")
     if args.max_correct_to_wrong is not None and args.max_correct_to_wrong < 0:
         parser.error("max-correct-to-wrong must be non-negative")
+    selected_screen_items = {}
     if args.screen_results is not None:
         screen = json.loads(args.screen_results.read_text(encoding="utf-8"))
-        candidates = screen.get("results", [])[: args.top_k]
+        screen_results = screen.get("results", [])
+        candidates = (
+            proxy_shortlist(screen_results, args.top_k)
+            if screen_results and "objectives" in screen_results[0]
+            else screen_results[: args.top_k]
+        )
         if not candidates:
             parser.error("screen-results does not contain candidates")
+        selected_screen_items = {
+            (int(item["source_layer"]), int(item["destination_layer"]), float(item["alpha"])): item
+            for item in candidates
+        }
         args.candidate = [
             (int(item["source_layer"]), int(item["destination_layer"]), float(item["alpha"])) for item in candidates
         ]
@@ -234,6 +244,33 @@ def main() -> int:
                 -item["numeric_correct"],
             )
         )
+        for item in ranking:
+            screen_item = selected_screen_items.get((item["source_layer"], item["destination_layer"], item["alpha"]))
+            if screen_item is not None and "objectives" in screen_item:
+                item["proxy_objectives"] = screen_item["objectives"]
+    best_flip_penalized = ranking[0] if ranking else None
+    best_accuracy = (
+        min(
+            ranking,
+            key=lambda item: (
+                not item["valid"],
+                -item["numeric_correct"],
+                item["correct_to_wrong"],
+                -item["wrong_to_correct"],
+            ),
+        )
+        if ranking
+        else None
+    )
+    candidates_with_proxy = [item for item in ranking if "proxy_objectives" in item]
+    best_perplexity = (
+        min(
+            candidates_with_proxy,
+            key=lambda item: item["proxy_objectives"]["final_answer"]["target_perplexity"],
+        )
+        if candidates_with_proxy
+        else None
+    )
     comparison = None
     if len(args.candidate) == 2:
         reference = args.candidate[0]
@@ -271,7 +308,10 @@ def main() -> int:
         "seconds": time.perf_counter() - started,
         "summaries": summaries,
         "ranking": ranking,
-        "best": ranking[0] if ranking else None,
+        "best": best_flip_penalized,
+        "best_flip_penalized": best_flip_penalized,
+        "best_accuracy": best_accuracy,
+        "best_perplexity": best_perplexity,
         "comparison": comparison,
         "samples": [{key: value for key, value in sample.items() if key != "prompt_ids"} for sample in samples],
     }

@@ -4,7 +4,10 @@ import pytest
 
 from recirculation.screening import (
     gsm8k_solution_target,
+    objective_result_key,
     paired_selection_entry,
+    perplexity_result_key,
+    proxy_shortlist,
     screen_result_key,
     summarize_paired_losses,
 )
@@ -32,6 +35,43 @@ def test_paired_loss_summary_penalizes_tail_regressions():
     assert summary["regressed_rows"] == 1
     assert summary["neutral_rows"] == 0
     assert screen_result_key(summary)[0] == pytest.approx(3.0)
+
+
+def test_perplexity_key_ignores_robust_harm_penalty():
+    low_ppl_harmed = {"target_perplexity": 2.0, "target_nll": 0.7, "screen_score": 1.0, "alpha": 0.1}
+    robust = {"target_perplexity": 2.1, "target_nll": 0.74, "screen_score": -0.1, "alpha": 0.1}
+    assert min([low_ppl_harmed, robust], key=perplexity_result_key) is low_ppl_harmed
+    assert min([low_ppl_harmed, robust], key=screen_result_key) is robust
+
+
+def test_dual_objective_shortlist_unions_plain_and_robust_leaders():
+    def candidate(source, final_ppl, final_score, full_ppl, full_score):
+        return {
+            "source_layer": source,
+            "destination_layer": 0,
+            "alpha": 0.1,
+            "objectives": {
+                "final_answer": {
+                    "target_perplexity": final_ppl,
+                    "target_nll": final_ppl,
+                    "screen_score": final_score,
+                },
+                "full_solution": {
+                    "target_perplexity": full_ppl,
+                    "target_nll": full_ppl,
+                    "screen_score": full_score,
+                },
+            },
+        }
+
+    results = [
+        candidate(1, 1.0, 9.0, 9.0, 9.0),
+        candidate(2, 9.0, 1.0, 9.0, 9.0),
+        candidate(3, 9.0, 9.0, 1.0, 9.0),
+        candidate(4, 9.0, 9.0, 9.0, 1.0),
+    ]
+    assert objective_result_key(results[0], "final_answer", robust=False)[0] == 1.0
+    assert [item["source_layer"] for item in proxy_shortlist(results, 4)] == [1, 2, 3, 4]
 
 
 def test_paired_loss_summary_rejects_mismatched_target_counts():
