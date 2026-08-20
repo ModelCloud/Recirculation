@@ -40,6 +40,7 @@ sys.path.insert(0, str(REPO_ROOT))
 from recirculation import RecirculationConfig
 from recirculation.cuda_backend import CUDAConcurrentRunner, CUDAGraphedConcurrentPrefill, CUDAPrefillRunner
 from recirculation.screening import (
+    DEFAULT_PATH_ALPHA,
     PROXY_RANKINGS,
     gsm8k_solution_target,
     objective_result_key,
@@ -544,7 +545,7 @@ def main() -> int:
                 layer_count if args.max_distance is None else min(layer_count, destination + args.max_distance + 1),
             )
         ]
-    alphas = args.alpha or [0.1]
+    alphas = args.alpha or [DEFAULT_PATH_ALPHA]
     candidates = [(source, destination, alpha) for source, destination in paths for alpha in alphas]
     candidate_keys = set(candidates)
     results = []

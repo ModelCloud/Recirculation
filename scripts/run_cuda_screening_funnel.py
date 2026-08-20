@@ -17,7 +17,7 @@ from logbar import LogBar
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
-from recirculation.screening import proxy_shortlist
+from recirculation.screening import DEFAULT_PATH_ALPHA, proxy_shortlist
 
 LOG = LogBar.shared()
 
@@ -80,7 +80,7 @@ def main() -> int:
     parser.add_argument("--row-start", type=int, default=272)
     parser.add_argument("--rows", type=int, default=32)
     parser.add_argument("--forbid-range", action="append", default=["0:272", "304:336"])
-    parser.add_argument("--path-alpha", type=float, default=0.10)
+    parser.add_argument("--path-alpha", type=float, default=DEFAULT_PATH_ALPHA)
     parser.add_argument("--top-paths", type=int, default=8)
     parser.add_argument(
         "--alpha-grid",

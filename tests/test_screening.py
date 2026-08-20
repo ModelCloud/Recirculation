@@ -3,6 +3,7 @@
 import pytest
 
 from recirculation.screening import (
+    DEFAULT_PATH_ALPHA,
     gsm8k_solution_target,
     objective_result_key,
     paired_selection_entry,
@@ -13,6 +14,10 @@ from recirculation.screening import (
     screen_result_key,
     summarize_paired_losses,
 )
+
+
+def test_path_search_starts_at_conservative_alpha():
+    assert DEFAULT_PATH_ALPHA == 0.05
 
 
 def test_gsm8k_solution_target_keeps_reasoning_and_removes_calculator_annotations():

@@ -8,6 +8,7 @@ import math
 import re
 
 _CALCULATOR_ANNOTATION = re.compile(r"<<[^<>]*>>")
+DEFAULT_PATH_ALPHA = 0.05
 PROXY_RANKINGS = (
     ("language_modeling_perplexity", "language_modeling", False),
     ("language_modeling_robust", "language_modeling", True),
