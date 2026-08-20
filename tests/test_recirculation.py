@@ -179,6 +179,54 @@ def test_cuda_snapshot_continuation_matches_full_prefill():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_cuda_terminal_padding_batch_score_matches_scalar_gate():
+    transformers = pytest.importorskip("transformers")
+    from recirculation.cuda_backend import CUDAPrefillRunner, measure_forward_error
+
+    model = (
+        transformers.LlamaForCausalLM(
+            transformers.LlamaConfig(
+                vocab_size=32,
+                hidden_size=64,
+                intermediate_size=128,
+                num_hidden_layers=4,
+                num_attention_heads=4,
+                num_key_value_heads=2,
+            )
+        )
+        .half()
+        .eval()
+        .cuda()
+    )
+    config = RecirculationConfig(source_layer=2, destination_layer=0, alpha=0.1)
+    scalar = CUDAPrefillRunner(model, config)
+    batched = CUDAPrefillRunner(model, config, allow_terminal_padding=True)
+    prefix = torch.tensor([[1, 2]], device="cuda")
+    _, cache, pending, _ = scalar.prefill(prefix)
+    snapshot = scalar.snapshot(cache, pending)
+    row0 = scalar.prefill_from_snapshot(torch.tensor([[3, 4]], device="cuda"), snapshot, collect_logits=True)[3]
+    row1 = scalar.prefill_from_snapshot(torch.tensor([[7, 8, 9]], device="cuda"), snapshot, collect_logits=True)[3]
+    expected = torch.stack(
+        (
+            torch.logsumexp(row0[0, 0].float(), dim=-1) - row0[0, 0, 5].float(),
+            torch.logsumexp(row0[0, 1].float(), dim=-1) - row0[0, 1, 6].float(),
+            torch.logsumexp(row1[0, 1].float(), dim=-1) - row1[0, 1, 10].float(),
+        )
+    ).sum()
+    tokens = torch.tensor([[3, 4, 0], [7, 8, 9]], device="cuda")
+    mask = torch.tensor([[1, 1, 1, 1, 0], [1, 1, 1, 1, 1]], device="cuda")
+    candidate, count = batched.score_from_snapshot(
+        tokens,
+        snapshot,
+        {0: ([0], [5]), 1: ([0, 1], [6, 10])},
+        attention_mask=mask,
+    )
+    error = measure_forward_error(expected[None], torch.tensor([candidate], device="cuda"))
+    error.require()
+    assert count == 3
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
 def test_cuda_concurrent_graph_matches_eager_for_changed_tokens(monkeypatch):
     transformers = pytest.importorskip("transformers")
     from recirculation.cuda_backend import CUDAConcurrentRunner, CUDAGraphedConcurrentPrefill, measure_forward_error

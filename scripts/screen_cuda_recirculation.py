@@ -23,6 +23,7 @@ for _thread_variable in (
     "VECLIB_MAXIMUM_THREADS",
     "NUMEXPR_NUM_THREADS",
 ):
+    candidate_started = time.perf_counter()
     os.environ.setdefault(_thread_variable, "16")
 
 import torch
@@ -34,7 +35,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 from recirculation import RecirculationConfig
-from recirculation.cuda_backend import CUDAConcurrentRunner, CUDAPrefillRunner
+from recirculation.cuda_backend import CUDAConcurrentRunner, CUDAGraphedConcurrentPrefill, CUDAPrefillRunner
 from scripts.eval_gsm8k_platinum import _gold_answer, _prompt_ids, _task_contract
 
 LOG = LogBar.shared()
@@ -77,7 +78,17 @@ def _implementation_commit() -> str:
     return completed.stdout.strip()
 
 
-def _score_candidate(model, prefix, contexts, candidate, scheduler, use_python_threads):
+def _score_candidate(
+    model,
+    prefix,
+    contexts,
+    candidate,
+    scheduler,
+    use_python_threads,
+    row_batch_size,
+    pad_token_id,
+    graph_prefix,
+):
     source, destination, alpha = candidate
     config = RecirculationConfig(source_layer=source, destination_layer=destination, alpha=alpha)
     candidate_stream = torch.cuda.Stream(device=prefix.device)
@@ -88,12 +99,69 @@ def _score_candidate(model, prefix, contexts, candidate, scheduler, use_python_t
             else CUDAPrefillRunner(model, config)
         )
         try:
-            _, cache, pending, _ = runner.prefill(prefix)
+            prefix_graph = None
+            if graph_prefix:
+                if not isinstance(runner, CUDAConcurrentRunner):
+                    raise ValueError("graph-prefix screening requires the concurrent scheduler")
+                runner.prefill(prefix[:, :2])
+                prefix_graph = CUDAGraphedConcurrentPrefill(runner, prefix, warmups=0)
+                _, cache, pending, _ = prefix_graph.prefill(prefix)
+            else:
+                _, cache, pending, _ = runner.prefill(prefix)
             snapshot = runner.snapshot(cache, pending)
+            if prefix_graph is not None:
+                torch.cuda.synchronize(prefix.device)
+            if row_batch_size > 1:
+                batch_runner = CUDAPrefillRunner(model, config, allow_terminal_padding=True)
+                total_nll = 0.0
+                answer_tokens = 0
+                prefix_length = snapshot.pending.token_position + 1
+                for batch_start in range(0, len(contexts), row_batch_size):
+                    batch = contexts[batch_start : batch_start + row_batch_size]
+                    sequences = [context + answer_ids[:-1] for context, answer_ids in batch]
+                    maximum_length = max(map(len, sequences))
+                    batch_tokens = torch.full(
+                        (len(batch), maximum_length),
+                        pad_token_id,
+                        dtype=torch.long,
+                        device="cuda",
+                    )
+                    attention_mask = torch.zeros(
+                        (len(batch), prefix_length + maximum_length),
+                        dtype=torch.long,
+                        device="cuda",
+                    )
+                    attention_mask[:, :prefix_length] = 1
+                    targets_by_position = {}
+                    for row, ((context, answer_ids), sequence) in enumerate(zip(batch, sequences)):
+                        batch_tokens[row, : len(sequence)] = torch.tensor(sequence, device="cuda")
+                        attention_mask[row, prefix_length : prefix_length + len(sequence)] = 1
+                        for target_index, target in enumerate(answer_ids):
+                            position = len(context) - 1 + target_index
+                            rows, targets = targets_by_position.setdefault(position, ([], []))
+                            rows.append(row)
+                            targets.append(int(target))
+                    batch_nll, batch_targets = batch_runner.score_from_snapshot(
+                        batch_tokens,
+                        snapshot,
+                        targets_by_position,
+                        attention_mask=attention_mask,
+                    )
+                    total_nll += batch_nll
+                    answer_tokens += batch_targets
+                return {
+                    "source_layer": source,
+                    "destination_layer": destination,
+                    "alpha": alpha,
+                    "answer_nll": total_nll / answer_tokens,
+                    "answer_tokens": answer_tokens,
+                    "seconds": time.perf_counter() - candidate_started,
+                }
             total_nll = 0.0
             answer_tokens = 0
             for context, answer_ids in contexts:
-                logits, cache, pending, _ = runner.prefill_from_snapshot(context, snapshot)
+                context_tensor = torch.tensor([context], dtype=torch.long, device="cuda")
+                logits, cache, pending, _ = runner.prefill_from_snapshot(context_tensor, snapshot)
                 for token_index, token in enumerate(answer_ids):
                     token_logits = logits[0, -1].float()
                     total_nll += float(torch.logsumexp(token_logits, dim=-1) - token_logits[int(token)])
@@ -114,6 +182,7 @@ def _score_candidate(model, prefix, contexts, candidate, scheduler, use_python_t
                 "alpha": alpha,
                 "answer_nll": total_nll / answer_tokens,
                 "answer_tokens": answer_tokens,
+                "seconds": time.perf_counter() - candidate_started,
             }
         finally:
             if isinstance(runner, CUDAConcurrentRunner):
@@ -134,6 +203,12 @@ def main() -> int:
     parser.add_argument("--max-distance", type=int, default=12)
     parser.add_argument("--scheduler", choices=("concurrent", "sequential"), default="concurrent")
     parser.add_argument("--candidate-workers", type=int, default=1)
+    parser.add_argument("--row-batch-size", type=int, default=32)
+    parser.add_argument(
+        "--graph-prefix",
+        action="store_true",
+        help="Graph the prefix only when it is at most 256 tokens; longer captures are rejected as unstable.",
+    )
     parser.add_argument(
         "--python-threads",
         action="store_true",
@@ -148,10 +223,14 @@ def main() -> int:
     overlaps = [interval for interval in forbidden_ranges if _overlaps(tuning_range, interval)]
     if overlaps:
         parser.error(f"tuning range {tuning_range} overlaps forbidden evaluation range(s): {overlaps}")
-    if args.rows < 1 or args.max_distance < 1 or args.report_every < 1 or args.candidate_workers < 1:
-        parser.error("rows, max-distance, report-every, and candidate-workers must be positive")
+    if min(args.rows, args.max_distance, args.report_every, args.candidate_workers, args.row_batch_size) < 1:
+        parser.error("rows, distances, reporting intervals, and worker/batch sizes must be positive")
     if args.scheduler == "sequential" and args.candidate_workers != 1:
         parser.error("the hook-based sequential scheduler requires --candidate-workers 1")
+    if args.scheduler == "sequential" and args.graph_prefix:
+        parser.error("the sequential scheduler does not support --graph-prefix")
+    if args.candidate_workers != 1 and args.graph_prefix:
+        parser.error("CUDA Graph prefix capture requires --candidate-workers 1")
 
     torch.set_num_threads(int(os.environ["OMP_NUM_THREADS"]))
     local_files_only = not args.allow_download
@@ -180,7 +259,7 @@ def main() -> int:
     contexts = []
     for prompt, answer in zip(prompts, answers):
         answer_ids = tokenizer(answer, add_special_tokens=False).input_ids
-        context = torch.tensor([prompt[common_length:] + phrase], dtype=torch.long, device="cuda")
+        context = prompt[common_length:] + phrase
         contexts.append((context, answer_ids))
 
     layer_count = len(model.get_decoder().layers)
@@ -206,6 +285,9 @@ def main() -> int:
                 candidate,
                 args.scheduler,
                 args.python_threads,
+                args.row_batch_size,
+                int(tokenizer.pad_token_id or tokenizer.eos_token_id),
+                args.graph_prefix,
             ): candidate
             for candidate in candidates
         }
@@ -231,6 +313,8 @@ def main() -> int:
             "scheduler": args.scheduler,
             "candidate_workers": args.candidate_workers,
             "python_threads": args.python_threads,
+            "row_batch_size": args.row_batch_size,
+            "graph_prefix": args.graph_prefix,
             "python": platform.python_version(),
             "python_gil_enabled": bool(getattr(sys, "_is_gil_enabled", lambda: True)()),
             "torch": torch.__version__,

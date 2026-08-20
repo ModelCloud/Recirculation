@@ -208,6 +208,7 @@ class CUDAPrefillRunner:
         *,
         fused: bool = True,
         skip_intermediate_logits: bool = True,
+        allow_terminal_padding: bool = False,
     ):
         if not hasattr(model, "get_decoder") or model.get_output_embeddings() is None:
             raise TypeError("CUDA prefill requires a Hugging Face causal language model")
@@ -215,8 +216,14 @@ class CUDAPrefillRunner:
         self.model = model
         self.decoder = model.get_decoder()
         self.output_embeddings = model.get_output_embeddings()
-        self.controller = RecirculationController(model, config, mixer=mixer)
+        self.controller = RecirculationController(
+            model,
+            config,
+            mixer=mixer,
+            allow_terminal_padding=allow_terminal_padding,
+        )
         self.skip_intermediate_logits = skip_intermediate_logits
+        self.allow_terminal_padding = allow_terminal_padding
 
     @torch.inference_mode()
     def prefill(
@@ -236,16 +243,18 @@ class CUDAPrefillRunner:
         tokens = tokens.to(device=device, dtype=torch.long)
         if tokens.ndim == 1:
             tokens = tokens.unsqueeze(0)
-        if tokens.ndim != 2 or tokens.shape[0] != 1 or tokens.shape[1] == 0:
-            raise ValueError("prefill requires tokens with shape [sequence] or [1, sequence]")
+        if tokens.ndim != 2 or tokens.shape[0] == 0 or tokens.shape[1] == 0:
+            raise ValueError("prefill requires tokens with shape [sequence] or [batch, sequence]")
         prefix_length = 0 if cache is None else cache.get_seq_length()
         total_length = prefix_length + tokens.shape[1]
         if attention_mask is None:
-            attention_mask = torch.ones((1, total_length), dtype=torch.long, device=device)
+            attention_mask = torch.ones((tokens.shape[0], total_length), dtype=torch.long, device=device)
         else:
             attention_mask = attention_mask.to(device=device)
-        if attention_mask.shape != (1, total_length):
+        if attention_mask.shape != (tokens.shape[0], total_length):
             raise ValueError("attention_mask must cover the cached prefix and every new token")
+        if self.allow_terminal_padding and bool((attention_mask[:, 1:] > attention_mask[:, :-1]).any()):
+            raise ValueError("terminal padding masks cannot contain a real token after padding begins")
 
         logits = None
         collected = []
@@ -283,9 +292,21 @@ class CUDAPrefillRunner:
     def snapshot(self, cache, pending: CUDARecirculationState) -> CUDAPrefillSnapshot:
         return _snapshot_cuda_state(cache, pending)
 
-    def restore(self, snapshot: CUDAPrefillSnapshot):
+    def restore(self, snapshot: CUDAPrefillSnapshot, *, batch_size: int = 1):
         cache = DynamicCache(snapshot.cache_data, config=self.model.config)
-        return cache, snapshot.pending
+        snapshot_batch = snapshot.pending.destination.shape[0]
+        if batch_size % snapshot_batch:
+            raise ValueError("requested batch size must be a multiple of the snapshot batch size")
+        repeats = batch_size // snapshot_batch
+        pending = snapshot.pending
+        if repeats > 1:
+            cache.batch_repeat_interleave(repeats)
+            pending = CUDARecirculationState(
+                pending.destination.repeat_interleave(repeats, dim=0),
+                pending.source.repeat_interleave(repeats, dim=0),
+                pending.token_position,
+            )
+        return cache, pending
 
     def prefill_from_snapshot(
         self,
@@ -293,9 +314,69 @@ class CUDAPrefillRunner:
         snapshot: CUDAPrefillSnapshot,
         *,
         collect_logits: bool = False,
+        attention_mask: torch.Tensor | None = None,
     ):
-        cache, pending = self.restore(snapshot)
-        return self.prefill(tokens, cache=cache, pending=pending, collect_logits=collect_logits)
+        batch_size = tokens.shape[0] if isinstance(tokens, torch.Tensor) and tokens.ndim == 2 else 1
+        cache, pending = self.restore(snapshot, batch_size=batch_size)
+        return self.prefill(
+            tokens,
+            cache=cache,
+            pending=pending,
+            collect_logits=collect_logits,
+            attention_mask=attention_mask,
+        )
+
+    @torch.inference_mode()
+    def score_from_snapshot(
+        self,
+        tokens: torch.Tensor,
+        snapshot: CUDAPrefillSnapshot,
+        targets_by_position: dict[int, tuple[list[int], list[int]]],
+        *,
+        attention_mask: torch.Tensor,
+    ) -> tuple[float, int]:
+        """Score sparse teacher-forced targets in one terminally padded batch."""
+
+        device = next(self.model.parameters()).device
+        tokens = tokens.to(device=device, dtype=torch.long)
+        if tokens.ndim != 2 or tokens.shape[0] == 0 or tokens.shape[1] == 0:
+            raise ValueError("batched scoring requires tokens with shape [batch, sequence]")
+        cache, pending = self.restore(snapshot, batch_size=tokens.shape[0])
+        prefix_length = cache.get_seq_length()
+        attention_mask = attention_mask.to(device=device)
+        if attention_mask.shape != (tokens.shape[0], prefix_length + tokens.shape[1]):
+            raise ValueError("scoring attention mask must cover the cached prefix and continuation")
+        if bool((attention_mask[:, 1:] > attention_mask[:, :-1]).any()):
+            raise ValueError("scoring masks cannot contain a real token after terminal padding begins")
+
+        total_nll = torch.zeros((), dtype=torch.float32, device=device)
+        target_count = 0
+        self.controller.attach()
+        self.controller._pending = pending
+        self.controller._position = prefix_length
+        try:
+            for position in range(tokens.shape[1]):
+                prefix_mask = attention_mask[:, : prefix_length + position + 1]
+                self.controller._recirculate_pending(cache, prefix_mask)
+                output = self.decoder(
+                    input_ids=tokens[:, position : position + 1],
+                    attention_mask=prefix_mask,
+                    past_key_values=cache,
+                    use_cache=True,
+                    return_dict=True,
+                )
+                cache = output.past_key_values
+                selected = targets_by_position.get(position)
+                if selected is not None:
+                    row_values, target_values = selected
+                    rows = torch.tensor(row_values, dtype=torch.long, device=device)
+                    targets = torch.tensor(target_values, dtype=torch.long, device=device)
+                    logits = self.output_embeddings(output.last_hidden_state[rows, -1]).float()
+                    total_nll += (torch.logsumexp(logits, dim=-1) - logits.gather(1, targets[:, None])[:, 0]).sum()
+                    target_count += len(target_values)
+            return float(total_nll), target_count
+        finally:
+            self.controller.detach()
 
 
 class CUDAConcurrentRunner:
@@ -570,8 +651,8 @@ class CUDAGraphedConcurrentPrefill:
         keep_graph: bool = False,
         capture_stream_priority: int = 0,
     ):
-        if warmups < 1:
-            raise ValueError("concurrent CUDA graph capture requires at least one warmup")
+        if warmups < 0:
+            raise ValueError("concurrent CUDA graph warmups must be non-negative")
         if capture_error_mode not in {"global", "thread_local", "relaxed"}:
             raise ValueError("capture_error_mode must be global, thread_local, or relaxed")
         if runner.config.ramp_tokens:
@@ -582,6 +663,11 @@ class CUDAGraphedConcurrentPrefill:
             example_tokens = example_tokens.unsqueeze(0)
         if example_tokens.ndim != 2 or example_tokens.shape[0] != 1 or example_tokens.shape[1] == 0:
             raise ValueError("concurrent graph capture requires tokens with shape [sequence] or [1, sequence]")
+        if example_tokens.shape[1] > 256:
+            raise ValueError(
+                "concurrent graph capture is limited to 256 tokens because larger graphs are unstable; "
+                "use eager or bounded static-cache graph blocks"
+            )
         self.runner = runner
         self.static_tokens = example_tokens.to(device=runner.device, dtype=torch.long).clone()
         self.capture_error_mode = capture_error_mode

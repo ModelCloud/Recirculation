@@ -146,7 +146,11 @@ python scripts/benchmark_cuda_concurrent.py \
 candidate's 1,078-token shared prefix once, restores an immutable candidate-specific KV snapshot for every row, and
 loads the model and dataset only once. The hook-free dual-stream scheduler is the default. Its screening mode enqueues
 both CUDA branches from one Python thread, avoiding futures overhead while preserving stream overlap; outer candidate
-parallelism is available but defaults to one because four workers slowed the measured single-GPU workload.
+parallelism is available but defaults to one because four workers slowed the measured single-GPU workload. Terminal
+right-padding batches the 32 row suffixes and sparsely projects only answer-target positions; this reduced the measured
+32-row candidate time from 100.68 seconds to 33.62 seconds (`2.995x`) with relative NLL difference `0.000263`, below
+the `0.002` gate. Prefix graph capture is opt-in and limited to 256 tokens because a 1,078-token graph was unstable on
+the tested PyTorch/CUDA stack. A bounded static-cache graph is still needed to reach the 10x screening target safely.
 
 ```bash
 PYTHONUNBUFFERED=1 \
