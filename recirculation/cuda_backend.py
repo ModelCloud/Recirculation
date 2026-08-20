@@ -236,6 +236,11 @@ class CUDAGraphedPrefill:
     ):
         if warmups < 1:
             raise ValueError("CUDA graph capture requires at least one warmup")
+        if runner.controller.config.ramp_tokens:
+            raise ValueError(
+                "CUDA graph replay with ramp_tokens is disabled because changed-input error exceeds the release gate; "
+                "use CUDAPrefillRunner directly"
+            )
         if example_tokens.ndim == 1:
             example_tokens = example_tokens.unsqueeze(0)
         if example_tokens.ndim != 2 or example_tokens.shape[0] != 1 or example_tokens.shape[1] == 0:

@@ -89,7 +89,9 @@ Detailed benchmark outputs and settings are available under [`results/`](results
 The CUDA backend preserves token-serial KV-cache updates while fusing the two L2 reductions, source normalization, and
 residual mixture into one Triton kernel. Fixed-length CUDA Graph replay includes the corrected same-token upper-stack
 pass and KV replacement. On Llama 3.2 1B, the corrected 128-token benchmark measured `4.533x` speedup with accumulated
-forward error `0.001206`, below the `0.002` release gate. Earlier CUDA measurements used the withdrawn scheduler.
+forward error `0.001206`, below the `0.002` release gate. Ramped coefficients are supported by the eager fused CUDA
+runner; CUDA Graph replay rejects ramped configurations because changed-input error exceeds the gate. Earlier CUDA
+measurements used the withdrawn scheduler.
 
 ```bash
 python -m pip install -e '.[cuda,eval,dev]'

@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 from torch import nn
@@ -30,6 +32,39 @@ def test_cuda_fused_mixture_matches_reference_epsilon_boundaries():
     candidate = FusedNormMix()(destination, source, 0.1, 0.9, True)
     error = measure_forward_error(reference, candidate)
     error.require(limit=1e-6)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_cuda_fused_ramp_matches_published_zero_based_schedule():
+    from recirculation.controller import _mixing_coefficients
+    from recirculation.cuda_backend import FusedNormMix
+
+    config = RecirculationConfig(
+        source_layer=2,
+        destination_layer=0,
+        alpha=0.2,
+        normalize_source=False,
+        ramp_tokens=10,
+    )
+    destination = torch.tensor([[[1.0, 0.0]]], device="cuda")
+    source = torch.tensor([[[0.0, 1.0]]], device="cuda")
+    fused = FusedNormMix()
+
+    for position, expected_alpha in ((0, 0.0), (1, 0.02), (9, 0.18), (10, 0.2), (11, 0.2)):
+        alpha, beta = _mixing_coefficients(config, position)
+        candidate = fused(destination, source, alpha, beta, False)
+        expected = torch.tensor([[[1.0 - expected_alpha, expected_alpha]]], device="cuda")
+        torch.testing.assert_close(candidate, expected, rtol=1e-6, atol=1e-6)
+
+
+def test_cuda_graph_rejects_ramping_that_exceeds_changed_input_gate():
+    from recirculation.cuda_backend import CUDAGraphedPrefill
+
+    runner = SimpleNamespace(
+        controller=SimpleNamespace(config=RecirculationConfig(source_layer=2, destination_layer=0, ramp_tokens=10))
+    )
+    with pytest.raises(ValueError, match="changed-input error exceeds the release gate"):
+        CUDAGraphedPrefill(runner, torch.ones(1, 1, dtype=torch.long))
 
 
 def test_mlx_forward_error_gate_accepts_exact_and_rejects_excess_error():

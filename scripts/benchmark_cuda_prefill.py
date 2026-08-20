@@ -71,6 +71,8 @@ def main() -> None:
     replay_pending_candidate = torch.cat((replay_candidate[2].destination, replay_candidate[2].source), dim=-1)
     replay_pending_error = measure_forward_error(replay_pending_reference, replay_pending_candidate)
     replay_pending_error.require()
+    if replay_reference[2].token_position != replay_candidate[2].token_position:
+        raise RuntimeError("graphed pending token position differs from the eager CUDA reference")
     reference.prefill(token_ids)
     reference_ms = time_prefill(reference, token_ids, args.repetitions)
     optimized_ms = time_prefill(graphed, token_ids, args.repetitions)
@@ -93,6 +95,7 @@ def main() -> None:
         "graphed_new_input_error_rate": replay_input_error.rate,
         "graphed_new_input_pending_error": replay_pending_error.__dict__,
         "graphed_new_input_pending_error_rate": replay_pending_error.rate,
+        "graphed_pending_token_position": replay_candidate[2].token_position,
     }
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)
