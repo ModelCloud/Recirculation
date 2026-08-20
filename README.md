@@ -92,105 +92,26 @@ The controller currently supports batch size 1 and the one-path, one-iteration v
 supported; the paper's learned adaptive variant, multiple paths, and multiple recirculation iterations are outside
 this reproduction.
 
-## MLX prefill
+## Accelerated backends
 
-An MLX-LM prefill path and reusable shared-prefix state are included for Apple Silicon.
+The repository includes semi-optimized MLX and CUDA paths that speed up path/alpha screening and recirculation
+inference on Apple Silicon and NVIDIA hardware. Accelerated paths are checked against the reference behavior and need
+to meet accuracy standards.
 
-Every faster forward is checked against the reference implementation and needs to meet accuracy standards.
-
-Install the MLX backend on Apple Silicon with `python -m pip install -e '.[mlx,dev]'`.
-
-Detailed benchmark outputs and settings are available under [`results/`](results/).
-
-## CUDA prefill
-
-The CUDA backend preserves token-serial KV-cache updates while fusing the two L2 reductions, source normalization, and
-residual mixture into one Triton kernel. Fixed-length CUDA Graph replay includes the corrected same-token upper-stack
-pass and KV replacement. On Llama 3.2 1B, the corrected 128-token benchmark measured `4.533x` speedup with accumulated
-forward behavior that meets accuracy standards. Ramped coefficients are supported by the eager fused CUDA runner;
-CUDA Graph replay is not enabled for ramped configurations because it did not meet accuracy standards. Earlier CUDA
-measurements used the withdrawn scheduler.
-
-```bash
-python -m pip install -e '.[cuda,eval,dev]'
-python scripts/benchmark_cuda_prefill.py \
-  --model /local-models/Llama-3.2-1B-Instruct \
-  --tokens 128 \
-  --output results/cuda_fused_prefill_128_tokens.json
-```
-
-### Concurrent CUDA decode schedule
-
-`CUDAConcurrentRunner` implements the paper's two-stack schedule: token `t-1` replays the upper stack on one CUDA
-stream while token `t` runs through the destination layer on another, and the streams join before token `t` enters
-its upper stack. Persistent Python worker threads enqueue the disjoint branches concurrently. The runner is enabled
-with both `GIL=1` and `GIL=0`: PyTorch releases the GIL around the CUDA operations used by the worker paths. LogBar
-records the detected mode. A free-threaded build such as CPython 3.14t with `-X gil=0` or `PYTHON_GIL=0` may still
-reduce host scheduling overhead. Readout remains on the token's first pass, as specified by the paper. The current API
-supports batch-one, unpadded inference.
-
-On a GIL-enabled Python 3.14.6 runtime, the current 128-token benchmark measured eager dual-stream execution at
-`1.054x` faster than sequential recirculation. Capturing the full dual-stream schedule measured `5.260x` speedup over
-sequential and `4.990x` over eager dual-stream execution while meeting accuracy standards. See
-[`results/cuda_concurrent_graph_gil1_128_tokens.md`](results/cuda_concurrent_graph_gil1_128_tokens.md). Benchmark
-artifacts record the detected runtime state and implementation commit.
-
-`CUDAGraphedConcurrentPrefill` captures the lower and replay streams, their event dependencies, and the joined upper
-stack as one fixed-shape CUDA Graph. A process-wide lock covers all warmups and capture, preventing two threads from
-capturing or warming CUDA graphs on the same device concurrently. Capture uses CUDA's global safety mode; replay is
-not locked. The benchmark needs to meet accuracy standards for both original and changed-token inputs.
-
-A sweep of capture safety modes, manual/automatic instantiation, and stream priorities found no material steady-state
-replay difference. High-priority (`-3`) lower/replay streams were nominally fastest and are the default, while capture
-retains the safer global mode and automatic instantiation. See
-[`results/cuda_graph_mode_sweep_gil1_128_tokens.md`](results/cuda_graph_mode_sweep_gil1_128_tokens.md).
-
-```bash
-python scripts/benchmark_cuda_concurrent.py \
-  --model /local-models/Llama-3.2-1B-Instruct \
-  --tokens 128 \
-  --output results/cuda_concurrent_128_tokens.json
-```
-
-### CUDA path and alpha screening
-
-`screen_cuda_recirculation.py` ports the MLX tuning screen to CUDA. It scores teacher-forced answer NLL, computes each
-candidate's 1,078-token shared prefix once, restores an immutable candidate-specific KV snapshot for every row, and
-loads the model and dataset only once. The hook-free dual-stream scheduler is the default. Its screening mode enqueues
-both CUDA branches from one Python thread, avoiding futures overhead while preserving stream overlap; outer candidate
-parallelism is available but defaults to one because four workers slowed the measured single-GPU workload. Terminal
-right-padding batches the 32 row suffixes and sparsely projects only answer-target positions; this reduced the measured
-32-row candidate time from 100.68 seconds to 33.62 seconds (`2.995x`) while meeting accuracy standards. Prefix graph
-capture is opt-in and limited to 256 tokens because a 1,078-token graph was unstable on the tested PyTorch/CUDA stack.
-A bounded static-cache graph is still needed to reach the 10x screening target safely.
-
-```bash
-PYTHONUNBUFFERED=1 \
-OMP_NUM_THREADS=16 \
-OPENBLAS_NUM_THREADS=16 \
-MKL_NUM_THREADS=16 \
-BLIS_NUM_THREADS=16 \
-VECLIB_MAXIMUM_THREADS=16 \
-NUMEXPR_NUM_THREADS=16 \
-python scripts/screen_cuda_recirculation.py \
-  --model /local-models/Llama-3.2-1B-Instruct \
-  --row-start 272 \
-  --rows 32 \
-  --forbid-range 0:272 \
-  --forbid-range 304:336 \
-  --alpha 0.10 \
-  --max-distance 12 \
-  --output results/cuda_path_screen_same_token_rows272_303_alpha010.json
-```
+Install with `python -m pip install -e '.[mlx,dev]'` for MLX or `python -m pip install -e '.[cuda,eval,dev]'` for CUDA.
+Reproduction commands and benchmark details are kept under [`results/`](results/).
 
 ## Citation
+
+Paper: [Recirculation (Mozer et al., 2026), arXiv:2608.17981v1](https://arxiv.org/html/2608.17981v1)
 
 ```bibtex
 @article{mozer2026recirculation,
   title={Recirculation},
   author={Mozer, Michael C. and Siddiqui, Shoaib Ahmed and Sawyer, Danny and Sanyal, Sunny and Liu, Rosanne},
   journal={arXiv preprint arXiv:2608.17981},
-  year={2026}
+  year={2026},
+  url={https://arxiv.org/abs/2608.17981v1}
 }
 ```
 
