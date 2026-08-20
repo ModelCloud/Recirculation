@@ -126,6 +126,27 @@ def objective_result_key(result: dict, objective: str, *, robust: bool) -> tuple
     return float(primary), float(summary["target_nll"]), float(result.get("alpha", math.inf))
 
 
+def screen_leaders(results: list[dict]) -> dict[str, dict | None]:
+    """Select every proxy leader from the full completed candidate population."""
+
+    leaders = {}
+    available_objectives = set(results[0].get("objectives", {})) if results else set()
+    for name, objective, robust in PROXY_RANKINGS:
+        leaders[name] = (
+            min(
+                results,
+                key=lambda result, selected_objective=objective, selected_robust=robust: objective_result_key(
+                    result,
+                    selected_objective,
+                    robust=selected_robust,
+                ),
+            )
+            if objective in available_objectives
+            else None
+        )
+    return leaders
+
+
 def proxy_shortlist(results: list[dict], limit: int) -> list[dict]:
     """Round-robin the four proxy rankings into one unique candidate shortlist."""
 
@@ -162,6 +183,78 @@ def proxy_shortlist(results: list[dict], limit: int) -> list[dict]:
         if not added and depth >= max(map(len, rankings), default=0):
             break
     return selected
+
+
+def render_screen_report_markdown(report: dict) -> str:
+    """Render a durable, human-readable ledger of every completed screen result."""
+
+    results = report.get("results", [])
+    total = report.get("total")
+    if total is None:
+        total = int(report.get("complete", 0)) + int(report.get("active", 0)) + int(report.get("pending", 0))
+    lines = [
+        "# CUDA Recirculation Screening Ledger",
+        "",
+        f"- Status: {report.get('status', 'unknown')}",
+        (
+            f"- Complete / active / pending / total: {report.get('complete', 0)} / "
+            f"{report.get('active', 0)} / {report.get('pending', 0)} / {total}"
+        ),
+        f"- Implementation commit: `{report.get('implementation_commit', 'unknown')}`",
+        f"- Promotion population: all {len(results)} completed candidates in this ledger",
+        "",
+        "## Current leaders",
+        "",
+        "| Ranking | Path | Alpha | Metric |",
+        "|---|---:|---:|---:|",
+    ]
+    for name, objective, robust in PROXY_RANKINGS:
+        leader = report.get("leaders", {}).get(name)
+        if leader is None:
+            lines.append(f"| {name} | — | — | — |")
+            continue
+        metrics = leader["objectives"][objective]
+        metric = metrics["screen_score"] if robust else metrics["target_perplexity"]
+        lines.append(
+            f"| {name} | {leader['source_layer']}→{leader['destination_layer']} | "
+            f"{leader['alpha']:.6g} | {metric:.9g} |"
+        )
+    lines.extend(
+        [
+            "",
+            "## All completed candidates",
+            "",
+            "The promotion shortlist is recalculated from this entire table, never only from the most recent result.",
+            "",
+            (
+                "| Path | Alpha | Seconds | Final PPL | Final ΔNLL | Final robust | Final tail harm | "
+                "Final I/R/N | Full PPL | Full ΔNLL | Full robust | Full tail harm | Full I/R/N |"
+            ),
+            "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        ]
+    )
+    for result in results:
+        final = result.get("objectives", {}).get("final_answer")
+        full = result.get("objectives", {}).get("full_solution")
+
+        def values(summary):
+            if summary is None:
+                return ("—",) * 5
+            return (
+                f"{summary['target_perplexity']:.9g}",
+                f"{summary['native_delta_nll']:.9g}",
+                f"{summary['screen_score']:.9g}",
+                f"{summary['tail_harm_nll']:.9g}",
+                f"{summary['improved_rows']}/{summary['regressed_rows']}/{summary['neutral_rows']}",
+            )
+
+        final_values = values(final)
+        full_values = values(full)
+        lines.append(
+            f"| {result['source_layer']}→{result['destination_layer']} | {result['alpha']:.6g} | "
+            f"{result.get('seconds', 0.0):.3f} | " + " | ".join((*final_values, *full_values)) + " |"
+        )
+    return "\n".join(lines) + "\n"
 
 
 def paired_selection_entry(

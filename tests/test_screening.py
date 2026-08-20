@@ -8,6 +8,8 @@ from recirculation.screening import (
     paired_selection_entry,
     perplexity_result_key,
     proxy_shortlist,
+    render_screen_report_markdown,
+    screen_leaders,
     screen_result_key,
     summarize_paired_losses,
 )
@@ -72,6 +74,59 @@ def test_dual_objective_shortlist_unions_plain_and_robust_leaders():
     ]
     assert objective_result_key(results[0], "final_answer", robust=False)[0] == 1.0
     assert [item["source_layer"] for item in proxy_shortlist(results, 4)] == [1, 2, 3, 4]
+
+
+def test_promotion_recalculates_against_full_population_and_keeps_early_winner():
+    def candidate(source, final_ppl, final_score, full_ppl, full_score):
+        return {
+            "source_layer": source,
+            "destination_layer": 0,
+            "alpha": 0.1,
+            "seconds": float(source),
+            "objectives": {
+                "final_answer": {
+                    "target_perplexity": final_ppl,
+                    "target_nll": final_ppl,
+                    "native_delta_nll": final_ppl,
+                    "screen_score": final_score,
+                    "tail_harm_nll": 0.0,
+                    "improved_rows": 1,
+                    "regressed_rows": 0,
+                    "neutral_rows": 0,
+                },
+                "full_solution": {
+                    "target_perplexity": full_ppl,
+                    "target_nll": full_ppl,
+                    "native_delta_nll": full_ppl,
+                    "screen_score": full_score,
+                    "tail_harm_nll": 0.0,
+                    "improved_rows": 1,
+                    "regressed_rows": 0,
+                    "neutral_rows": 0,
+                },
+            },
+        }
+
+    early_winner = candidate(1, 1.0, -1.0, 1.0, -1.0)
+    completed = [early_winner, candidate(2, 2.0, 2.0, 2.0, 2.0), candidate(3, 3.0, 3.0, 3.0, 3.0)]
+    leaders = screen_leaders(completed)
+    assert all(leader is early_winner for leader in leaders.values())
+    assert proxy_shortlist(completed, 1) == [early_winner]
+
+    report = {
+        "status": "running",
+        "complete": 3,
+        "active": 1,
+        "pending": 1,
+        "implementation_commit": "abc123",
+        "leaders": leaders,
+        "results": completed,
+    }
+    markdown = render_screen_report_markdown(report)
+    assert "all 3 completed candidates" in markdown
+    assert "1→0" in markdown
+    assert "2→0" in markdown
+    assert "3→0" in markdown
 
 
 def test_paired_loss_summary_rejects_mismatched_target_counts():

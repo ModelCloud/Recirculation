@@ -134,6 +134,11 @@ layer-distance cap. Each candidate step jointly scores complete solutions and th
 continuation; proxy regressions are kept distinct from actual accuracy flips, which require paired generation on the
 disjoint evaluation stage. Multiprocess screens can use `--native-baseline PATH`: prepare it once with
 `--baseline-only`, then every worker validates and reuses the same per-row baseline instead of recomputing alpha zero.
+When a screen is split across processes, merge every shard before promotion with
+`scripts/aggregate_cuda_screening.py`. The aggregate validates commit and scoring settings, rejects duplicate
+candidates, recalculates all four rankings over the full completed population, and atomically maintains both a full
+JSON record and a human-readable Markdown ledger. Downstream alpha or E2E promotion must consume this aggregate,
+never an individual shard.
 
 Install with `python -m pip install -e '.[mlx,dev]'` for MLX or `python -m pip install -e '.[cuda,eval,dev]'` for CUDA.
 Reproduction commands and benchmark details are kept under [`results/`](results/).

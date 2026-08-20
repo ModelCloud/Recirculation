@@ -40,6 +40,8 @@ from recirculation.screening import (
     gsm8k_solution_target,
     objective_result_key,
     proxy_shortlist,
+    render_screen_report_markdown,
+    screen_leaders,
     summarize_paired_losses,
 )
 from scripts.eval_gsm8k_platinum import _gold_answer, _prompt_ids, _task_contract
@@ -147,28 +149,14 @@ def _write_report(path, *, status, implementation_commit, settings, started, res
         key=lambda result: objective_result_key(result, default_objective, robust=True),
     )
     complete = len(ordered_results)
-    leaders = (
-        {
-            name: min(
-                ordered_results,
-                key=lambda result, objective=objective, robust=robust: objective_result_key(
-                    result, objective, robust=robust
-                ),
-            )
-            for name, objective, robust in PROXY_RANKINGS
-            if objective in ordered_results[0]["objectives"]
-        }
-        if ordered_results
-        else {}
-    )
-    for name, _, _ in PROXY_RANKINGS:
-        leaders.setdefault(name, None)
+    leaders = screen_leaders(ordered_results)
     default_leader = leaders[f"{default_objective}_robust"]
     report = {
         "status": status,
         "complete": complete,
         "active": 1 if status == "running" and complete < total else 0,
         "pending": max(total - complete - (1 if status == "running" and complete < total else 0), 0),
+        "total": total,
         "implementation_commit": implementation_commit,
         "settings": settings,
         "seconds": elapsed_offset + time.perf_counter() - started,
@@ -180,7 +168,13 @@ def _write_report(path, *, status, implementation_commit, settings, started, res
         "results": ordered_results,
     }
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    json_temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    json_temporary.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    json_temporary.replace(path)
+    markdown = path.with_suffix(".md")
+    markdown_temporary = markdown.with_name(f".{markdown.name}.{os.getpid()}.tmp")
+    markdown_temporary.write_text(render_screen_report_markdown(report), encoding="utf-8")
+    markdown_temporary.replace(markdown)
 
 
 def _score_candidate(
