@@ -1,0 +1,24 @@
+{
+  "model": "/local-models/Llama-3.2-1B-Instruct",
+  "new_tokens": 16,
+  "prompt_tokens": 128,
+  "repetitions": 2,
+  "results": {
+    "direct": {
+      "median_seconds": 3.2239780253730714,
+      "seconds": [
+        3.249875921756029,
+        3.1980801289901137
+      ],
+      "tokens_per_second": 4.962812982619048
+    },
+    "threaded": {
+      "median_seconds": 3.229144283104688,
+      "seconds": [
+        3.169421188533306,
+        3.2888673776760697
+      ],
+      "tokens_per_second": 4.95487305529026
+    }
+  }
+}
