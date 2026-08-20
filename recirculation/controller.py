@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 
-"""Inference-only deep-to-shallow residual feedback.
+"""Inference-only same-token deep-to-shallow residual feedback.
 
 This is the one-path, one-iteration variant from "Recirculation". The
 controller operates through decoder-layer hooks and does not modify model
 weights or checkpoint tensors. The controller's ``generate`` method performs serial prefill and cached
- decoding, so every token receives the source activation from the preceding
- token, including prompt tokens.
+ decoding. Each token is replayed from the destination through the upper stack
+ using its own first-pass source and destination activations.
 """
 
 from __future__ import annotations
@@ -46,6 +46,12 @@ class RecirculationConfig:
         object.__setattr__(self, "beta", float(beta))
 
 
+@dataclass(frozen=True)
+class _PendingRecirculation:
+    destination: torch.Tensor
+    source: torch.Tensor
+
+
 def _find_decoder_layers(model: nn.Module) -> nn.ModuleList:
     """Find the standard Hugging Face decoder layer list without assuming a wrapper depth."""
 
@@ -73,20 +79,8 @@ def _hidden_states_from_output(output: Any) -> torch.Tensor:
     raise TypeError("Recirculation source layer returned no tensor hidden states.")
 
 
-def _replace_hidden_states_output(output: Any, hidden_states: torch.Tensor) -> Any:
-    """Replace the residual-stream field while preserving decoder auxiliary outputs."""
-
-    if torch.is_tensor(output):
-        return hidden_states
-    if isinstance(output, tuple):
-        return (hidden_states, *output[1:])
-    if isinstance(output, list):
-        return [hidden_states, *output[1:]]
-    raise TypeError("Recirculation destination layer returned an unsupported output container.")
-
-
 class RecirculationController:
-    """Attach and detach one delayed deep-to-shallow residual feedback path.
+    """Attach and detach one same-token, one-iteration feedback path.
 
     This is an inference-time intervention and does not alter model weights or
     serialized metadata. Use :meth:`generate` for paper-faithful serial prefill.
@@ -109,7 +103,9 @@ class RecirculationController:
         self._destination = layers[config.destination_layer]
         self._source = layers[config.source_layer]
         self._handles: list[Any] = []
-        self._pending_source: torch.Tensor | None = None
+        self._pending: _PendingRecirculation | None = None
+        self._current_destination: torch.Tensor | None = None
+        self._in_second_pass = False
         self._position = 0
         self._active = False
         self._mixer = mixer
@@ -117,18 +113,18 @@ class RecirculationController:
     def reset(self) -> None:
         """Discard delayed state before starting another prompt."""
 
-        self._pending_source = None
+        self._pending = None
+        self._current_destination = None
         self._position = 0
 
     def _destination_hook(self, _module: nn.Module, _args: tuple[Any, ...], output: Any):
-        if self._pending_source is None:
-            return output
         hidden_states = _hidden_states_from_output(output)
-        source = self._pending_source.to(device=hidden_states.device, dtype=hidden_states.dtype)
-        if source.shape[:2] != hidden_states.shape[:2]:
-            raise RuntimeError(
-                "Recirculation source/destination shapes differ; use standard generation with a stable batch size."
-            )
+        if not self._in_second_pass:
+            self._current_destination = hidden_states[:, -1:, :].detach()
+        return output
+
+    def _mix(self, destination: torch.Tensor, source: torch.Tensor) -> torch.Tensor:
+        source = source.to(device=destination.device, dtype=destination.dtype)
         strength = self.config.alpha
         if self.config.ramp_tokens:
             strength *= min(1.0, self._position / float(self.config.ramp_tokens))
@@ -138,27 +134,59 @@ class RecirculationController:
         if self.config.beta == 1.0 - self.config.alpha:
             beta = 1.0 - strength
         if self._mixer is not None:
-            mixed = self._mixer(hidden_states, source, strength, beta, self.config.normalize_source)
-            self._pending_source = None
-            return _replace_hidden_states_output(output, mixed)
+            return self._mixer(destination, source, strength, beta, self.config.normalize_source)
         if self.config.normalize_source:
             destination_norm = (
-                hidden_states.float().norm(dim=-1, keepdim=True).clamp_min(torch.finfo(torch.float32).eps)
+                destination.float().norm(dim=-1, keepdim=True).clamp_min(torch.finfo(torch.float32).eps)
             )
             source_norm = source.float().norm(dim=-1, keepdim=True).clamp_min(torch.finfo(torch.float32).eps)
             source = source * (destination_norm.to(source.dtype) / source_norm.to(source.dtype))
-        mixed = beta * hidden_states + strength * source
-        self._pending_source = None
-        return _replace_hidden_states_output(output, mixed)
+        return beta * destination + strength * source
 
     def _source_hook(self, _module: nn.Module, _args: tuple[Any, ...], output: Any):
         hidden_states = _hidden_states_from_output(output)
-        # The source from token t is consumed by token t+1. During prefill we
-        # retain only the final prompt token, which is the first useful state
-        # for autoregressive generation.
-        self._pending_source = hidden_states[:, -1:, :].detach()
+        if self._in_second_pass:
+            return output
+        if self._current_destination is None:
+            raise RuntimeError("destination activation was not captured before source activation")
+        self._pending = _PendingRecirculation(
+            self._current_destination,
+            hidden_states[:, -1:, :].detach(),
+        )
         self._position += int(hidden_states.shape[1])
         return output
+
+    def _recirculate_pending(self, past_key_values, attention_mask: torch.Tensor) -> None:
+        if self._pending is None:
+            return
+        decoder = self.model.model
+        sequence_length = past_key_values.get_seq_length()
+        if sequence_length < 1:
+            raise RuntimeError("cannot recirculate an empty KV cache")
+        first_upper_layer = self.config.destination_layer + 1
+        for layer in past_key_values.layers[first_upper_layer:]:
+            layer.crop(-1)
+        hidden_states = self._mix(self._pending.destination, self._pending.source)
+        position_ids = torch.tensor(
+            [[sequence_length - 1]], dtype=torch.long, device=hidden_states.device
+        )
+        if not bool(attention_mask[:, :sequence_length].all()):
+            raise ValueError("paper-exact replay currently requires an unpadded batch")
+        position_embeddings = decoder.rotary_emb(hidden_states, position_ids=position_ids)
+        self._in_second_pass = True
+        try:
+            for layer in decoder.layers[first_upper_layer:]:
+                hidden_states = layer(
+                    hidden_states,
+                    attention_mask=None,
+                    position_ids=position_ids,
+                    past_key_values=past_key_values,
+                    use_cache=True,
+                    position_embeddings=position_embeddings,
+                )
+        finally:
+            self._in_second_pass = False
+        self._pending = None
 
     def attach(self) -> RecirculationController:
         if self._active:
@@ -175,7 +203,8 @@ class RecirculationController:
         for handle in self._handles:
             handle.remove()
         self._handles.clear()
-        self._pending_source = None
+        self._pending = None
+        self._current_destination = None
         self._active = False
 
     @torch.inference_mode()
@@ -187,11 +216,11 @@ class RecirculationController:
         max_new_tokens: int,
         eos_token_id: int | None = None,
     ) -> torch.Tensor:
-        """Generate with paper-faithful serial prefill and cached decode.
+        """Generate with paper-faithful same-token replay and cached decode.
 
-        The paper's recurrence is across input steps, so a normal parallel
-        ``model.generate`` prefill is not equivalent. This method runs every
-        prompt token and generated token as one cached forward step.
+        Before first-passing token ``t``, this method second-passes token
+        ``t-1`` from the destination through the upper stack and replaces its
+        upper-layer KV entries. A normal parallel prefill is not equivalent.
         """
 
         if input_ids.ndim != 2 or input_ids.shape[0] != 1:
@@ -213,6 +242,8 @@ class RecirculationController:
             for position in range(prompt_length):
                 token = input_ids[:, position : position + 1]
                 prefix_mask = attention_mask[:, : position + 1]
+                if past_key_values is not None:
+                    self._recirculate_pending(past_key_values, prefix_mask)
                 outputs = self.model(
                     input_ids=token,
                     attention_mask=prefix_mask,
@@ -228,7 +259,10 @@ class RecirculationController:
                 generated = torch.cat((generated, token), dim=1)
                 if eos_token_id is not None and bool((token == eos_token_id).all()):
                     break
-                full_mask = torch.ones((1, generated.shape[1]), dtype=attention_mask.dtype, device=generated.device)
+                full_mask = torch.ones(
+                    (1, generated.shape[1]), dtype=attention_mask.dtype, device=generated.device
+                )
+                self._recirculate_pending(past_key_values, full_mask)
                 outputs = self.model(
                     input_ids=token,
                     attention_mask=full_mask,

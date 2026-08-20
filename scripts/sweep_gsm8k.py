@@ -39,6 +39,26 @@ def _parse_candidate(value: str) -> tuple[int, int, float]:
         raise argparse.ArgumentTypeError("candidate must be SOURCE:DESTINATION:ALPHA") from exc
 
 
+def _paired_candidate_summary(samples, reference_arm: str, candidate_arm: str):
+    result = {}
+    for answer_key, label in (("strict_answer", "strict"), ("flexible_answer", "flexible")):
+        changes = wrong_to_correct = correct_to_wrong = 0
+        for sample in samples:
+            reference = sample[reference_arm][answer_key]
+            candidate = sample[candidate_arm][answer_key]
+            gold = sample["gold_answer"]
+            changes += reference != candidate
+            wrong_to_correct += reference != gold and candidate == gold
+            correct_to_wrong += reference == gold and candidate != gold
+        result[label] = {
+            "answer_changes": changes,
+            "wrong_to_correct": wrong_to_correct,
+            "correct_to_wrong": correct_to_wrong,
+            "net_correct": wrong_to_correct - correct_to_wrong,
+        }
+    return result
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default="meta-llama/Llama-3.2-1B-Instruct")
@@ -49,6 +69,7 @@ def main() -> int:
     parser.add_argument("--row-start", type=int, default=128)
     parser.add_argument("--rows", type=int, default=16)
     parser.add_argument("--max-new-tokens", type=int, default=128)
+    parser.add_argument("--skip-baseline", action="store_true")
     parser.add_argument(
         "--candidate",
         action="append",
@@ -92,12 +113,13 @@ def main() -> int:
         )
 
     started = time.perf_counter()
-    for sample_index, sample in enumerate(samples):
-        sample["baseline"] = _generate(
-            model, tokenizer, sample["prompt_ids"], device, args.max_new_tokens, until
-        )
-        if (sample_index + 1) % 4 == 0:
-            print(f"baseline rows {sample_index + 1}/{len(samples)}", flush=True)
+    if not args.skip_baseline:
+        for sample_index, sample in enumerate(samples):
+            sample["baseline"] = _generate(
+                model, tokenizer, sample["prompt_ids"], device, args.max_new_tokens, until
+            )
+            if (sample_index + 1) % 4 == 0:
+                print(f"baseline rows {sample_index + 1}/{len(samples)}", flush=True)
     for candidate_index, (source, destination, alpha) in enumerate(args.candidate):
         config = RecirculationConfig(source_layer=source, destination_layer=destination, alpha=alpha)
         arm = f"source{source}_destination{destination}_alpha{alpha:g}"
@@ -120,10 +142,28 @@ def main() -> int:
                 print(f"candidate {candidate_index + 1}/{len(args.candidate)} {arm} rows={sample_index + 1} correct={correct}", flush=True)
 
     summaries = {}
+    baseline_summary = None if args.skip_baseline else _summary(samples, "baseline")
     for source, destination, alpha in args.candidate:
         arm = f"source{source}_destination{destination}_alpha{alpha:g}"
         summaries[arm] = _summary(samples, arm)
-        summaries[arm]["delta_vs_baseline"] = summaries[arm]["flexible_correct"] - _summary(samples, "baseline")["flexible_correct"]
+        if baseline_summary is not None:
+            summaries[arm]["delta_vs_baseline"] = (
+                summaries[arm]["flexible_correct"] - baseline_summary["flexible_correct"]
+            )
+    comparison = None
+    if len(args.candidate) == 2:
+        reference = args.candidate[0]
+        candidate = args.candidate[1]
+        reference_arm = f"source{reference[0]}_destination{reference[1]}_alpha{reference[2]:g}"
+        candidate_arm = f"source{candidate[0]}_destination{candidate[1]}_alpha{candidate[2]:g}"
+        comparison = {
+            "reference_arm": reference_arm,
+            "candidate_arm": candidate_arm,
+            "flexible_correct_delta": (
+                summaries[candidate_arm]["flexible_correct"] - summaries[reference_arm]["flexible_correct"]
+            ),
+            "paired": _paired_candidate_summary(samples, reference_arm, candidate_arm),
+        }
     report = {
         "settings": {
             "model": args.model,
@@ -134,9 +174,11 @@ def main() -> int:
             "max_new_tokens": args.max_new_tokens,
             "fewshot_count": len(fewshots),
             "candidates": [list(candidate) for candidate in args.candidate],
+            "baseline_skipped": args.skip_baseline,
         },
         "seconds": time.perf_counter() - started,
         "summaries": summaries,
+        "comparison": comparison,
         "samples": [{key: value for key, value in sample.items() if key != "prompt_ids"} for sample in samples],
     }
     output = args.output.expanduser().resolve()

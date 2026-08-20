@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
-"""Paper-faithful MLX recirculation with serial prefill and KV caching."""
+"""Paper-faithful MLX same-token recirculation with upper-KV replacement."""
 
 from __future__ import annotations
 
@@ -31,9 +31,15 @@ class ForwardError:
 
 
 @dataclass(frozen=True)
+class PendingRecirculation:
+    destination: mx.array
+    source: mx.array
+
+
+@dataclass(frozen=True)
 class MLXPrefillSnapshot:
     cache_states: tuple
-    pending_source: mx.array
+    pending: PendingRecirculation
 
 
 def measure_forward_error(reference: mx.array, candidate: mx.array) -> ForwardError:
@@ -99,12 +105,12 @@ class MLXRecirculator:
     def make_cache(self):
         return self.model.make_cache()
 
-    def snapshot(self, cache, pending_source: mx.array) -> MLXPrefillSnapshot:
-        """Capture KV state and delayed source so an exact prefix can be reused."""
+    def snapshot(self, cache, pending: PendingRecirculation) -> MLXPrefillSnapshot:
+        """Capture KV state and the final token's pending same-token second pass."""
 
         states = tuple(layer_cache.state for layer_cache in cache)
-        mx.eval(*(array for state in states for array in state), pending_source)
-        return MLXPrefillSnapshot(states, pending_source)
+        mx.eval(*(array for state in states for array in state), pending.destination, pending.source)
+        return MLXPrefillSnapshot(states, pending)
 
     def restore(self, snapshot: MLXPrefillSnapshot):
         """Restore a prefix into fresh cache objects without recomputing it."""
@@ -114,16 +120,48 @@ class MLXRecirculator:
             raise ValueError("snapshot layer count differs from model cache")
         for layer_cache, state in zip(cache, snapshot.cache_states):
             layer_cache.state = state
-        return cache, snapshot.pending_source
+        return cache, snapshot.pending
 
-    def step(self, token: mx.array, cache, pending_source: mx.array | None = None, *, project_logits: bool = True):
-        """Process exactly one token and return logits plus the source for the next token."""
+    def _recirculate_pending(self, cache, pending: PendingRecirculation | None) -> None:
+        """Replace the preceding token's upper-stack KV states with its second pass."""
+
+        if pending is None:
+            return
+        decoder = self.model.model
+        first_upper_layer = self.config.destination_layer + 1
+        for layer_cache in cache[first_upper_layer:]:
+            if layer_cache.trim(1) != 1:
+                raise RuntimeError("cannot rewind the preceding token for recirculation")
+        hidden = self.mixer(pending.destination, pending.source, self.config)
+        full_mask = create_attention_mask(hidden, cache[first_upper_layer])
+        sliding_mask = None
+        if decoder.swa_idx is not None:
+            sliding_mask = create_attention_mask(
+                hidden, cache[first_upper_layer], window_size=decoder.sliding_window
+            )
+        for layer, layer_cache in zip(
+            decoder.layers[first_upper_layer:], cache[first_upper_layer:]
+        ):
+            mask = sliding_mask if layer.use_sliding else full_mask
+            hidden = layer(hidden, mask, cache=layer_cache)
+        mx.eval(hidden)
+
+    def step(
+        self,
+        token: mx.array,
+        cache,
+        pending: PendingRecirculation | None = None,
+        *,
+        project_logits: bool = True,
+    ):
+        """Second-pass the preceding token, then first-pass one new token."""
 
         if token.ndim == 1:
             token = token[None, :]
         if token.shape != (1, 1):
             raise ValueError("step requires one token with shape [1, 1]")
         decoder = self.model.model
+        self._recirculate_pending(cache, pending)
         hidden = decoder.embed_tokens(token)
         full_mask = create_attention_mask(hidden, cache[decoder.fa_idx])
         sliding_mask = None
@@ -131,29 +169,32 @@ class MLXRecirculator:
             sliding_mask = create_attention_mask(
                 hidden, cache[decoder.swa_idx], window_size=decoder.sliding_window
             )
-        next_source = None
+        destination = source = None
         for index, (layer, layer_cache) in enumerate(zip(decoder.layers, cache)):
             mask = sliding_mask if layer.use_sliding else full_mask
             hidden = layer(hidden, mask, cache=layer_cache)
-            if index == self.config.destination_layer and pending_source is not None:
-                hidden = self.mixer(hidden, pending_source, self.config)
+            if index == self.config.destination_layer:
+                destination = hidden
             if index == self.config.source_layer:
-                next_source = hidden
+                source = hidden
+        if destination is None or source is None:
+            raise RuntimeError("recirculation path activations were not captured")
+        next_pending = PendingRecirculation(destination, source)
         if not project_logits:
-            return None, next_source
+            return None, next_pending
         hidden = decoder.norm(hidden)
         if self.model.args.tie_word_embeddings:
             logits = decoder.embed_tokens.as_linear(hidden)
         else:
             logits = self.model.lm_head(hidden)
-        return logits, next_source
+        return logits, next_pending
 
     def prefill(
         self,
         tokens: Sequence[int] | mx.array,
         *,
         cache=None,
-        pending_source=None,
+        pending=None,
         collect_logits: bool = False,
     ):
         """Serially prefill tokens, preserving the paper's recurrence across prompt steps."""
@@ -166,25 +207,25 @@ class MLXRecirculator:
         tokens = list(tokens)
         for index, token in enumerate(tokens):
             project_logits = collect_logits or index == len(tokens) - 1
-            logits, pending_source = self.step(
+            logits, pending = self.step(
                 mx.array([[int(token)]], dtype=mx.int32),
                 cache,
-                pending_source,
+                pending,
                 project_logits=project_logits,
             )
             if logits is not None:
                 collected.append(logits)
         if logits is None:
             raise ValueError("prefill requires at least one token")
-        mx.eval(logits, pending_source)
-        return logits, cache, pending_source, mx.concatenate(collected, axis=1)
+        mx.eval(logits, pending.destination, pending.source)
+        return logits, cache, pending, mx.concatenate(collected, axis=1)
 
     def prefill_from_snapshot(
         self, tokens: Sequence[int] | mx.array, snapshot: MLXPrefillSnapshot, *, collect_logits: bool = False
     ):
-        cache, pending_source = self.restore(snapshot)
+        cache, pending = self.restore(snapshot)
         return self.prefill(
-            tokens, cache=cache, pending_source=pending_source, collect_logits=collect_logits
+            tokens, cache=cache, pending=pending, collect_logits=collect_logits
         )
 
 
@@ -194,6 +235,7 @@ __all__ = [
     "ForwardError",
     "MLXPrefillSnapshot",
     "MLXRecirculator",
+    "PendingRecirculation",
     "measure_forward_error",
     "mix_reference",
 ]

@@ -142,7 +142,7 @@ class FusedNormMix:
 
 
 class CUDAPrefillRunner:
-    """Paper-faithful cached prefill that skips intermediate vocabulary projections."""
+    """Same-token replay prefill that skips intermediate vocabulary projections."""
 
     def __init__(
         self,
@@ -169,7 +169,7 @@ class CUDAPrefillRunner:
         attention_mask: torch.Tensor | None = None,
         collect_logits: bool = False,
     ):
-        """Return final logits, KV cache, delayed source, and optionally every token's logits."""
+        """Return final logits, KV cache, pending source, and optionally every token's logits."""
 
         device = next(self.model.parameters()).device
         if not isinstance(tokens, torch.Tensor):
@@ -192,9 +192,12 @@ class CUDAPrefillRunner:
         self.controller.attach()
         try:
             for position in range(tokens.shape[1]):
+                prefix_mask = attention_mask[:, : position + 1]
+                if cache is not None:
+                    self.controller._recirculate_pending(cache, prefix_mask)
                 output = self.decoder(
                     input_ids=tokens[:, position : position + 1],
-                    attention_mask=attention_mask[:, : position + 1],
+                    attention_mask=prefix_mask,
                     past_key_values=cache,
                     use_cache=True,
                     return_dict=True,
@@ -205,10 +208,10 @@ class CUDAPrefillRunner:
                     logits = self.output_embeddings(output.last_hidden_state[:, -1:, :])
                 if collect_logits or is_final:
                     collected.append(logits)
-            pending_source = self.controller._pending_source
-            if logits is None or pending_source is None:  # pragma: no cover - guarded by model/config validation
-                raise RuntimeError("prefill did not produce logits and delayed source state")
-            return logits, cache, pending_source.detach(), torch.cat(collected, dim=1)
+            pending = self.controller._pending
+            if logits is None or pending is None:  # pragma: no cover - guarded by model/config validation
+                raise RuntimeError("prefill did not produce logits and pending replay state")
+            return logits, cache, pending.source.detach(), torch.cat(collected, dim=1)
         finally:
             self.controller.detach()
 

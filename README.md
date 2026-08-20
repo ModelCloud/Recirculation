@@ -1,62 +1,29 @@
 # Recirculation reproduction
 
-> [!WARNING]
-> **Implementation status:** The current implementation has known bugs and inconsistencies with the paper. The code and
-> reported results should therefore be treated as provisional and not yet as a paper-faithful reproduction. A fix and
-> renewed validation are underway.
-
 ## Progress
 
-- 2026-08-20 — Graphed CUDA fused prefill ran **3.987x faster** over 128 tokens within the forward-error gate.
-- 2026-08-20 — Exact shared-prefix reuse made real eight-shot GSM8K prefill **5.24x faster** with zero measured error.
-- 2026-08-20 — MLX prefill reached **1.30x speedup** over 128 tokens with zero measured forward error.
-- 2026-08-20 — Shared-prefix reuse reached **3.34x speedup** for repeated prompts.
-- 2026-08-20 — Dense Llama 3.2 1B improved from 46.09% to 53.91% on the 128-row confirmation.
+- 2026-08-20 — Corrected recirculation to replay each token's own upper stack and replace its upper-layer KV state.
+- 2026-08-20 — With zero feedback, replay now matches ordinary serial inference exactly in Torch and MLX.
 
 This repository contains an independent, inference-only implementation and validation of
 [Recirculation](https://arxiv.org/abs/2608.17981). It is not the authors' official implementation.
 
-The implementation adds a delayed deep-to-shallow residual path. For token step `t`, the source activation from a
-deeper layer is norm-matched and mixed into the output of a shallower destination layer at step `t+1`:
+For token `t`, its first-pass source activation is norm-matched and mixed with its own first-pass destination
+activation. The mixed state is then replayed through layers after the destination, replacing token `t`'s upper-layer
+KV entries before token `t+1` is processed:
 
 ```text
 s_hat = ||d|| / ||s|| * s
-d_next = beta * d + alpha * s_hat
+d_second_pass = beta * d_first_pass + alpha * s_hat_first_pass
 ```
 
-Serial prefill is required because prompt token `t+1` consumes feedback produced by prompt token `t`. Decode remains
-cached and autoregressive. The intervention changes neither model weights nor checkpoint files.
+Serial prefill is required because token `t`'s corrected upper-layer state must be available before token `t+1`
+reaches those layers. The intervention changes neither model weights nor checkpoint files.
 
-## Reproduction result
+## Evaluation status
 
-We first screened four middle-stack layer pairs on 16 GSM8K-Platinum rows. The selected `12 -> 5` pair was then locked
-and evaluated on a disjoint 128-row confirmation slice using dense `meta-llama/Llama-3.2-1B-Instruct`.
-
-| Metric | Baseline | Recirculation | Change |
-|---|---:|---:|---:|
-| Correct answers | 59/128 | **69/128** | **+10** |
-| Accuracy | 46.09% | **53.91%** | **+7.81 points** |
-| Relative accuracy | — | — | **+16.95%** |
-| Wrong to correct | — | 15 | — |
-| Correct to wrong | — | 5 | — |
-
-The paired discordances are 15 gains and 5 losses (exact two-sided binomial/McNemar `p ~= 0.0414`). This is a focused
-reproduction result, not evidence that the configuration generalizes to other models, datasets, or prompt formats.
-
-### Locked confirmation configuration
-
-| Setting | Value |
-|---|---|
-| Model | `meta-llama/Llama-3.2-1B-Instruct` (dense) |
-| Dataset | `madrylab/gsm8k-platinum`, test rows 144–271 |
-| Source -> destination | `12 -> 5` on the next token |
-| Alpha / beta | `0.10 / 0.90` |
-| Source normalization | L2 norm matched to destination |
-| Ramp | Disabled |
-| Decode | Greedy, at most 256 new tokens |
-| Prompt | Fixed eight-shot chat prompt in `configs/` |
-
-Aggregate artifacts are under [`results/`](results/). They intentionally exclude dataset questions and model outputs.
+Results produced before the same-token replay correction measured a different delayed cross-token intervention and
+are withdrawn as recirculation evidence. Path/alpha tuning and the locked GSM8K confirmation must be rerun.
 
 ## Install and test
 
@@ -67,8 +34,7 @@ python -m pip install -e '.[eval,dev]'
 pytest -q
 ```
 
-The unit tests verify that feedback comes from the previous token, is mixed after the destination layer, and is removed
-cleanly when the controller detaches.
+The tests verify the published norm-ratio mixture, prohibit cross-token injection, and check replay state handling.
 
 ## Run the confirmation evaluation
 
@@ -119,10 +85,8 @@ Detailed benchmark outputs and settings are available under [`results/`](results
 ## CUDA prefill
 
 The CUDA backend preserves token-serial KV-cache updates while fusing the two L2 reductions, source normalization, and
-residual mixture into one Triton kernel. It also skips the vocabulary projection for every non-final prompt token. For
-repeated inference at a known prompt length, `CUDAGraphedPrefill` captures the complete serial loop and replays it with
-new token and mask values, removing per-token CPU dispatch. Fused results are gated against the ordinary PyTorch
-expression with the same `2e-3` maximum forward-error rate.
+residual mixture into one Triton kernel. CUDA performance results produced before the same-token replay correction are
+withdrawn and must be rerun against the corrected scheduler.
 
 ```bash
 python -m pip install -e '.[cuda,eval,dev]'

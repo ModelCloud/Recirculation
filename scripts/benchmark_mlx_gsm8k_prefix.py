@@ -56,8 +56,8 @@ def main() -> int:
         return output
 
     def cached_prefill():
-        _, cache, pending_source, _ = runner.prefill(prefix)
-        snapshot = runner.snapshot(cache, pending_source)
+        _, cache, pending, _ = runner.prefill(prefix)
+        snapshot = runner.snapshot(cache, pending)
         output = mx.concatenate([runner.prefill_from_snapshot(suffix, snapshot)[0] for suffix in suffixes])
         mx.eval(output)
         return output
