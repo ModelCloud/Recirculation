@@ -206,6 +206,11 @@ def main() -> int:
         action="store_true",
         help="Request Transformers StaticCache for dense CUDA generation.",
     )
+    parser.add_argument(
+        "--cuda-compile-runner",
+        action="store_true",
+        help="Compile recirculation lower/upper stacks with CUDA graph trees disabled.",
+    )
     parser.add_argument("--top-k", type=int, default=5)
     parser.add_argument(
         "--harm-weight",
@@ -320,6 +325,12 @@ def main() -> int:
             )
             for source, destination, alpha in args.candidate
         }
+        if args.cuda_compile_runner:
+            for runner in candidate_runners.values():
+                compile_options = {"triton.cudagraphs": False}
+                runner._run_lower = torch.compile(runner._run_lower, dynamic=True, options=compile_options)
+                runner._run_upper = torch.compile(runner._run_upper, dynamic=True, options=compile_options)
+            print("Compiled recirculation stacks enabled (Inductor CUDA graph trees disabled)", flush=True)
     graph_prefills = {}
 
     samples = []
@@ -572,6 +583,7 @@ def main() -> int:
             "cuda_compile_used": compile_used,
             "cuda_python_threads": args.cuda_python_threads,
             "cuda_static_cache": args.cuda_static_cache,
+            "cuda_compile_runner": args.cuda_compile_runner,
         },
         "seconds": time.perf_counter() - started,
         "summaries": summaries,
