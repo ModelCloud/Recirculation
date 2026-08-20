@@ -104,6 +104,46 @@ def test_cuda_concurrent_stacks_match_sequential_scheduler(monkeypatch):
     assert candidate[2].token_position == reference[2].token_position == 3
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_cuda_concurrent_graph_matches_eager_for_changed_tokens(monkeypatch):
+    transformers = pytest.importorskip("transformers")
+    from recirculation.cuda_backend import CUDAConcurrentRunner, CUDAGraphedConcurrentPrefill, measure_forward_error
+
+    monkeypatch.setattr(__import__("sys"), "_is_gil_enabled", lambda: False)
+    model = (
+        transformers.LlamaForCausalLM(
+            transformers.LlamaConfig(
+                vocab_size=32,
+                hidden_size=64,
+                intermediate_size=128,
+                num_hidden_layers=4,
+                num_attention_heads=4,
+                num_key_value_heads=2,
+            )
+        )
+        .half()
+        .eval()
+        .cuda()
+    )
+    config = RecirculationConfig(source_layer=2, destination_layer=0, alpha=0.1)
+    tokens = torch.tensor([[1, 2, 3, 4]], device="cuda")
+    changed_tokens = torch.tensor([[4, 3, 2, 1]], device="cuda")
+    concurrent = CUDAConcurrentRunner(model, config)
+    try:
+        graphed = CUDAGraphedConcurrentPrefill(concurrent, tokens, warmups=1)
+        expected = concurrent.prefill(changed_tokens)
+        candidate = graphed.prefill(changed_tokens)
+        logits_error = measure_forward_error(expected[0], candidate[0])
+        pending_error = measure_forward_error(
+            torch.cat((expected[2].destination, expected[2].source), dim=-1),
+            torch.cat((candidate[2].destination, candidate[2].source), dim=-1),
+        )
+        logits_error.require()
+        pending_error.require()
+    finally:
+        concurrent.close()
+
+
 def test_cuda_concurrent_runner_rejects_gil_enabled_python(monkeypatch):
     from recirculation.cuda_backend import CUDAConcurrentRunner
 

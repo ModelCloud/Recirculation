@@ -10,6 +10,10 @@
 
 This repository contains an independent, inference-only implementation and validation of
 [Recirculation](https://arxiv.org/abs/2608.17981). It is not the authors' official implementation.
+The code aims to remain as faithful to the upstream method as possible. Backend implementations may differ slightly,
+especially during inference, where MLX, CUDA, ROCm, and their underlying hardware impose different execution and
+kernel constraints. Such backend-specific differences should preserve the published mathematical and state behavior
+and must be validated against the repository's accuracy gates.
 
 For token `t`, its first-pass source activation is norm-matched and mixed with its own first-pass destination
 activation. The mixed state is then replayed through layers after the destination, replacing token `t`'s upper-layer
@@ -115,6 +119,11 @@ inference.
 The development benchmark recorded `1.065x` speedup with zero measured logits or pending-state error, but it used a
 GIL-enabled runtime before this guard was introduced. New concurrency benchmarks require `GIL=0` and record the
 detected runtime state in their output.
+
+`CUDAGraphedConcurrentPrefill` captures the lower and replay streams, their event dependencies, and the joined upper
+stack as one fixed-shape CUDA Graph. A process-wide lock covers all warmups and capture, preventing two threads from
+capturing or warming CUDA graphs on the same device concurrently. Capture uses CUDA's global safety mode; replay is
+not locked. The benchmark gates both the original and changed-token outputs at accumulated error `<=2e-3`.
 
 ```bash
 python scripts/benchmark_cuda_concurrent.py \

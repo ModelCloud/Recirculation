@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import sys
+import threading
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -23,6 +24,7 @@ from .controller import RecirculationConfig, RecirculationController, _mixing_co
 
 MAX_FORWARD_ERROR = 2e-3
 LOG = LogBar.shared()
+_CUDA_GRAPH_CAPTURE_LOCK = threading.Lock()
 
 
 def require_gil_disabled() -> None:
@@ -284,6 +286,9 @@ class CUDAConcurrentRunner:
         self.device = device
         self.lower_stream = torch.cuda.Stream(device=device)
         self.replay_stream = torch.cuda.Stream(device=device)
+        self.dependency_event = torch.cuda.Event()
+        self.lower_done_event = torch.cuda.Event()
+        self.replay_done_event = torch.cuda.Event()
         self.executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="recirculation-cuda")
         self.gil_enabled = False
 
@@ -391,18 +396,15 @@ class CUDAConcurrentRunner:
         else:
             if pending.token_position != token_position - 1:
                 raise ValueError("pending token position does not precede the current cache position")
-            dependency = torch.cuda.Event()
-            dependency.record(main_stream)
-            replay_future = self.executor.submit(self._replay_branch, pending, cache, dependency)
-            lower_future = self.executor.submit(self._lower_branch, token, cache, token_position, dependency)
+            self.dependency_event.record(main_stream)
+            replay_future = self.executor.submit(self._replay_branch, pending, cache, self.dependency_event)
+            lower_future = self.executor.submit(self._lower_branch, token, cache, token_position, self.dependency_event)
             destination, position_ids, position_embeddings = lower_future.result()
             replay_future.result()
-            lower_done = torch.cuda.Event()
-            replay_done = torch.cuda.Event()
-            lower_done.record(self.lower_stream)
-            replay_done.record(self.replay_stream)
-            main_stream.wait_event(lower_done)
-            main_stream.wait_event(replay_done)
+            self.lower_done_event.record(self.lower_stream)
+            self.replay_done_event.record(self.replay_stream)
+            main_stream.wait_event(self.lower_done_event)
+            main_stream.wait_event(self.replay_done_event)
 
         hidden, source = self._run_upper(
             destination,
@@ -465,6 +467,71 @@ class CUDAConcurrentRunner:
                 break
             logits, cache, pending = self.step(token, cache, pending)
         return generated
+
+
+class CUDAGraphedConcurrentPrefill:
+    """Capture the two-stream concurrent prefill as one fixed-shape CUDA Graph.
+
+    CUDA Graph capture is process-global with respect to unsafe CUDA activity.
+    A process-wide lock serializes warmup and capture across instances. The
+    runner's lower and replay streams fork from the capture stream and rejoin it
+    at every token boundary, so both paths are included in the same graph.
+    """
+
+    def __init__(
+        self,
+        runner: CUDAConcurrentRunner,
+        example_tokens: torch.Tensor,
+        *,
+        warmups: int = 3,
+    ):
+        if warmups < 1:
+            raise ValueError("concurrent CUDA graph capture requires at least one warmup")
+        if runner.config.ramp_tokens:
+            raise ValueError(
+                "concurrent CUDA graph replay with ramp_tokens is disabled until changed-input accuracy is gated"
+            )
+        if example_tokens.ndim == 1:
+            example_tokens = example_tokens.unsqueeze(0)
+        if example_tokens.ndim != 2 or example_tokens.shape[0] != 1 or example_tokens.shape[1] == 0:
+            raise ValueError("concurrent graph capture requires tokens with shape [sequence] or [1, sequence]")
+        self.runner = runner
+        self.static_tokens = example_tokens.to(device=runner.device, dtype=torch.long).clone()
+        self.capture_stream = torch.cuda.Stream(device=runner.device)
+        self.graph = torch.cuda.CUDAGraph()
+
+        LOG.info.once(
+            "Serializing two-stream CUDA Graph warmup and capture with the process-wide capture lock."
+        )
+        with _CUDA_GRAPH_CAPTURE_LOCK:
+            current_stream = torch.cuda.current_stream(runner.device)
+            self.capture_stream.wait_stream(current_stream)
+            with torch.cuda.stream(self.capture_stream):
+                for _ in range(warmups):
+                    self.outputs = runner.prefill(self.static_tokens)
+            current_stream.wait_stream(self.capture_stream)
+            torch.cuda.synchronize(runner.device)
+            with torch.cuda.graph(
+                self.graph,
+                stream=self.capture_stream,
+                capture_error_mode="global",
+            ):
+                self.outputs = runner.prefill(self.static_tokens)
+            torch.cuda.synchronize(runner.device)
+
+    @torch.inference_mode()
+    def prefill(self, tokens: Sequence[int] | torch.Tensor):
+        """Copy fixed-shape token values and replay both captured CUDA streams."""
+
+        if not isinstance(tokens, torch.Tensor):
+            tokens = torch.tensor(list(tokens), dtype=torch.long, device=self.runner.device)
+        if tokens.ndim == 1:
+            tokens = tokens.unsqueeze(0)
+        if tokens.shape != self.static_tokens.shape:
+            raise ValueError(f"captured concurrent prefill requires tokens with shape {tuple(self.static_tokens.shape)}")
+        self.static_tokens.copy_(tokens.to(device=self.runner.device, dtype=torch.long))
+        self.graph.replay()
+        return self.outputs
 
 
 class CUDAGraphedPrefill:
@@ -544,6 +611,7 @@ class CUDAGraphedPrefill:
 __all__ = [
     "MAX_FORWARD_ERROR",
     "CUDAConcurrentRunner",
+    "CUDAGraphedConcurrentPrefill",
     "CUDAGraphedPrefill",
     "CUDAPrefillRunner",
     "CUDARecirculationState",

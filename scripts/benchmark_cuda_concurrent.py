@@ -17,6 +17,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from recirculation import RecirculationConfig
 from recirculation.cuda_backend import (
     CUDAConcurrentRunner,
+    CUDAGraphedConcurrentPrefill,
     CUDAPrefillRunner,
     measure_forward_error,
     require_gil_disabled,
@@ -73,10 +74,38 @@ def main() -> None:
         if sequential_output[2].token_position != concurrent_output[2].token_position:
             raise RuntimeError("concurrent pending token position differs from sequential CUDA")
 
+        graphed = CUDAGraphedConcurrentPrefill(concurrent, token_ids)
+        graphed_output = graphed.prefill(token_ids)
+        graphed_logits_error = measure_forward_error(concurrent_output[0], graphed_output[0])
+        graphed_logits_error.require()
+        graphed_pending_reference = torch.cat(
+            (concurrent_output[2].destination, concurrent_output[2].source), dim=-1
+        )
+        graphed_pending_candidate = torch.cat((graphed_output[2].destination, graphed_output[2].source), dim=-1)
+        graphed_pending_error = measure_forward_error(graphed_pending_reference, graphed_pending_candidate)
+        graphed_pending_error.require()
+        replay_tokens = torch.roll(token_ids, shifts=1, dims=1)
+        replay_reference = concurrent.prefill(replay_tokens)
+        replay_candidate = graphed.prefill(replay_tokens)
+        graphed_new_input_error = measure_forward_error(replay_reference[0], replay_candidate[0])
+        graphed_new_input_error.require()
+        replay_pending_reference = torch.cat(
+            (replay_reference[2].destination, replay_reference[2].source), dim=-1
+        )
+        replay_pending_candidate = torch.cat(
+            (replay_candidate[2].destination, replay_candidate[2].source), dim=-1
+        )
+        graphed_new_input_pending_error = measure_forward_error(
+            replay_pending_reference, replay_pending_candidate
+        )
+        graphed_new_input_pending_error.require()
+
         sequential.prefill(token_ids)
         concurrent.prefill(token_ids)
+        graphed.prefill(token_ids)
         sequential_ms = time_prefill(sequential, token_ids, args.repetitions)
         concurrent_ms = time_prefill(concurrent, token_ids, args.repetitions)
+        graphed_ms = time_prefill(graphed, token_ids, args.repetitions)
         result = {
             "model": str(args.model),
             "tokens": token_ids.shape[1],
@@ -90,14 +119,26 @@ def main() -> None:
             "cuda_streams": 2,
             "sequential_ms": sequential_ms,
             "concurrent_ms": concurrent_ms,
+            "graphed_ms": graphed_ms,
             "sequential_median_ms": statistics.median(sequential_ms),
             "concurrent_median_ms": statistics.median(concurrent_ms),
+            "graphed_median_ms": statistics.median(graphed_ms),
             "speedup": statistics.median(sequential_ms) / statistics.median(concurrent_ms),
+            "graphed_speedup_vs_sequential": statistics.median(sequential_ms) / statistics.median(graphed_ms),
+            "graphed_speedup_vs_eager_concurrent": statistics.median(concurrent_ms) / statistics.median(graphed_ms),
             "logits_error": logits_error.__dict__,
             "logits_error_rate": logits_error.rate,
             "pending_error": pending_error.__dict__,
             "pending_error_rate": pending_error.rate,
             "pending_token_position": concurrent_output[2].token_position,
+            "graphed_logits_error": graphed_logits_error.__dict__,
+            "graphed_logits_error_rate": graphed_logits_error.rate,
+            "graphed_pending_error": graphed_pending_error.__dict__,
+            "graphed_pending_error_rate": graphed_pending_error.rate,
+            "graphed_new_input_error": graphed_new_input_error.__dict__,
+            "graphed_new_input_error_rate": graphed_new_input_error.rate,
+            "graphed_new_input_pending_error": graphed_new_input_pending_error.__dict__,
+            "graphed_new_input_pending_error_rate": graphed_new_input_pending_error.rate,
         }
         if args.output:
             args.output.parent.mkdir(parents=True, exist_ok=True)
