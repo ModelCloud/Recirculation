@@ -90,6 +90,7 @@ python scripts/screen_cuda_recirculation.py \
   --corpus pg19 \
   --windows-per-corpus 256 \
   --window-tokens 1024 \
+  --corpus-artifact results/c4_pg19_256x1024_windows.json \
   --row-batch-size 256 \
   --alpha 0.10 \
   --output results/cuda_c4_pg19_paths.json

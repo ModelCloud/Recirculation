@@ -322,6 +322,12 @@ def main() -> int:
     )
     parser.add_argument("--windows-per-corpus", type=int, default=256)
     parser.add_argument("--window-tokens", type=int, default=1024)
+    parser.add_argument(
+        "--corpus-artifact",
+        type=Path,
+        default=None,
+        help="Load or atomically create the exact tokenized corpus windows shared by every worker.",
+    )
     parser.add_argument("--task-config", type=Path, default=REPO_ROOT / "configs/gsm8k-platinum-cot-llama.yaml")
     parser.add_argument("--row-start", type=int, default=272)
     parser.add_argument("--rows", type=int, default=32)
@@ -432,29 +438,63 @@ def main() -> int:
             "c4": ("allenai/c4", "en"),
             "pg19": ("emozilla/pg19", None),
         }
-        contexts = []
-        for corpus in args.corpus:
-            dataset_name, dataset_config = specs[corpus]
-            stream = load_dataset(dataset_name, name=dataset_config, split="train", streaming=True)
-            accepted = 0
-            examined = 0
-            for document in stream:
-                examined += 1
-                token_ids = tokenizer(
-                    str(document["text"]),
-                    add_special_tokens=False,
-                    truncation=True,
-                    max_length=args.window_tokens,
-                ).input_ids
-                if len(token_ids) < args.window_tokens:
-                    continue
-                contexts.append({"language_modeling": ([int(token_ids[0])], list(map(int, token_ids[1:])))})
-                accepted += 1
-                if accepted == args.windows_per_corpus:
-                    break
-            if accepted != args.windows_per_corpus:
-                parser.error(f"{corpus} yielded only {accepted} qualifying windows after {examined} documents")
-            corpus_counts[corpus] = {"windows": accepted, "documents_examined": examined}
+        corpus_artifact = args.corpus_artifact.expanduser().resolve() if args.corpus_artifact else None
+        artifact = None
+        if corpus_artifact is not None and corpus_artifact.exists():
+            artifact = json.loads(corpus_artifact.read_text(encoding="utf-8"))
+            expected = {
+                "corpora": args.corpus,
+                "windows_per_corpus": args.windows_per_corpus,
+                "window_tokens": args.window_tokens,
+                "tokenizer": args.model,
+            }
+            mismatches = {key: (artifact.get(key), value) for key, value in expected.items() if artifact.get(key) != value}
+            if mismatches:
+                parser.error(f"corpus artifact does not match this screen: {mismatches}")
+            LOG.info(f"Loaded {len(artifact['windows'])} shared tokenized corpus windows from {corpus_artifact}")
+        if artifact is None:
+            windows = []
+            for corpus in args.corpus:
+                dataset_name, dataset_config = specs[corpus]
+                stream = load_dataset(dataset_name, name=dataset_config, split="train", streaming=True)
+                accepted = 0
+                examined = 0
+                for document in stream:
+                    examined += 1
+                    token_ids = tokenizer(
+                        str(document["text"]),
+                        add_special_tokens=False,
+                        truncation=True,
+                        max_length=args.window_tokens,
+                    ).input_ids
+                    if len(token_ids) < args.window_tokens:
+                        continue
+                    windows.append({"corpus": corpus, "token_ids": list(map(int, token_ids))})
+                    accepted += 1
+                    if accepted == args.windows_per_corpus:
+                        break
+                if accepted != args.windows_per_corpus:
+                    parser.error(f"{corpus} yielded only {accepted} qualifying windows after {examined} documents")
+                corpus_counts[corpus] = {"windows": accepted, "documents_examined": examined}
+            artifact = {
+                "corpora": args.corpus,
+                "windows_per_corpus": args.windows_per_corpus,
+                "window_tokens": args.window_tokens,
+                "tokenizer": args.model,
+                "corpus_counts": corpus_counts,
+                "windows": windows,
+            }
+            if corpus_artifact is not None:
+                corpus_artifact.parent.mkdir(parents=True, exist_ok=True)
+                temporary = corpus_artifact.with_name(f".{corpus_artifact.name}.{os.getpid()}.tmp")
+                temporary.write_text(json.dumps(artifact, separators=(",", ":")) + "\n", encoding="utf-8")
+                temporary.replace(corpus_artifact)
+                LOG.info(f"Wrote shared tokenized corpus windows to {corpus_artifact}")
+        corpus_counts = artifact["corpus_counts"]
+        contexts = [
+            {"language_modeling": ([window["token_ids"][0]], window["token_ids"][1:])}
+            for window in artifact["windows"]
+        ]
         if tokenizer.bos_token_id is None:
             parser.error("corpus screening requires a tokenizer BOS token")
         prefix = torch.tensor([[tokenizer.bos_token_id]], dtype=torch.long, device="cuda")
@@ -609,6 +649,7 @@ def main() -> int:
         "corpora": args.corpus,
         "corpus_counts": corpus_counts,
         "window_tokens": args.window_tokens if args.corpus else None,
+        "corpus_artifact": str(args.corpus_artifact.resolve()) if args.corpus_artifact else None,
         "row_start": args.row_start,
         "rows": args.rows,
         "row_stop_exclusive": stop,
