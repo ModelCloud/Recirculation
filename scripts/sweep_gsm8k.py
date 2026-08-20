@@ -83,6 +83,52 @@ def _implementation_commit() -> str:
     return completed.stdout.strip()
 
 
+def _arm_name(source: int, destination: int, alpha: float) -> str:
+    return f"source{source}_destination{destination}_alpha{alpha:g}"
+
+
+def _status_table(samples, candidates, total_rows: int, phase: str) -> str:
+    """Render a compact live table, including paired flips for completed rows."""
+    lines = [
+        "State      Arm               Config           Rows    Correct    Accuracy    W→C    C→W    Net",
+        "────────  ────────────────  ─────────────  ────────  ─────────  ──────────  ─────  ─────  ─────",
+    ]
+    baseline_done = [sample for sample in samples if "baseline" in sample]
+    baseline_complete = len(baseline_done) == total_rows
+    baseline_correct = sum(numbers_equal(s["baseline"]["numeric_answer"], s["gold_answer"]) for s in baseline_done)
+    baseline_state = "Complete" if baseline_complete else ("Active" if phase == "baseline" else "Pending")
+    baseline_acc = f"{100 * baseline_correct / len(baseline_done):.2f}%" if baseline_done else "—"
+    lines.append(f"{baseline_state:<9} Dense baseline    none             {len(baseline_done):>3}/{total_rows:<4}  {baseline_correct:>8}  {baseline_acc:>9}    —      —      —")
+    lines.append("────────  ────────────────  ─────────────  ────────  ─────────  ──────────  ─────  ─────  ─────")
+    for index, (source, destination, alpha) in enumerate(candidates):
+        arm = _arm_name(source, destination, alpha)
+        done = [sample for sample in samples if arm in sample]
+        complete = len(done) == total_rows
+        state = "Complete" if complete else ("Active" if done else ("Active" if phase == f"candidate-{index}" else "Pending"))
+        correct = sum(numbers_equal(s[arm]["numeric_answer"], s["gold_answer"]) for s in done)
+        accuracy = f"{100 * correct / len(done):.2f}%" if done else "—"
+        paired = [s for s in done if "baseline" in s]
+        w2c = c2w = 0
+        for sample in paired:
+            base_ok = numbers_equal(sample["baseline"]["numeric_answer"], sample["gold_answer"])
+            cand_ok = numbers_equal(sample[arm]["numeric_answer"], sample["gold_answer"])
+            w2c += not base_ok and cand_ok
+            c2w += base_ok and not cand_ok
+        flip = f"{w2c:>5}  {c2w:>5}  {w2c - c2w:>+5}" if paired else "    —      —      —"
+        config = f"{source}→{destination}, α={alpha:.2f}"
+        lines.append(f"{state:<9} Recirculation     {config:<14} {len(done):>3}/{total_rows:<4}  {correct:>8}  {accuracy:>9}  {flip}")
+        if index != len(candidates) - 1:
+            lines.append("────────  ────────────────  ─────────────  ────────  ─────────  ──────────  ─────  ─────  ─────")
+    return "\n".join(lines)
+
+
+def _write_status(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    temporary.replace(path)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default="meta-llama/Llama-3.2-1B-Instruct")
@@ -121,6 +167,7 @@ def main() -> int:
         help="Repeat SOURCE:DESTINATION:ALPHA; defaults to four middle-stack pairs.",
     )
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--status-every", type=float, default=60.0, help="Seconds between live status table updates.")
     args = parser.parse_args()
     if args.screen_results is not None and args.candidate is not None:
         parser.error("use either --screen-results or --candidate, not both")
@@ -128,6 +175,8 @@ def main() -> int:
         parser.error("top-k must be positive and harm-weight must be at least 1")
     if args.max_correct_to_wrong is not None and args.max_correct_to_wrong < 0:
         parser.error("max-correct-to-wrong must be non-negative")
+    if args.status_every <= 0:
+        parser.error("status-every must be positive")
     selected_screen_items = {}
     if args.screen_results is not None:
         screen = json.loads(args.screen_results.read_text(encoding="utf-8"))
@@ -184,14 +233,38 @@ def main() -> int:
         )
 
     started = time.perf_counter()
+    status_path = args.output.expanduser().resolve().with_suffix(".status.json")
+    last_status = 0.0
+
+    def maybe_status(phase: str, force: bool = False) -> None:
+        nonlocal last_status
+        now = time.perf_counter()
+        if not force and now - last_status < args.status_every:
+            return
+        last_status = now
+        table = _status_table(samples, args.candidate, len(samples), phase)
+        payload = {
+            "implementation_commit": _implementation_commit(),
+            "phase": phase,
+            "elapsed_seconds": now - started,
+            "total_rows": len(samples),
+            "candidates": [list(candidate) for candidate in args.candidate],
+            "table": table,
+        }
+        _write_status(status_path, payload)
+        print(table, flush=True)
+
+    maybe_status("baseline", force=True)
     if not args.skip_baseline:
         for sample_index, sample in enumerate(samples):
             sample["baseline"] = _generate(model, tokenizer, sample["prompt_ids"], device, args.max_new_tokens, until)
+            maybe_status("baseline")
             if (sample_index + 1) % 4 == 0:
                 print(f"baseline rows {sample_index + 1}/{len(samples)}", flush=True)
+        maybe_status("candidates", force=True)
     for candidate_index, (source, destination, alpha) in enumerate(args.candidate):
         config = RecirculationConfig(source_layer=source, destination_layer=destination, alpha=alpha)
-        arm = f"source{source}_destination{destination}_alpha{alpha:g}"
+        arm = _arm_name(source, destination, alpha)
         for sample_index, sample in enumerate(samples):
             with RecirculationController(model, config) as controller:
                 sample[arm] = _generate(
@@ -203,6 +276,7 @@ def main() -> int:
                     until,
                     controller=controller,
                 )
+            maybe_status(f"candidate-{candidate_index}")
             if (sample_index + 1) % 4 == 0:
                 correct = sum(
                     numbers_equal(sample[arm]["numeric_answer"], sample["gold_answer"])
@@ -212,6 +286,8 @@ def main() -> int:
                     f"candidate {candidate_index + 1}/{len(args.candidate)} {arm} rows={sample_index + 1} correct={correct}",
                     flush=True,
                 )
+
+        maybe_status(f"candidate-{candidate_index + 1}", force=True)
 
     summaries = {}
     baseline_summary = None if args.skip_baseline else _summary(samples, "baseline")
@@ -313,11 +389,13 @@ def main() -> int:
         "best_accuracy": best_accuracy,
         "best_perplexity": best_perplexity,
         "comparison": comparison,
+        "status_checkpoint": str(status_path),
         "samples": [{key: value for key, value in sample.items() if key != "prompt_ids"} for sample in samples],
     }
     output = args.output.expanduser().resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    maybe_status("complete", force=True)
     print(json.dumps(summaries, indent=2), flush=True)
     print(f"Wrote {output}", flush=True)
     return 0
