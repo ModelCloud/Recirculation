@@ -149,6 +149,14 @@ def _norm_mix_kernel(
         source_norm = source_norm.to(element_type)
         scale = tl.where(source_norm > 0.0, destination_norm / source_norm, 0.0).to(element_type)
         source = (source * scale).to(element_type)
+        # Torch materializes the normalized source in the residual dtype before
+        # applying alpha.  A local cast is insufficient here because Triton can
+        # fold the scale and alpha multiplies across that FP16/BF16 rounding
+        # boundary.  Use the output buffer as row-local scratch to make the
+        # oracle's dtype boundary observable without another kernel launch.
+        tl.store(output_pointer + indices, source, mask=mask)
+        tl.debug_barrier()
+        source = tl.load(output_pointer + indices, mask=mask, other=0.0).to(tl.float32)
     destination_term = (beta * destination).to(element_type)
     source_term = (alpha * source).to(element_type)
     mixed = (destination_term + source_term).to(element_type)
