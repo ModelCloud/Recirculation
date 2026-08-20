@@ -23,7 +23,6 @@ for _thread_variable in (
     "VECLIB_MAXIMUM_THREADS",
     "NUMEXPR_NUM_THREADS",
 ):
-    candidate_started = time.perf_counter()
     os.environ.setdefault(_thread_variable, "16")
 
 import torch
@@ -36,6 +35,7 @@ sys.path.insert(0, str(REPO_ROOT))
 
 from recirculation import RecirculationConfig
 from recirculation.cuda_backend import CUDAConcurrentRunner, CUDAGraphedConcurrentPrefill, CUDAPrefillRunner
+from recirculation.screening import gsm8k_solution_target, screen_result_key, summarize_paired_losses
 from scripts.eval_gsm8k_platinum import _gold_answer, _prompt_ids, _task_contract
 
 LOG = LogBar.shared()
@@ -79,7 +79,7 @@ def _implementation_commit() -> str:
 
 
 def _write_report(path, *, status, implementation_commit, settings, started, results, total):
-    ordered_results = sorted(results, key=lambda item: item["answer_nll"])
+    ordered_results = sorted(results, key=screen_result_key)
     complete = len(ordered_results)
     report = {
         "status": status,
@@ -107,6 +107,7 @@ def _score_candidate(
     pad_token_id,
     graph_prefix,
 ):
+    candidate_started = time.perf_counter()
     source, destination, alpha = candidate
     config = RecirculationConfig(source_layer=source, destination_layer=destination, alpha=alpha)
     candidate_stream = torch.cuda.Stream(device=prefix.device)
@@ -131,8 +132,8 @@ def _score_candidate(
                 torch.cuda.synchronize(prefix.device)
             if row_batch_size > 1:
                 batch_runner = CUDAPrefillRunner(model, config, allow_terminal_padding=True)
-                total_nll = 0.0
-                answer_tokens = 0
+                row_nll = []
+                row_counts = []
                 prefix_length = snapshot.pending.token_position + 1
                 for batch_start in range(0, len(contexts), row_batch_size):
                     batch = contexts[batch_start : batch_start + row_batch_size]
@@ -164,26 +165,27 @@ def _score_candidate(
                         snapshot,
                         targets_by_position,
                         attention_mask=attention_mask,
+                        return_per_row=True,
                     )
-                    total_nll += batch_nll
-                    answer_tokens += batch_targets
+                    row_nll.extend(batch_nll)
+                    row_counts.extend(batch_targets)
                 return {
                     "source_layer": source,
                     "destination_layer": destination,
                     "alpha": alpha,
-                    "answer_nll": total_nll / answer_tokens,
-                    "answer_tokens": answer_tokens,
+                    "row_nll_totals": row_nll,
+                    "row_target_counts": row_counts,
                     "seconds": time.perf_counter() - candidate_started,
                 }
-            total_nll = 0.0
-            answer_tokens = 0
+            row_nll = []
+            row_counts = []
             for context, answer_ids in contexts:
+                sample_nll = 0.0
                 context_tensor = torch.tensor([context], dtype=torch.long, device="cuda")
                 logits, cache, pending, _ = runner.prefill_from_snapshot(context_tensor, snapshot)
                 for token_index, token in enumerate(answer_ids):
                     token_logits = logits[0, -1].float()
-                    total_nll += float(torch.logsumexp(token_logits, dim=-1) - token_logits[int(token)])
-                    answer_tokens += 1
+                    sample_nll += float(torch.logsumexp(token_logits, dim=-1) - token_logits[int(token)])
                     if token_index + 1 < len(answer_ids):
                         answer_token = torch.tensor([[int(token)]], dtype=torch.long, device="cuda")
                         if scheduler == "concurrent":
@@ -194,12 +196,14 @@ def _score_candidate(
                                 cache=cache,
                                 pending=pending,
                             )
+                row_nll.append(sample_nll)
+                row_counts.append(len(answer_ids))
             return {
                 "source_layer": source,
                 "destination_layer": destination,
                 "alpha": alpha,
-                "answer_nll": total_nll / answer_tokens,
-                "answer_tokens": answer_tokens,
+                "row_nll_totals": row_nll,
+                "row_target_counts": row_counts,
                 "seconds": time.perf_counter() - candidate_started,
             }
         finally:
@@ -222,6 +226,15 @@ def main() -> int:
     parser.add_argument("--scheduler", choices=("concurrent", "sequential"), default="concurrent")
     parser.add_argument("--candidate-workers", type=int, default=1)
     parser.add_argument("--row-batch-size", type=int, default=32)
+    parser.add_argument(
+        "--target-mode",
+        choices=("full_solution", "final_answer"),
+        default="full_solution",
+        help="Score the full rationale and final answer by default; final_answer preserves the historical proxy.",
+    )
+    parser.add_argument("--tail-quantile", type=float, default=0.9)
+    parser.add_argument("--tail-weight", type=float, default=1.0)
+    parser.add_argument("--harm-tolerance", type=float, default=0.0)
     parser.add_argument(
         "--graph-prefix",
         action="store_true",
@@ -249,6 +262,10 @@ def main() -> int:
         parser.error("the sequential scheduler does not support --graph-prefix")
     if args.candidate_workers != 1 and args.graph_prefix:
         parser.error("CUDA Graph prefix capture requires --candidate-workers 1")
+    if not 0.0 <= args.tail_quantile < 1.0:
+        parser.error("tail-quantile must be in [0, 1)")
+    if args.tail_weight < 0.0 or args.harm_tolerance < 0.0:
+        parser.error("tail-weight and harm-tolerance must be non-negative")
 
     torch.set_num_threads(int(os.environ["OMP_NUM_THREADS"]))
     local_files_only = not args.allow_download
@@ -270,15 +287,19 @@ def main() -> int:
         parser.error("requested row range exceeds the dataset")
     documents = [dataset[index] for index in range(args.row_start, stop)]
     prompts = [_prompt_ids(tokenizer, str(document["question"]), fewshots) for document in documents]
-    answers = [_gold_answer(str(document["answer"])) for document in documents]
-    common_length = _common_prefix_length(prompts)
+    gold_answers = [_gold_answer(str(document["answer"])) for document in documents]
+    common_length = min(_common_prefix_length(prompts), min(len(prompt) - 1 for prompt in prompts))
     prefix = torch.tensor([prompts[0][:common_length]], dtype=torch.long, device="cuda")
-    phrase = tokenizer("The final answer is ", add_special_tokens=False).input_ids
     contexts = []
-    for prompt, answer in zip(prompts, answers):
-        answer_ids = tokenizer(answer, add_special_tokens=False).input_ids
-        context = prompt[common_length:] + phrase
-        contexts.append((context, answer_ids))
+    for prompt, document, gold_answer in zip(prompts, documents, gold_answers):
+        if args.target_mode == "full_solution":
+            target = gsm8k_solution_target(str(document["answer"]), gold_answer)
+            context = prompt[common_length:]
+        else:
+            target = gold_answer
+            context = prompt[common_length:] + tokenizer("The final answer is ", add_special_tokens=False).input_ids
+        target_ids = tokenizer(target, add_special_tokens=False).input_ids
+        contexts.append((context, target_ids))
 
     layer_count = len(model.get_decoder().layers)
     paths = args.path
@@ -293,6 +314,21 @@ def main() -> int:
     results = []
     started = time.perf_counter()
     implementation_commit = _implementation_commit()
+    native_candidate = (paths[0][0], paths[0][1], 0.0)
+    LOG.info(f"Scoring paired native alpha=0 baseline with path {paths[0][0]}->{paths[0][1]}")
+    native = _score_candidate(
+        model,
+        prefix,
+        contexts,
+        native_candidate,
+        args.scheduler,
+        args.python_threads,
+        args.row_batch_size,
+        int(tokenizer.pad_token_id or tokenizer.eos_token_id),
+        args.graph_prefix,
+    )
+    native_nll = native.pop("row_nll_totals")
+    native_counts = native.pop("row_target_counts")
     settings = {
         "split_role": "tuning",
         "model": args.model,
@@ -309,6 +345,16 @@ def main() -> int:
         "python_threads": args.python_threads,
         "row_batch_size": args.row_batch_size,
         "graph_prefix": args.graph_prefix,
+        "target_mode": args.target_mode,
+        "tail_quantile": args.tail_quantile,
+        "tail_weight": args.tail_weight,
+        "harm_tolerance": args.harm_tolerance,
+        "ranking": "native_delta_nll + tail_weight * worst-tail positive per-row delta",
+        "native_baseline": {
+            **native,
+            "target_nll": sum(native_nll) / sum(native_counts),
+            "target_tokens": sum(native_counts),
+        },
         "python": platform.python_version(),
         "python_gil_enabled": bool(getattr(sys, "_is_gil_enabled", lambda: True)()),
         "torch": torch.__version__,
@@ -354,7 +400,22 @@ def main() -> int:
             for candidate in candidates
         }
         for future in as_completed(futures):
-            results.append(future.result())
+            result = future.result()
+            candidate_nll = result.pop("row_nll_totals")
+            candidate_counts = result.pop("row_target_counts")
+            result.update(
+                summarize_paired_losses(
+                    list(range(args.row_start, stop)),
+                    native_nll,
+                    native_counts,
+                    candidate_nll,
+                    candidate_counts,
+                    tail_quantile=args.tail_quantile,
+                    tail_weight=args.tail_weight,
+                    harm_tolerance=args.harm_tolerance,
+                )
+            )
+            results.append(result)
             _write_report(
                 args.output,
                 status="running",
@@ -365,8 +426,13 @@ def main() -> int:
                 total=len(candidates),
             )
             if len(results) % args.report_every == 0 or len(results) == len(candidates):
-                best = min(results, key=lambda item: item["answer_nll"])
-                LOG.info(f"candidates={len(results)}/{len(candidates)} best={best}")
+                best = min(results, key=screen_result_key)
+                LOG.info(
+                    f"candidates={len(results)}/{len(candidates)} "
+                    f"best={best['source_layer']}->{best['destination_layer']} alpha={best['alpha']:g} "
+                    f"score={best['screen_score']:.6f} target_nll={best['target_nll']:.6f} "
+                    f"improved={best['improved_rows']} regressed={best['regressed_rows']}"
+                )
 
     _write_report(
         args.output,

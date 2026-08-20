@@ -224,6 +224,15 @@ def test_cuda_terminal_padding_batch_score_matches_scalar_gate():
     error = measure_forward_error(expected[None], torch.tensor([candidate], device="cuda"))
     error.require()
     assert count == 3
+    row_nll, row_counts = batched.score_from_snapshot(
+        tokens,
+        snapshot,
+        {0: ([0], [5]), 1: ([0, 1], [6, 10])},
+        attention_mask=mask,
+        return_per_row=True,
+    )
+    torch.testing.assert_close(torch.tensor(row_nll).sum(), expected.cpu(), rtol=2e-3, atol=2e-3)
+    assert row_counts == [2, 1]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")

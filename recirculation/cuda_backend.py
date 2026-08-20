@@ -334,7 +334,8 @@ class CUDAPrefillRunner:
         targets_by_position: dict[int, tuple[list[int], list[int]]],
         *,
         attention_mask: torch.Tensor,
-    ) -> tuple[float, int]:
+        return_per_row: bool = False,
+    ) -> tuple[float, int] | tuple[list[float], list[int]]:
         """Score sparse teacher-forced targets in one terminally padded batch."""
 
         device = next(self.model.parameters()).device
@@ -351,6 +352,8 @@ class CUDAPrefillRunner:
 
         total_nll = torch.zeros((), dtype=torch.float32, device=device)
         target_count = 0
+        row_nll = torch.zeros(tokens.shape[0], dtype=torch.float32, device=device)
+        row_counts = [0] * tokens.shape[0]
         self.controller.attach()
         self.controller._pending = pending
         self.controller._position = prefix_length
@@ -372,8 +375,14 @@ class CUDAPrefillRunner:
                     rows = torch.tensor(row_values, dtype=torch.long, device=device)
                     targets = torch.tensor(target_values, dtype=torch.long, device=device)
                     logits = self.output_embeddings(output.last_hidden_state[rows, -1]).float()
-                    total_nll += (torch.logsumexp(logits, dim=-1) - logits.gather(1, targets[:, None])[:, 0]).sum()
+                    losses = torch.logsumexp(logits, dim=-1) - logits.gather(1, targets[:, None])[:, 0]
+                    total_nll += losses.sum()
+                    row_nll.index_add_(0, rows, losses)
                     target_count += len(target_values)
+                    for row in row_values:
+                        row_counts[row] += 1
+            if return_per_row:
+                return row_nll.tolist(), row_counts
             return float(total_nll), target_count
         finally:
             self.controller.detach()

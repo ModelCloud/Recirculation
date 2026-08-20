@@ -11,6 +11,7 @@ repository all build on that method. This is not the authors' official implement
 
 ## Progress
 
+- 2026-08-20 — CUDA screening now supports full-solution paired perplexity, tail-regression penalties, and E2E harm gates.
 - 2026-08-20 — Two-stack CUDA execution supports both GIL-enabled and free-threaded Python.
 - 2026-08-20 — The paper's zero-based ten-step ramp is now available with `ramp_tokens=10`.
 - 2026-08-20 — Corrected CUDA same-token replay reached **4.533x prefill speedup** while meeting accuracy standards.
@@ -47,8 +48,9 @@ branches before `t+1` enters the upper stack. The intervention changes neither m
 ## Evaluation status
 
 Results produced before the same-token replay correction measured a different delayed cross-token intervention and
-are withdrawn as recirculation evidence. Corrected path and alpha tuning are complete; the locked GSM8K confirmation
-uses Evalution scoring on a separate dataset split.
+are withdrawn as recirculation evidence. The initial corrected path/alpha screen used final-answer likelihood; its
+candidate remains provisional because paired E2E evaluation found both wrong-to-correct and correct-to-wrong changes.
+The robust full-solution screen and locked Evalution-scored confirmation use separate tuning and holdout ranges.
 
 ## Install and test
 
@@ -107,6 +109,30 @@ to meet accuracy standards.
 
 Install with `python -m pip install -e '.[mlx,dev]'` for MLX or `python -m pip install -e '.[cuda,eval,dev]'` for CUDA.
 Reproduction commands and benchmark details are kept under [`results/`](results/).
+
+### Robust CUDA screening funnel
+
+The CUDA screen searches source/destination pairs first at a conservative fixed alpha, then refines alpha only on the
+best paths. It scores complete GSM8K rationales and final answers, compares every row with an exact `alpha=0` native
+baseline, and ranks by native-relative NLL plus a worst-tail regression penalty. The historical final-answer-only
+proxy remains available as `--target-mode final_answer`, but it should not select release settings.
+
+Finalists undergo paired greedy generation. Ranking records both wrong-to-correct and correct-to-wrong transitions
+and defaults to `wrong_to_correct - 2 * correct_to_wrong`; a hard regression cap is also available. Exact outcome
+transitions cannot be inferred from teacher-forced perplexity, so a disjoint E2E holdout remains mandatory.
+
+```bash
+python scripts/run_cuda_screening_funnel.py \
+  --model /local-models/Llama-3.2-1B-Instruct \
+  --row-start 272 \
+  --rows 32 \
+  --holdout-row-start 304 \
+  --holdout-rows 32 \
+  --top-paths 8 \
+  --e2e-top-k 5 \
+  --harm-weight 2 \
+  --output-dir results/cuda_screening_funnel
+```
 
 ## Citation
 
