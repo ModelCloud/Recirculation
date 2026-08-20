@@ -1,0 +1,42 @@
+{
+  "alpha": 0.1,
+  "concurrent_median_ms": 2481.0948856174946,
+  "concurrent_ms": [
+    2498.061324469745,
+    2475.8084658533335,
+    2492.9094705730677,
+    2481.0948856174946,
+    2450.044537894428
+  ],
+  "cuda_streams": 2,
+  "destination_layer": 5,
+  "logits_error": {
+    "max_absolute": 0.0,
+    "normalized_max": 0.0,
+    "relative_l2": 0.0
+  },
+  "logits_error_rate": 0.0,
+  "model": "/local-models/Llama-3.2-1B-Instruct",
+  "pending_error": {
+    "max_absolute": 0.0,
+    "normalized_max": 0.0,
+    "relative_l2": 0.0
+  },
+  "pending_error_rate": 0.0,
+  "pending_token_position": 127,
+  "python_gil_enabled": true,
+  "python_worker_threads": 2,
+  "ramp_tokens": 0,
+  "repetitions": 5,
+  "sequential_median_ms": 2643.3541709557176,
+  "sequential_ms": [
+    2618.5320680961013,
+    2659.7079131752253,
+    2643.3541709557176,
+    2651.2536192312837,
+    2594.555765390396
+  ],
+  "source_layer": 12,
+  "speedup": 1.0653982587602004,
+  "tokens": 128
+}

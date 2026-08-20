@@ -1,13 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 
-"""CUDA serial prefill with a fused recirculation norm-and-mix kernel."""
+"""CUDA recirculation kernels and serial/concurrent inference schedulers."""
 
 from __future__ import annotations
 
+import sys
 from collections.abc import Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
 import torch
+from transformers import DynamicCache
 
 try:
     import triton
@@ -15,7 +18,7 @@ try:
 except ImportError as error:  # pragma: no cover - depends on the CUDA installation
     raise ImportError("The CUDA backend requires Triton. Install the 'cuda' extra.") from error
 
-from .controller import RecirculationConfig, RecirculationController
+from .controller import RecirculationConfig, RecirculationController, _mixing_coefficients
 
 MAX_FORWARD_ERROR = 2e-3
 
@@ -33,6 +36,15 @@ class ForwardError:
     def require(self, limit: float = MAX_FORWARD_ERROR) -> None:
         if self.rate > limit:
             raise RuntimeError(f"forward accumulation error {self.rate:.6g} exceeds limit {limit:.6g}")
+
+
+@dataclass(frozen=True)
+class CUDARecirculationState:
+    """First-pass activations waiting for their same-token upper replay."""
+
+    destination: torch.Tensor
+    source: torch.Tensor
+    token_position: int
 
 
 def measure_forward_error(reference: torch.Tensor, candidate: torch.Tensor) -> ForwardError:
@@ -213,9 +225,226 @@ class CUDAPrefillRunner:
             pending = self.controller._pending
             if logits is None or pending is None:  # pragma: no cover - guarded by model/config validation
                 raise RuntimeError("prefill did not produce logits and pending replay state")
-            return logits, cache, pending, torch.cat(collected, dim=1)
+            state = CUDARecirculationState(
+                pending.destination.detach(), pending.source.detach(), pending.token_position
+            )
+            return logits, cache, state, torch.cat(collected, dim=1)
         finally:
             self.controller.detach()
+
+
+class CUDAConcurrentRunner:
+    """Overlap the previous upper replay with the current token's lower stack.
+
+    The two branches use disjoint decoder layers and KV-cache entries. Persistent
+    Python workers enqueue them onto separate CUDA streams, then the streams join
+    before the current token enters the upper stack. This preserves first-pass
+    readout while implementing the paper's two-stack decode schedule.
+    """
+
+    def __init__(
+        self,
+        model,
+        config: RecirculationConfig,
+        *,
+        fused: bool = True,
+    ):
+        if not hasattr(model, "get_decoder") or model.get_output_embeddings() is None:
+            raise TypeError("concurrent CUDA inference requires a Hugging Face causal language model")
+        device = next(model.parameters()).device
+        if device.type != "cuda":
+            raise ValueError("concurrent CUDA inference requires a CUDA model")
+        self.model = model
+        self.decoder = model.get_decoder()
+        self.output_embeddings = model.get_output_embeddings()
+        self.config = config
+        if not 0 <= config.destination_layer < config.source_layer < len(self.decoder.layers):
+            raise ValueError("recirculation layers are outside the decoder or are not ordered destination < source")
+        self.mixer = FusedNormMix() if fused else mix_reference
+        self.device = device
+        self.lower_stream = torch.cuda.Stream(device=device)
+        self.replay_stream = torch.cuda.Stream(device=device)
+        self.executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="recirculation-cuda")
+        self.gil_enabled = bool(getattr(sys, "_is_gil_enabled", lambda: True)())
+
+    def close(self) -> None:
+        self.executor.shutdown(wait=True)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        del exc_type, exc_value, traceback
+        self.close()
+
+    def _mix(self, pending: CUDARecirculationState) -> torch.Tensor:
+        alpha, beta = _mixing_coefficients(self.config, pending.token_position)
+        return self.mixer(
+            pending.destination,
+            pending.source,
+            alpha,
+            beta,
+            self.config.normalize_source,
+        )
+
+    def _position(self, hidden: torch.Tensor, token_position: int):
+        position_ids = torch.full((1, 1), token_position, dtype=torch.long, device=self.device)
+        return position_ids, self.decoder.rotary_emb(hidden, position_ids=position_ids)
+
+    def _run_lower(self, token: torch.Tensor, cache, token_position: int):
+        hidden = self.decoder.embed_tokens(token)
+        position_ids, position_embeddings = self._position(hidden, token_position)
+        for layer in self.decoder.layers[: self.config.destination_layer + 1]:
+            hidden = layer(
+                hidden,
+                attention_mask=None,
+                position_ids=position_ids,
+                past_key_values=cache,
+                use_cache=True,
+                position_embeddings=position_embeddings,
+            )
+        return hidden, position_ids, position_embeddings
+
+    def _run_upper(self, hidden, cache, position_ids, position_embeddings, *, capture_source: bool):
+        source = None
+        first_upper_layer = self.config.destination_layer + 1
+        for index, layer in enumerate(self.decoder.layers[first_upper_layer:], start=first_upper_layer):
+            hidden = layer(
+                hidden,
+                attention_mask=None,
+                position_ids=position_ids,
+                past_key_values=cache,
+                use_cache=True,
+                position_embeddings=position_embeddings,
+            )
+            if capture_source and index == self.config.source_layer:
+                source = hidden
+        if capture_source and source is None:
+            raise RuntimeError("source activation was not captured in the current upper stack")
+        return hidden, source
+
+    def _replay_branch(self, pending, cache, dependency):
+        with torch.inference_mode(), torch.cuda.device(self.device), torch.cuda.stream(self.replay_stream):
+            self.replay_stream.wait_event(dependency)
+            first_upper_layer = self.config.destination_layer + 1
+            for layer_cache in cache.layers[first_upper_layer:]:
+                layer_cache.crop(-1)
+            hidden = self._mix(pending)
+            position_ids, position_embeddings = self._position(hidden, pending.token_position)
+            self._run_upper(
+                hidden,
+                cache,
+                position_ids,
+                position_embeddings,
+                capture_source=False,
+            )
+
+    def _lower_branch(self, token, cache, token_position, dependency):
+        with torch.inference_mode(), torch.cuda.device(self.device), torch.cuda.stream(self.lower_stream):
+            self.lower_stream.wait_event(dependency)
+            return self._run_lower(token, cache, token_position)
+
+    @torch.inference_mode()
+    def step(
+        self,
+        token: torch.Tensor,
+        cache=None,
+        pending: CUDARecirculationState | None = None,
+        *,
+        project_logits: bool = True,
+    ):
+        """Process one token, overlapping its lower stack with the pending upper replay."""
+
+        token = token.to(device=self.device, dtype=torch.long)
+        if token.ndim == 1:
+            token = token.unsqueeze(0)
+        if token.shape != (1, 1):
+            raise ValueError("step requires one token with shape [1, 1]")
+        cache = DynamicCache(config=self.model.config) if cache is None else cache
+        token_position = cache.get_seq_length()
+        main_stream = torch.cuda.current_stream(self.device)
+
+        if pending is None:
+            if token_position != 0:
+                raise ValueError("a non-empty cache requires pending recirculation state")
+            destination, position_ids, position_embeddings = self._run_lower(token, cache, token_position)
+        else:
+            if pending.token_position != token_position - 1:
+                raise ValueError("pending token position does not precede the current cache position")
+            dependency = torch.cuda.Event()
+            dependency.record(main_stream)
+            replay_future = self.executor.submit(self._replay_branch, pending, cache, dependency)
+            lower_future = self.executor.submit(self._lower_branch, token, cache, token_position, dependency)
+            destination, position_ids, position_embeddings = lower_future.result()
+            replay_future.result()
+            lower_done = torch.cuda.Event()
+            replay_done = torch.cuda.Event()
+            lower_done.record(self.lower_stream)
+            replay_done.record(self.replay_stream)
+            main_stream.wait_event(lower_done)
+            main_stream.wait_event(replay_done)
+
+        hidden, source = self._run_upper(
+            destination,
+            cache,
+            position_ids,
+            position_embeddings,
+            capture_source=True,
+        )
+        next_pending = CUDARecirculationState(destination.detach(), source.detach(), token_position)
+        if not project_logits:
+            return None, cache, next_pending
+        logits = self.output_embeddings(self.decoder.norm(hidden))
+        return logits, cache, next_pending
+
+    @torch.inference_mode()
+    def prefill(self, tokens: Sequence[int] | torch.Tensor, *, collect_logits: bool = False):
+        """Serially prefill while overlapping the two independent stacks at each step."""
+
+        if not isinstance(tokens, torch.Tensor):
+            tokens = torch.tensor(list(tokens), dtype=torch.long, device=self.device)
+        tokens = tokens.to(device=self.device, dtype=torch.long)
+        if tokens.ndim == 1:
+            tokens = tokens.unsqueeze(0)
+        if tokens.ndim != 2 or tokens.shape[0] != 1 or tokens.shape[1] == 0:
+            raise ValueError("prefill requires tokens with shape [sequence] or [1, sequence]")
+        cache = None
+        pending = None
+        logits = None
+        collected = []
+        for position in range(tokens.shape[1]):
+            project_logits = collect_logits or position == tokens.shape[1] - 1
+            logits, cache, pending = self.step(
+                tokens[:, position : position + 1],
+                cache,
+                pending,
+                project_logits=project_logits,
+            )
+            if logits is not None:
+                collected.append(logits)
+        return logits, cache, pending, torch.cat(collected, dim=1)
+
+    @torch.inference_mode()
+    def generate(
+        self,
+        input_ids: torch.Tensor,
+        *,
+        max_new_tokens: int,
+        eos_token_id: int | None = None,
+    ) -> torch.Tensor:
+        """Generate with first-pass readout and overlapped two-stack decode."""
+
+        if max_new_tokens < 0:
+            raise ValueError("max_new_tokens must be non-negative")
+        logits, cache, pending, _ = self.prefill(input_ids)
+        generated = input_ids.to(device=self.device, dtype=torch.long).clone()
+        for _ in range(max_new_tokens):
+            token = logits[:, -1, :].argmax(dim=-1, keepdim=True)
+            generated = torch.cat((generated, token), dim=1)
+            if eos_token_id is not None and bool((token == eos_token_id).all()):
+                break
+            logits, cache, pending = self.step(token, cache, pending)
+        return generated
 
 
 class CUDAGraphedPrefill:
@@ -294,8 +523,10 @@ class CUDAGraphedPrefill:
 
 __all__ = [
     "MAX_FORWARD_ERROR",
+    "CUDAConcurrentRunner",
     "CUDAGraphedPrefill",
     "CUDAPrefillRunner",
+    "CUDARecirculationState",
     "ForwardError",
     "FusedNormMix",
     "measure_forward_error",

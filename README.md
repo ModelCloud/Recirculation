@@ -2,6 +2,7 @@
 
 ## Progress
 
+- 2026-08-20 — Two-stack CUDA execution overlapped replay/current work for **1.065x lower latency** with zero error.
 - 2026-08-20 — Ramping now follows the paper's zero-based 10-step schedule exactly.
 - 2026-08-20 — Corrected CUDA same-token replay reached **4.533x prefill speedup** within the `2e-3` error gate.
 - 2026-08-20 — Corrected recirculation to replay each token's own upper stack and replace its upper-layer KV state.
@@ -99,6 +100,25 @@ python scripts/benchmark_cuda_prefill.py \
   --model /local-models/Llama-3.2-1B-Instruct \
   --tokens 128 \
   --output results/cuda_fused_prefill_128_tokens.json
+```
+
+### Concurrent CUDA decode schedule
+
+`CUDAConcurrentRunner` implements the paper's two-stack schedule: token `t-1` replays the upper stack on one CUDA
+stream while token `t` runs through the destination layer on another, and the streams join before token `t` enters
+its upper stack. Persistent Python worker threads enqueue the disjoint branches concurrently; this works on standard
+Python because PyTorch releases the GIL around CUDA operations and is also compatible with free-threaded Python.
+Readout remains on the token's first pass, as specified by the paper. The current API supports batch-one, unpadded
+inference.
+
+On the available GIL-enabled Python build, the 128-token Llama 3.2 1B benchmark improved sequential fused CUDA from
+`2643.35 ms` to `2481.09 ms` (`1.065x`) with zero measured logits or pending-state error.
+
+```bash
+python scripts/benchmark_cuda_concurrent.py \
+  --model /local-models/Llama-3.2-1B-Instruct \
+  --tokens 128 \
+  --output results/cuda_concurrent_128_tokens.json
 ```
 
 ## Citation
