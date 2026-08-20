@@ -128,11 +128,43 @@ stack as one fixed-shape CUDA Graph. A process-wide lock covers all warmups and 
 capturing or warming CUDA graphs on the same device concurrently. Capture uses CUDA's global safety mode; replay is
 not locked. The benchmark gates both the original and changed-token outputs at accumulated error `<=2e-3`.
 
+A sweep of capture safety modes, manual/automatic instantiation, and stream priorities found no material steady-state
+replay difference. High-priority (`-3`) lower/replay streams were nominally fastest and are the default, while capture
+retains the safer global mode and automatic instantiation. See
+[`results/cuda_graph_mode_sweep_gil1_128_tokens.md`](results/cuda_graph_mode_sweep_gil1_128_tokens.md).
+
 ```bash
 python scripts/benchmark_cuda_concurrent.py \
   --model /local-models/Llama-3.2-1B-Instruct \
   --tokens 128 \
   --output results/cuda_concurrent_128_tokens.json
+```
+
+### CUDA path and alpha screening
+
+`screen_cuda_recirculation.py` ports the MLX tuning screen to CUDA. It scores teacher-forced answer NLL, computes each
+candidate's 1,078-token shared prefix once, restores an immutable candidate-specific KV snapshot for every row, and
+loads the model and dataset only once. The hook-free dual-stream scheduler is the default. Its screening mode enqueues
+both CUDA branches from one Python thread, avoiding futures overhead while preserving stream overlap; outer candidate
+parallelism is available but defaults to one because four workers slowed the measured single-GPU workload.
+
+```bash
+PYTHONUNBUFFERED=1 \
+OMP_NUM_THREADS=16 \
+OPENBLAS_NUM_THREADS=16 \
+MKL_NUM_THREADS=16 \
+BLIS_NUM_THREADS=16 \
+VECLIB_MAXIMUM_THREADS=16 \
+NUMEXPR_NUM_THREADS=16 \
+python scripts/screen_cuda_recirculation.py \
+  --model /local-models/Llama-3.2-1B-Instruct \
+  --row-start 272 \
+  --rows 32 \
+  --forbid-range 0:272 \
+  --forbid-range 304:336 \
+  --alpha 0.10 \
+  --max-distance 12 \
+  --output results/cuda_path_screen_same_token_rows272_303_alpha010.json
 ```
 
 ## Citation

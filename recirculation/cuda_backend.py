@@ -69,6 +69,27 @@ class CUDARecirculationState:
     token_position: int
 
 
+@dataclass(frozen=True)
+class CUDAPrefillSnapshot:
+    """Immutable CUDA KV and pending state for shared-prefix screening."""
+
+    cache_data: tuple[tuple[torch.Tensor | None, ...], ...]
+    pending: CUDARecirculationState
+
+
+def _snapshot_cuda_state(cache, pending: CUDARecirculationState) -> CUDAPrefillSnapshot:
+    cache_data = tuple(
+        tuple(value.detach().clone() if torch.is_tensor(value) else value for value in layer_data)
+        for layer_data in cache
+    )
+    frozen_pending = CUDARecirculationState(
+        pending.destination.detach().clone(),
+        pending.source.detach().clone(),
+        pending.token_position,
+    )
+    return CUDAPrefillSnapshot(cache_data, frozen_pending)
+
+
 def measure_forward_error(reference: torch.Tensor, candidate: torch.Tensor) -> ForwardError:
     """Measure an optimized accumulated forward against the PyTorch oracle."""
 
@@ -204,6 +225,8 @@ class CUDAPrefillRunner:
         *,
         attention_mask: torch.Tensor | None = None,
         collect_logits: bool = False,
+        cache=None,
+        pending: CUDARecirculationState | None = None,
     ):
         """Return final logits, KV cache, pending same-token replay, and optionally every token's logits."""
 
@@ -215,20 +238,23 @@ class CUDAPrefillRunner:
             tokens = tokens.unsqueeze(0)
         if tokens.ndim != 2 or tokens.shape[0] != 1 or tokens.shape[1] == 0:
             raise ValueError("prefill requires tokens with shape [sequence] or [1, sequence]")
+        prefix_length = 0 if cache is None else cache.get_seq_length()
+        total_length = prefix_length + tokens.shape[1]
         if attention_mask is None:
-            attention_mask = torch.ones_like(tokens)
+            attention_mask = torch.ones((1, total_length), dtype=torch.long, device=device)
         else:
             attention_mask = attention_mask.to(device=device)
-        if attention_mask.shape != tokens.shape:
-            raise ValueError("attention_mask must have the same shape as tokens")
+        if attention_mask.shape != (1, total_length):
+            raise ValueError("attention_mask must cover the cached prefix and every new token")
 
-        cache = None
         logits = None
         collected = []
         self.controller.attach()
+        self.controller._pending = pending
+        self.controller._position = prefix_length
         try:
             for position in range(tokens.shape[1]):
-                prefix_mask = attention_mask[:, : position + 1]
+                prefix_mask = attention_mask[:, : prefix_length + position + 1]
                 if cache is not None:
                     self.controller._recirculate_pending(cache, prefix_mask)
                 output = self.decoder(
@@ -254,6 +280,23 @@ class CUDAPrefillRunner:
         finally:
             self.controller.detach()
 
+    def snapshot(self, cache, pending: CUDARecirculationState) -> CUDAPrefillSnapshot:
+        return _snapshot_cuda_state(cache, pending)
+
+    def restore(self, snapshot: CUDAPrefillSnapshot):
+        cache = DynamicCache(snapshot.cache_data, config=self.model.config)
+        return cache, snapshot.pending
+
+    def prefill_from_snapshot(
+        self,
+        tokens: Sequence[int] | torch.Tensor,
+        snapshot: CUDAPrefillSnapshot,
+        *,
+        collect_logits: bool = False,
+    ):
+        cache, pending = self.restore(snapshot)
+        return self.prefill(tokens, cache=cache, pending=pending, collect_logits=collect_logits)
+
 
 class CUDAConcurrentRunner:
     """Overlap the previous upper replay with the current token's lower stack.
@@ -270,6 +313,8 @@ class CUDAConcurrentRunner:
         config: RecirculationConfig,
         *,
         fused: bool = True,
+        stream_priority: int = -3,
+        use_python_threads: bool = True,
     ):
         if not hasattr(model, "get_decoder") or model.get_output_embeddings() is None:
             raise TypeError("concurrent CUDA inference requires a Hugging Face causal language model")
@@ -284,16 +329,23 @@ class CUDAConcurrentRunner:
             raise ValueError("recirculation layers are outside the decoder or are not ordered destination < source")
         self.mixer = FusedNormMix() if fused else mix_reference
         self.device = device
-        self.lower_stream = torch.cuda.Stream(device=device)
-        self.replay_stream = torch.cuda.Stream(device=device)
+        self.stream_priority = stream_priority
+        self.use_python_threads = use_python_threads
+        self.lower_stream = torch.cuda.Stream(device=device, priority=stream_priority)
+        self.replay_stream = torch.cuda.Stream(device=device, priority=stream_priority)
         self.dependency_event = torch.cuda.Event()
         self.lower_done_event = torch.cuda.Event()
         self.replay_done_event = torch.cuda.Event()
-        self.executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="recirculation-cuda")
+        self.executor = (
+            ThreadPoolExecutor(max_workers=2, thread_name_prefix="recirculation-cuda")
+            if use_python_threads
+            else None
+        )
         self.gil_enabled = log_concurrency_mode()
 
     def close(self) -> None:
-        self.executor.shutdown(wait=True)
+        if self.executor is not None:
+            self.executor.shutdown(wait=True)
 
     def __enter__(self):
         return self
@@ -397,10 +449,18 @@ class CUDAConcurrentRunner:
             if pending.token_position != token_position - 1:
                 raise ValueError("pending token position does not precede the current cache position")
             self.dependency_event.record(main_stream)
-            replay_future = self.executor.submit(self._replay_branch, pending, cache, self.dependency_event)
-            lower_future = self.executor.submit(self._lower_branch, token, cache, token_position, self.dependency_event)
-            destination, position_ids, position_embeddings = lower_future.result()
-            replay_future.result()
+            if self.executor is None:
+                self._replay_branch(pending, cache, self.dependency_event)
+                destination, position_ids, position_embeddings = self._lower_branch(
+                    token, cache, token_position, self.dependency_event
+                )
+            else:
+                replay_future = self.executor.submit(self._replay_branch, pending, cache, self.dependency_event)
+                lower_future = self.executor.submit(
+                    self._lower_branch, token, cache, token_position, self.dependency_event
+                )
+                destination, position_ids, position_embeddings = lower_future.result()
+                replay_future.result()
             self.lower_done_event.record(self.lower_stream)
             self.replay_done_event.record(self.replay_stream)
             main_stream.wait_event(self.lower_done_event)
@@ -420,7 +480,14 @@ class CUDAConcurrentRunner:
         return logits, cache, next_pending
 
     @torch.inference_mode()
-    def prefill(self, tokens: Sequence[int] | torch.Tensor, *, collect_logits: bool = False):
+    def prefill(
+        self,
+        tokens: Sequence[int] | torch.Tensor,
+        *,
+        collect_logits: bool = False,
+        cache=None,
+        pending: CUDARecirculationState | None = None,
+    ):
         """Serially prefill while overlapping the two independent stacks at each step."""
 
         if not isinstance(tokens, torch.Tensor):
@@ -430,8 +497,6 @@ class CUDAConcurrentRunner:
             tokens = tokens.unsqueeze(0)
         if tokens.ndim != 2 or tokens.shape[0] != 1 or tokens.shape[1] == 0:
             raise ValueError("prefill requires tokens with shape [sequence] or [1, sequence]")
-        cache = None
-        pending = None
         logits = None
         collected = []
         for position in range(tokens.shape[1]):
@@ -445,6 +510,23 @@ class CUDAConcurrentRunner:
             if logits is not None:
                 collected.append(logits)
         return logits, cache, pending, torch.cat(collected, dim=1)
+
+    def snapshot(self, cache, pending: CUDARecirculationState) -> CUDAPrefillSnapshot:
+        return _snapshot_cuda_state(cache, pending)
+
+    def restore(self, snapshot: CUDAPrefillSnapshot):
+        cache = DynamicCache(snapshot.cache_data, config=self.model.config)
+        return cache, snapshot.pending
+
+    def prefill_from_snapshot(
+        self,
+        tokens: Sequence[int] | torch.Tensor,
+        snapshot: CUDAPrefillSnapshot,
+        *,
+        collect_logits: bool = False,
+    ):
+        cache, pending = self.restore(snapshot)
+        return self.prefill(tokens, cache=cache, pending=pending, collect_logits=collect_logits)
 
     @torch.inference_mode()
     def generate(
@@ -624,6 +706,7 @@ __all__ = [
     "CUDAGraphedConcurrentPrefill",
     "CUDAGraphedPrefill",
     "CUDAPrefillRunner",
+    "CUDAPrefillSnapshot",
     "CUDARecirculationState",
     "ForwardError",
     "FusedNormMix",

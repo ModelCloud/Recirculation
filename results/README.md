@@ -15,3 +15,7 @@ fresh dense/sequential timings, and the provenance and limitations of the histor
 The GIL-enabled eager and CUDA Graph dual-stream comparison is recorded in
 [`cuda_concurrent_graph_gil1_128_tokens.md`](cuda_concurrent_graph_gil1_128_tokens.md), including its implementation
 commit, raw JSON artifact, environment, and accuracy gates.
+
+The post-capture mode/priority sweep and its higher-repetition confirmation are summarized in
+[`cuda_graph_mode_sweep_gil1_128_tokens.md`](cuda_graph_mode_sweep_gil1_128_tokens.md). The nominal winner preserves
+global capture safety and changes only the lower/replay stream priority.

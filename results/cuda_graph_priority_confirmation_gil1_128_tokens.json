@@ -1,0 +1,115 @@
+{
+  "alpha": 0.1,
+  "baseline_median_ms": 513.4994210675359,
+  "best_median_ms": 513.3716473355889,
+  "best_speedup_vs_baseline": 1.0002488912907639,
+  "best_variant": "global_auto_high_branches",
+  "destination_layer": 5,
+  "implementation_commit": "819567f3cab5341f61c11b9c69b419639f367817",
+  "model": "/local-models/Llama-3.2-1B-Instruct",
+  "python_gil_enabled": true,
+  "repetitions": 21,
+  "source_layer": 12,
+  "stream_priority_range": [
+    0,
+    -3
+  ],
+  "tokens": 128,
+  "variants": [
+    {
+      "capture_error_mode": "global",
+      "capture_priority": 0,
+      "keep_graph": false,
+      "launch_priority": 0,
+      "logits_error": {
+        "max_absolute": 0.0,
+        "normalized_max": 0.0,
+        "relative_l2": 0.0
+      },
+      "logits_error_rate": 0.0,
+      "lower_priority": -3,
+      "mean_ms": 513.6699405986639,
+      "median_ms": 513.3716473355889,
+      "name": "global_auto_high_branches",
+      "pending_error": {
+        "max_absolute": 0.0,
+        "normalized_max": 0.0,
+        "relative_l2": 0.0
+      },
+      "pending_error_rate": 0.0,
+      "replay_priority": -3,
+      "samples_ms": [
+        513.2028870284557,
+        513.2756140083075,
+        516.358096152544,
+        512.9558155313134,
+        513.8815091922879,
+        513.9463935047388,
+        513.1580606102943,
+        513.3716473355889,
+        513.1609058007598,
+        514.0955960378051,
+        513.2013633847237,
+        514.6056888625026,
+        513.3951520547271,
+        513.6789632961154,
+        513.5235777124763,
+        513.3706443011761,
+        514.7325899451971,
+        513.4200798347592,
+        513.3641427382827,
+        513.3300991728902,
+        513.0399260669947
+      ],
+      "stdev_ms": 0.77786986870306
+    },
+    {
+      "capture_error_mode": "global",
+      "capture_priority": 0,
+      "keep_graph": false,
+      "launch_priority": 0,
+      "logits_error": {
+        "max_absolute": 0.0,
+        "normalized_max": 0.0,
+        "relative_l2": 0.0
+      },
+      "logits_error_rate": 0.0,
+      "lower_priority": 0,
+      "mean_ms": 513.7733867214549,
+      "median_ms": 513.4994210675359,
+      "name": "global_auto_default",
+      "pending_error": {
+        "max_absolute": 0.0,
+        "normalized_max": 0.0,
+        "relative_l2": 0.0
+      },
+      "pending_error_rate": 0.0,
+      "replay_priority": 0,
+      "samples_ms": [
+        513.5316625237465,
+        513.3016537874937,
+        513.254264369607,
+        513.1816361099482,
+        513.8942329213023,
+        517.014748416841,
+        513.5083980858326,
+        513.550759293139,
+        513.4994210675359,
+        516.8011505156755,
+        513.2166938856244,
+        513.452410697937,
+        513.1012024357915,
+        514.2602100968361,
+        512.9583897069097,
+        513.0597930401564,
+        513.5703356936574,
+        513.833386823535,
+        513.1475497037172,
+        513.6519419029355,
+        513.4512800723314
+      ],
+      "stdev_ms": 1.0866011703764793
+    }
+  ],
+  "warmups": 3
+}

@@ -102,6 +102,80 @@ def test_cuda_concurrent_stacks_match_sequential_scheduler(monkeypatch):
     torch.testing.assert_close(candidate[2].destination, reference[2].destination, rtol=0, atol=0)
     torch.testing.assert_close(candidate[2].source, reference[2].source, rtol=0, atol=0)
     assert candidate[2].token_position == reference[2].token_position == 3
+    assert concurrent.lower_stream.priority == -3
+    assert concurrent.replay_stream.priority == -3
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_cuda_single_thread_stream_enqueue_matches_threaded(monkeypatch):
+    transformers = pytest.importorskip("transformers")
+    from recirculation.cuda_backend import CUDAConcurrentRunner
+
+    monkeypatch.setattr(__import__("sys"), "_is_gil_enabled", lambda: True)
+    model = (
+        transformers.LlamaForCausalLM(
+            transformers.LlamaConfig(
+                vocab_size=32,
+                hidden_size=64,
+                intermediate_size=128,
+                num_hidden_layers=4,
+                num_attention_heads=4,
+                num_key_value_heads=2,
+            )
+        )
+        .half()
+        .eval()
+        .cuda()
+    )
+    config = RecirculationConfig(source_layer=2, destination_layer=0, alpha=0.1)
+    tokens = torch.tensor([[1, 2, 3, 4]], device="cuda")
+    threaded = CUDAConcurrentRunner(model, config)
+    single_thread = CUDAConcurrentRunner(model, config, use_python_threads=False)
+    try:
+        expected = threaded.prefill(tokens, collect_logits=True)
+        candidate = single_thread.prefill(tokens, collect_logits=True)
+    finally:
+        threaded.close()
+        single_thread.close()
+    torch.testing.assert_close(candidate[3], expected[3], rtol=0, atol=0)
+    torch.testing.assert_close(candidate[2].destination, expected[2].destination, rtol=0, atol=0)
+    torch.testing.assert_close(candidate[2].source, expected[2].source, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_cuda_snapshot_continuation_matches_full_prefill():
+    transformers = pytest.importorskip("transformers")
+    from recirculation.cuda_backend import CUDAPrefillRunner
+
+    model = (
+        transformers.LlamaForCausalLM(
+            transformers.LlamaConfig(
+                vocab_size=32,
+                hidden_size=64,
+                intermediate_size=128,
+                num_hidden_layers=4,
+                num_attention_heads=4,
+                num_key_value_heads=2,
+            )
+        )
+        .half()
+        .eval()
+        .cuda()
+    )
+    runner = CUDAPrefillRunner(
+        model,
+        RecirculationConfig(source_layer=2, destination_layer=0, alpha=0.1, ramp_tokens=2),
+    )
+    tokens = torch.tensor([[1, 2, 3, 4]], device="cuda")
+    expected = runner.prefill(tokens, collect_logits=True)
+    _, cache, pending, _ = runner.prefill(tokens[:, :2])
+    snapshot = runner.snapshot(cache, pending)
+    candidate = runner.prefill_from_snapshot(tokens[:, 2:], snapshot, collect_logits=True)
+
+    torch.testing.assert_close(candidate[3], expected[3][:, 2:], rtol=0, atol=0)
+    torch.testing.assert_close(candidate[2].destination, expected[2].destination, rtol=0, atol=0)
+    torch.testing.assert_close(candidate[2].source, expected[2].source, rtol=0, atol=0)
+    assert candidate[2].token_position == expected[2].token_position == 3
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
