@@ -2,16 +2,19 @@
 
 """Inference-only same-token deep-to-shallow residual feedback.
 
-This is the one-path, one-iteration variant from "Recirculation". The
-controller operates through decoder-layer hooks and does not modify model
-weights or checkpoint tensors. The controller's ``generate`` method is the
-normative Torch implementation: it performs serial prefill and cached decoding,
-replaying each token from the destination through the upper stack using that
-token's own first-pass source and destination activations.
+This is the one-path, one-additional-iteration variant from "Recirculation":
+https://arxiv.org/html/2608.17981v1
+
+The controller operates through decoder-layer hooks and does not modify model
+weights or checkpoint tensors. Its ``generate`` method is the normative Torch
+implementation of the serial equivalent of Figure 3(c): each input step's first
+iteration supplies the source and destination residuals for its later additional
+top-stack iteration, while readout occurs only after a first iteration.
 """
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -22,7 +25,12 @@ from torch import nn
 
 @dataclass(frozen=True)
 class RecirculationConfig:
-    """Controls for the opt-in recirculation experiment."""
+    """Controls for the paper's fixed-coefficient recirculation experiment.
+
+    ``iterations`` counts additional iterations beyond the ordinary first
+    iteration. ``normalize_source`` applies the source renormalization from
+    Equation (2), matching its L2 norm to the destination residual.
+    """
 
     source_layer: int
     destination_layer: int
@@ -37,11 +45,11 @@ class RecirculationConfig:
             raise ValueError("Recirculation layer indices must be non-negative.")
         if self.source_layer <= self.destination_layer:
             raise ValueError("Recirculation source_layer must be deeper than destination_layer.")
-        if not 0.0 <= self.alpha <= 1.0:
-            raise ValueError("Recirculation alpha must be in [0, 1].")
+        if not math.isfinite(self.alpha) or not 0.0 <= self.alpha <= 1.0:
+            raise ValueError("Recirculation alpha must be finite and in [0, 1].")
         beta = 1.0 - self.alpha if self.beta is None else self.beta
-        if not 0.0 <= beta <= 1.0:
-            raise ValueError("Recirculation beta must be in [0, 1].")
+        if not math.isfinite(beta) or not 0.0 <= beta <= 1.0:
+            raise ValueError("Recirculation beta must be finite and in [0, 1].")
         if self.ramp_tokens < 0:
             raise ValueError("Recirculation ramp_tokens must be non-negative.")
         if self.iterations != 1:
@@ -50,28 +58,30 @@ class RecirculationConfig:
 
 
 @dataclass(frozen=True)
-class _PendingRecirculation:
-    destination: torch.Tensor
-    source: torch.Tensor
-    token_position: int
+class _PendingFirstIterationState:
+    """First-iteration residuals awaiting their additional top-stack iteration."""
+
+    destination_residual: torch.Tensor
+    source_residual: torch.Tensor
+    input_step: int
 
 
-def _mixing_coefficients(config: RecirculationConfig, token_position: int | None = None) -> tuple[float, float]:
+def _mixing_coefficients(config: RecirculationConfig, input_step: int | None = None) -> tuple[float, float]:
     """Return the paper's alpha_t and its configured beta coefficient."""
 
-    if token_position is not None and token_position < 0:
-        raise ValueError("Recirculation token_position must be non-negative.")
-    strength = config.alpha
+    if input_step is not None and input_step < 0:
+        raise ValueError("Recirculation input_step must be non-negative.")
+    alpha_t = config.alpha
     if config.ramp_tokens:
-        if token_position is None:
-            raise ValueError("Recirculation token_position is required when ramp_tokens is enabled.")
-        strength *= min(token_position / float(config.ramp_tokens), 1.0)
+        if input_step is None:
+            raise ValueError("Recirculation input_step is required when ramp_tokens is enabled.")
+        alpha_t *= min(input_step / float(config.ramp_tokens), 1.0)
     # The paper's convex mixture uses beta_t = 1 - alpha_t. An explicitly
-    # non-convex beta remains fixed while alpha ramps.
-    beta = config.beta
+    # supplied non-default beta remains fixed while alpha ramps.
+    beta_t = config.beta
     if config.beta == 1.0 - config.alpha:
-        beta = 1.0 - strength
-    return float(strength), float(beta)
+        beta_t = 1.0 - alpha_t
+    return float(alpha_t), float(beta_t)
 
 
 def torch_mix_reference(
@@ -81,7 +91,7 @@ def torch_mix_reference(
     beta: float,
     normalize_source: bool,
 ) -> torch.Tensor:
-    """Apply the paper's residual mixture using ordinary Torch operations.
+    """Apply the paper's Equations (1)-(2) using ordinary Torch operations.
 
     This function is the numerical oracle for accelerated backends. For the
     paper's undefined zero-source-norm edge case, the normalized source is
@@ -133,7 +143,7 @@ def _hidden_states_from_output(output: Any) -> torch.Tensor:
 
 
 class RecirculationController:
-    """Attach and detach one same-token, one-iteration feedback path.
+    """Attach and detach one same-token, one-additional-iteration path.
 
     This is an inference-time intervention and does not alter model weights or
     serialized metadata. Use :meth:`generate` for paper-faithful serial prefill.
@@ -157,66 +167,97 @@ class RecirculationController:
         self._destination = layers[config.destination_layer]
         self._source = layers[config.source_layer]
         self._handles: list[Any] = []
-        self._pending: _PendingRecirculation | None = None
-        self._current_destination: torch.Tensor | None = None
-        self._in_second_pass = False
-        self._position = 0
+        self._pending_first_iteration: _PendingFirstIterationState | None = None
+        self._first_iteration_destination: torch.Tensor | None = None
+        self._in_additional_iteration = False
+        self._next_input_step = 0
         self._active = False
         self._mixer = mixer
         self._allow_terminal_padding = allow_terminal_padding
 
     def reset(self) -> None:
-        """Discard delayed state before starting another prompt."""
+        """Discard pending first-iteration state before starting another prompt."""
 
-        self._pending = None
-        self._current_destination = None
-        self._position = 0
+        self._pending_first_iteration = None
+        self._first_iteration_destination = None
+        self._next_input_step = 0
 
-    def _destination_hook(self, _module: nn.Module, _args: tuple[Any, ...], output: Any):
+    def _capture_first_iteration_destination(self, _module: nn.Module, _args: tuple[Any, ...], output: Any):
+        """Capture z_{t,t,d} without changing the first-iteration residual stream."""
+
         hidden_states = _hidden_states_from_output(output)
-        if not self._in_second_pass:
-            self._current_destination = hidden_states[:, -1:, :].detach()
+        if not self._in_additional_iteration:
+            self._first_iteration_destination = hidden_states[:, -1:, :].detach()
         return output
 
-    def _mix(self, destination: torch.Tensor, source: torch.Tensor, token_position: int) -> torch.Tensor:
-        strength, beta = _mixing_coefficients(self.config, token_position)
+    def _compute_recirculated_destination(
+        self,
+        destination_residual: torch.Tensor,
+        source_residual: torch.Tensor,
+        input_step: int,
+    ) -> torch.Tensor:
+        """Compute Equation (1)'s destination state for the additional iteration."""
+
+        alpha_t, beta_t = _mixing_coefficients(self.config, input_step)
         if self._mixer is not None:
-            return self._mixer(destination, source, strength, beta, self.config.normalize_source)
-        return torch_mix_reference(destination, source, strength, beta, self.config.normalize_source)
-
-    def _source_hook(self, _module: nn.Module, _args: tuple[Any, ...], output: Any):
-        hidden_states = _hidden_states_from_output(output)
-        if self._in_second_pass:
-            return output
-        if self._current_destination is None:
-            raise RuntimeError("destination activation was not captured before source activation")
-        token_count = int(hidden_states.shape[1])
-        if token_count < 1:
-            raise RuntimeError("source activation contains no token positions")
-        self._pending = _PendingRecirculation(
-            self._current_destination,
-            hidden_states[:, -1:, :].detach(),
-            self._position + token_count - 1,
+            return self._mixer(
+                destination_residual,
+                source_residual,
+                alpha_t,
+                beta_t,
+                self.config.normalize_source,
+            )
+        return torch_mix_reference(
+            destination_residual,
+            source_residual,
+            alpha_t,
+            beta_t,
+            self.config.normalize_source,
         )
-        self._position += token_count
+
+    def _capture_first_iteration_source(self, _module: nn.Module, _args: tuple[Any, ...], output: Any):
+        """Complete the first-iteration state captured for the current input step."""
+
+        hidden_states = _hidden_states_from_output(output)
+        if self._in_additional_iteration:
+            return output
+        if self._first_iteration_destination is None:
+            raise RuntimeError("destination activation was not captured before source activation")
+        input_step_count = int(hidden_states.shape[1])
+        if input_step_count < 1:
+            raise RuntimeError("source residual contains no input steps")
+        self._pending_first_iteration = _PendingFirstIterationState(
+            destination_residual=self._first_iteration_destination,
+            source_residual=hidden_states[:, -1:, :].detach(),
+            input_step=self._next_input_step + input_step_count - 1,
+        )
+        self._next_input_step += input_step_count
         return output
 
-    def _recirculate_pending(self, past_key_values, attention_mask: torch.Tensor) -> None:
-        if self._pending is None:
+    def _run_pending_top_stack_iteration(self, past_key_values, attention_mask: torch.Tensor) -> None:
+        """Run the preceding input step's additional top-stack iteration.
+
+        This is the serial form of Figure 3(c)'s top-stack branch. It begins
+        with Equation (1)'s mixed destination and replaces only that input
+        step's top-stack KV entries.
+        """
+
+        if self._pending_first_iteration is None:
             return
+        first_iteration_state = self._pending_first_iteration
         decoder = self.model.model
         sequence_length = past_key_values.get_seq_length()
         if sequence_length < 1:
             raise RuntimeError("cannot recirculate an empty KV cache")
-        first_upper_layer = self.config.destination_layer + 1
-        for layer in past_key_values.layers[first_upper_layer:]:
+        top_stack_start = self.config.destination_layer + 1
+        for layer in past_key_values.layers[top_stack_start:]:
             layer.crop(-1)
-        hidden_states = self._mix(
-            self._pending.destination,
-            self._pending.source,
-            self._pending.token_position,
+        hidden_states = self._compute_recirculated_destination(
+            first_iteration_state.destination_residual,
+            first_iteration_state.source_residual,
+            first_iteration_state.input_step,
         )
-        # Construct directly on-device so fixed-length replay remains CUDA graph capture-safe.
+        # Construct on-device so the additional iteration remains CUDA Graph capture-safe.
         position_ids = torch.full((1, 1), sequence_length - 1, dtype=torch.long, device=hidden_states.device)
         capturing = hidden_states.is_cuda and torch.cuda.is_current_stream_capturing()
         if (
@@ -224,11 +265,11 @@ class RecirculationController:
             and not self._allow_terminal_padding
             and not bool(attention_mask[:, :sequence_length].all())
         ):
-            raise ValueError("paper-exact replay currently requires an unpadded batch")
+            raise ValueError("paper-faithful additional iteration currently requires an unpadded batch")
         position_embeddings = decoder.rotary_emb(hidden_states, position_ids=position_ids)
-        self._in_second_pass = True
+        self._in_additional_iteration = True
         try:
-            for layer in decoder.layers[first_upper_layer:]:
+            for layer in decoder.layers[top_stack_start:]:
                 hidden_states = layer(
                     hidden_states,
                     attention_mask=None,
@@ -238,16 +279,17 @@ class RecirculationController:
                     position_embeddings=position_embeddings,
                 )
         finally:
-            self._in_second_pass = False
-        self._pending = None
+            self._in_additional_iteration = False
+        # Figure 3: the additional iteration updates state but has no readout.
+        self._pending_first_iteration = None
 
     def attach(self) -> RecirculationController:
         if self._active:
             return self
         self.reset()
         self._handles = [
-            self._destination.register_forward_hook(self._destination_hook),
-            self._source.register_forward_hook(self._source_hook),
+            self._destination.register_forward_hook(self._capture_first_iteration_destination),
+            self._source.register_forward_hook(self._capture_first_iteration_source),
         ]
         self._active = True
         return self
@@ -256,8 +298,8 @@ class RecirculationController:
         for handle in self._handles:
             handle.remove()
         self._handles.clear()
-        self._pending = None
-        self._current_destination = None
+        self._pending_first_iteration = None
+        self._first_iteration_destination = None
         self._active = False
 
     @torch.inference_mode()
@@ -269,11 +311,11 @@ class RecirculationController:
         max_new_tokens: int,
         eos_token_id: int | None = None,
     ) -> torch.Tensor:
-        """Generate with paper-faithful same-token replay and cached decode.
+        """Generate with the paper's first/additional-iteration schedule.
 
-        Before first-passing token ``t``, this method second-passes token
-        ``t-1`` from the destination through the upper stack and replaces its
-        upper-layer KV entries. A normal parallel prefill is not equivalent.
+        Before input step ``t`` begins its first iteration, this serial reference
+        completes input step ``t-1``'s additional top-stack iteration. Readout
+        follows the first iteration only, as specified by Figure 3.
         """
 
         if input_ids.ndim != 2 or input_ids.shape[0] != 1:
@@ -293,39 +335,41 @@ class RecirculationController:
             prompt_length = input_ids.shape[1]
             generated = input_ids.clone()
             past_key_values = None
-            logits = None
-            for position in range(prompt_length):
-                token = input_ids[:, position : position + 1]
-                prefix_mask = attention_mask[:, : position + 1]
+            first_iteration_logits = None
+            for input_step in range(prompt_length):
+                current_input = input_ids[:, input_step : input_step + 1]
+                prefix_mask = attention_mask[:, : input_step + 1]
                 if past_key_values is not None:
-                    self._recirculate_pending(past_key_values, prefix_mask)
-                outputs = self.model(
-                    input_ids=token,
+                    # Serial equivalent of Figure 3(c)'s preceding top-stack branch.
+                    self._run_pending_top_stack_iteration(past_key_values, prefix_mask)
+                first_iteration_outputs = self.model(
+                    input_ids=current_input,
                     attention_mask=prefix_mask,
                     past_key_values=past_key_values,
                     use_cache=True,
                 )
-                past_key_values = outputs.past_key_values
-                logits = outputs.logits[:, -1, :]
+                past_key_values = first_iteration_outputs.past_key_values
+                # Figure 3: readout follows the current input's first iteration.
+                first_iteration_logits = first_iteration_outputs.logits[:, -1, :]
             for _ in range(max_new_tokens):
-                if logits is None:
+                if first_iteration_logits is None:
                     break
-                token = logits.argmax(dim=-1, keepdim=True)
-                generated = torch.cat((generated, token), dim=1)
-                if eos_token_id is not None and bool((token == eos_token_id).all()):
+                next_input = first_iteration_logits.argmax(dim=-1, keepdim=True)
+                generated = torch.cat((generated, next_input), dim=1)
+                if eos_token_id is not None and bool((next_input == eos_token_id).all()):
                     break
                 full_mask = torch.ones(
                     (1, generated.shape[1]), dtype=attention_mask.dtype, device=generated.device
                 )
-                self._recirculate_pending(past_key_values, full_mask)
-                outputs = self.model(
-                    input_ids=token,
+                self._run_pending_top_stack_iteration(past_key_values, full_mask)
+                first_iteration_outputs = self.model(
+                    input_ids=next_input,
                     attention_mask=full_mask,
                     past_key_values=past_key_values,
                     use_cache=True,
                 )
-                past_key_values = outputs.past_key_values
-                logits = outputs.logits[:, -1, :]
+                past_key_values = first_iteration_outputs.past_key_values
+                first_iteration_logits = first_iteration_outputs.logits[:, -1, :]
             return generated
         finally:
             if not was_active:

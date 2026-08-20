@@ -19,6 +19,23 @@ def test_recirculation_config_rejects_negative_layer_indices(source_layer, desti
 
 
 @pytest.mark.parametrize(
+    ("alpha", "beta"),
+    (
+        (-0.2, None),
+        (1.01, None),
+        (float("nan"), None),
+        (float("inf"), None),
+        (0.1, -0.01),
+        (0.1, 1.01),
+        (0.1, float("nan")),
+    ),
+)
+def test_recirculation_config_rejects_out_of_range_mixture_coefficients(alpha, beta):
+    with pytest.raises(ValueError, match="must be finite and in"):
+        RecirculationConfig(source_layer=2, destination_layer=0, alpha=alpha, beta=beta)
+
+
+@pytest.mark.parametrize(
     ("beta", "normalize_source", "expected"),
     (
         (0.9, True, [[[2.7, 4.1]]]),
@@ -515,7 +532,7 @@ def test_mlx_ramp_matches_published_zero_based_schedule():
     source = mx.array([[[0.0, 1.0]]])
     compiled = CompiledNormMix(config)
 
-    with pytest.raises(ValueError, match="token_position is required"):
+    with pytest.raises(ValueError, match="input_step is required"):
         mix_reference(destination, source, config)
     for position, expected_alpha in ((0, 0.0), (1, 0.02), (9, 0.18), (10, 0.2), (11, 0.2)):
         expected = mx.array([[[1.0 - expected_alpha, expected_alpha]]])
@@ -629,7 +646,7 @@ class _ReplayCache:
         return self.layers[0].length
 
 
-def test_controller_captures_same_token_path_without_cross_token_injection():
+def test_controller_captures_first_iteration_state_without_cross_input_injection():
     model = _ToyDecoder()
     input_hidden = torch.zeros(1, 1, 2)
     with RecirculationController(
@@ -638,37 +655,37 @@ def test_controller_captures_same_token_path_without_cross_token_injection():
     ) as controller:
         first = model(input_hidden)
         second = model(input_hidden)
-        pending = controller._pending
+        pending = controller._pending_first_iteration
 
     assert torch.equal(first, torch.full_like(first, 6.0))
     assert torch.equal(second, torch.full_like(second, 6.0))
     assert pending is not None
-    assert pending.token_position == 1
-    assert torch.equal(pending.destination, torch.full_like(input_hidden, 1.0))
-    assert torch.equal(pending.source, torch.full_like(input_hidden, 6.0))
+    assert pending.input_step == 1
+    assert torch.equal(pending.destination_residual, torch.full_like(input_hidden, 1.0))
+    assert torch.equal(pending.source_residual, torch.full_like(input_hidden, 6.0))
     assert torch.equal(model(input_hidden), torch.full_like(input_hidden, 6.0))
 
 
-def test_controller_replays_same_token_from_destination_and_rewinds_only_upper_cache():
+def test_controller_runs_additional_top_stack_iteration_and_rewinds_only_top_stack_cache():
     model = _ReplayModel()
     controller = RecirculationController(
         model,
         RecirculationConfig(source_layer=2, destination_layer=0, alpha=0.5, beta=0.5, normalize_source=False),
     )
-    controller._current_destination = torch.ones(1, 1, 2)
-    controller._source_hook(model.model.layers[2], (), (torch.full((1, 1, 2), 6.0),))
+    controller._first_iteration_destination = torch.ones(1, 1, 2)
+    controller._capture_first_iteration_source(model.model.layers[2], (), (torch.full((1, 1, 2), 6.0),))
     cache = _ReplayCache(model.model.layers, length=1)
 
-    controller._recirculate_pending(cache, torch.ones(1, 1, dtype=torch.long))
+    controller._run_pending_top_stack_iteration(cache, torch.ones(1, 1, dtype=torch.long))
 
     assert cache.layers[0].length == 1
     assert [layer.length for layer in cache.layers[1:]] == [0, 0]
     assert torch.equal(model.model.layers[1].last_input, torch.full((1, 1, 2), 3.5))
     assert torch.equal(model.model.layers[2].last_input, torch.full((1, 1, 2), 5.5))
-    assert controller._pending is None
+    assert controller._pending_first_iteration is None
 
 
-def test_controller_ramp_forwards_zero_based_pending_position_to_mixer():
+def test_controller_ramp_forwards_zero_based_input_step_to_mixer():
     model = _ReplayModel()
     observed = []
 
@@ -688,12 +705,12 @@ def test_controller_ramp_forwards_zero_based_pending_position_to_mixer():
         mixer=record_mix,
     )
     for position in range(12):
-        controller._current_destination = torch.ones(1, 1, 2)
-        controller._source_hook(model.model.layers[2], (), (torch.zeros(1, 1, 2),))
-        assert controller._pending is not None
-        assert controller._pending.token_position == position
+        controller._first_iteration_destination = torch.ones(1, 1, 2)
+        controller._capture_first_iteration_source(model.model.layers[2], (), (torch.zeros(1, 1, 2),))
+        assert controller._pending_first_iteration is not None
+        assert controller._pending_first_iteration.input_step == position
         cache = _ReplayCache(model.model.layers, length=position + 1)
-        controller._recirculate_pending(cache, torch.ones(1, position + 1, dtype=torch.long))
+        controller._run_pending_top_stack_iteration(cache, torch.ones(1, position + 1, dtype=torch.long))
 
     expected_alpha = [0.2 * min(position / 10.0, 1.0) for position in range(12)]
     assert [item[0] for item in observed] == pytest.approx(expected_alpha)

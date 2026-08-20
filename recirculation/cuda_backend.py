@@ -271,7 +271,7 @@ class CUDAPrefillRunner:
             for position in range(tokens.shape[1]):
                 prefix_mask = attention_mask[:, : prefix_length + position + 1]
                 if cache is not None:
-                    self.controller._recirculate_pending(cache, prefix_mask)
+                    self.controller._run_pending_top_stack_iteration(cache, prefix_mask)
                 output = self.decoder(
                     input_ids=tokens[:, position : position + 1],
                     attention_mask=prefix_mask,
@@ -366,7 +366,7 @@ class CUDAPrefillRunner:
         try:
             for position in range(tokens.shape[1]):
                 prefix_mask = attention_mask[:, : prefix_length + position + 1]
-                self.controller._recirculate_pending(cache, prefix_mask)
+                self.controller._run_pending_top_stack_iteration(cache, prefix_mask)
                 output = self.decoder(
                     input_ids=tokens[:, position : position + 1],
                     attention_mask=prefix_mask,

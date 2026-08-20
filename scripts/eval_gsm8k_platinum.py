@@ -60,6 +60,14 @@ def _parse_path(value: str) -> tuple[int, int]:
         raise argparse.ArgumentTypeError("paths must use SOURCE:DESTINATION") from exc
 
 
+def _parse_candidate(value: str) -> tuple[int, int, float]:
+    try:
+        source, destination, alpha = value.split(":")
+        return int(source), int(destination), float(alpha)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("candidates must use SOURCE:DESTINATION:ALPHA") from exc
+
+
 def _overlaps(left: tuple[int, int], right: tuple[int, int]) -> bool:
     return left[0] < right[1] and right[0] < left[1]
 
@@ -123,8 +131,12 @@ def _candidate_arm(source: int, destination: int, alpha: float) -> str:
     return f"source{source}_destination{destination}_alpha{alpha:g}"
 
 
-def _candidate_specs(paths, alphas, beta, ramp_tokens):
-    values = [(source, destination, alpha) for source, destination in paths for alpha in alphas]
+def _candidate_specs(paths, alphas, beta, ramp_tokens, *, candidates=None):
+    values = (
+        list(candidates)
+        if candidates is not None
+        else [(source, destination, alpha) for source, destination in paths for alpha in alphas]
+    )
     if len(set(values)) != len(values):
         raise ValueError("duplicate recirculation candidates are not allowed")
     single = len(values) == 1
@@ -353,6 +365,13 @@ def main() -> int:
         default=None,
         help="Repeat SOURCE:DESTINATION to evaluate multiple paths in one model-loaded process.",
     )
+    parser.add_argument(
+        "--candidate",
+        action="append",
+        type=_parse_candidate,
+        default=None,
+        help="Repeat SOURCE:DESTINATION:ALPHA for explicit path/alpha arms without a Cartesian product.",
+    )
     parser.add_argument("--alpha", action="append", type=float, default=None)
     parser.add_argument("--beta", type=float, default=None)
     parser.add_argument("--ramp-tokens", type=int, default=0)
@@ -369,8 +388,16 @@ def main() -> int:
         raise ValueError("row-start must be non-negative and rows/max-new-tokens must be positive")
     paths = args.path or [(args.source_layer, args.destination_layer)]
     alphas = args.alpha or [0.10]
+    if args.candidate is not None and (args.path is not None or args.alpha is not None):
+        parser.error("--candidate cannot be combined with --path or --alpha")
     try:
-        candidate_specs = _candidate_specs(paths, alphas, args.beta, args.ramp_tokens)
+        candidate_specs = _candidate_specs(
+            paths,
+            alphas,
+            args.beta,
+            args.ramp_tokens,
+            candidates=args.candidate,
+        )
         backend, resolved_device = _resolve_backend(args.backend, args.device)
     except (RuntimeError, ValueError) as error:
         parser.error(str(error))

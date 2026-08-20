@@ -1,5 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import sys
+
+import pytest
 from evalution.benchmarks import gsm8k_platinum
 from evalution.scorers.gsm8k import INVALID_ANSWER
 
@@ -11,6 +14,7 @@ from scripts.eval_gsm8k_platinum import (
     _gold_answer,
     _instruction,
     _paired,
+    _parse_candidate,
     _summary,
     _task_contract,
 )
@@ -75,6 +79,41 @@ def test_candidate_matrix_batches_same_destination_paths_together():
     batches = _candidate_batches(specs, batch_size=8)
     assert len(batches) == 1
     assert [config.source_layer for _, config in batches[0]] == [8, 4]
+
+
+def test_explicit_candidates_preserve_path_specific_alphas():
+    candidates = [_parse_candidate("8:2:0.2"), _parse_candidate("4:2:0.2")]
+    specs = _candidate_specs([], [], None, 0, candidates=candidates)
+
+    assert [arm for arm, _ in specs] == [
+        "source8_destination2_alpha0.2",
+        "source4_destination2_alpha0.2",
+    ]
+    assert [(config.alpha, config.beta) for _, config in specs] == [(0.2, 0.8), (0.2, 0.8)]
+    assert len(_candidate_batches(specs, batch_size=8)) == 1
+
+
+@pytest.mark.parametrize(
+    "coefficient_args",
+    (("--candidate", "8:2:-0.2"), ("--path", "8:2", "--alpha", "-0.2")),
+)
+def test_cli_rejects_negative_alpha_before_backend_initialization(monkeypatch, tmp_path, capsys, coefficient_args):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["eval_gsm8k_platinum.py", *coefficient_args, "--output", str(tmp_path / "result.json")],
+    )
+    monkeypatch.setattr(
+        evaluation,
+        "_resolve_backend",
+        lambda *_args, **_kwargs: pytest.fail("backend initialization must not run for an invalid alpha"),
+    )
+
+    with pytest.raises(SystemExit) as error:
+        evaluation.main()
+
+    assert error.value.code == 2
+    assert "Recirculation alpha must be finite and in [0, 1]" in capsys.readouterr().err
 
 
 def test_backend_auto_prefers_cuda_then_mlx(monkeypatch):
