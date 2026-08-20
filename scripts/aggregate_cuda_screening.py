@@ -105,14 +105,23 @@ def aggregate_reports(paths: list[Path]) -> dict:
         )
 
     results = list(results_by_key.values())
-    default_objective = "final_answer" if results and "final_answer" in results[0]["objectives"] else "full_solution"
+    available = list(results[0]["objectives"]) if results else []
+    default_objective = (
+        "final_answer"
+        if "final_answer" in available
+        else "full_solution"
+        if "full_solution" in available
+        else available[0]
+        if available
+        else "full_solution"
+    )
     results.sort(key=lambda result: objective_result_key(result, default_objective, robust=True))
     leaders = screen_leaders(results)
     complete = len(results)
     active = sum(source["active"] for source in sources)
     pending = max(total - complete - active, 0)
     status = "complete" if all(source["status"] == "complete" for source in sources) else "running"
-    default_leader = leaders[f"{default_objective}_robust"]
+    default_leader = leaders.get(f"{default_objective}_robust")
     settings = {
         **reference_settings,
         "aggregation": {
@@ -131,7 +140,7 @@ def aggregate_reports(paths: list[Path]) -> dict:
         "settings": settings,
         "source_reports": sources,
         "best": default_leader,
-        "best_perplexity": leaders[f"{default_objective}_perplexity"],
+        "best_perplexity": leaders.get(f"{default_objective}_perplexity"),
         "best_robust": default_leader,
         "leaders": leaders,
         "shortlist": proxy_shortlist(results, min(8, len(results))) if results else [],

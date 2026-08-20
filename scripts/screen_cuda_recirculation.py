@@ -147,14 +147,23 @@ def _write_native_baseline(path: Path, *, contract: dict, implementation_commit:
 
 
 def _write_report(path, *, status, implementation_commit, settings, started, results, total, elapsed_offset=0.0):
-    default_objective = "final_answer" if results and "final_answer" in results[0]["objectives"] else "full_solution"
+    available = list(results[0]["objectives"]) if results else []
+    default_objective = (
+        "final_answer"
+        if "final_answer" in available
+        else "full_solution"
+        if "full_solution" in available
+        else available[0]
+        if available
+        else "full_solution"
+    )
     ordered_results = sorted(
         results,
         key=lambda result: objective_result_key(result, default_objective, robust=True),
     )
     complete = len(ordered_results)
     leaders = screen_leaders(ordered_results)
-    default_leader = leaders[f"{default_objective}_robust"]
+    default_leader = leaders.get(f"{default_objective}_robust")
     report = {
         "status": status,
         "complete": complete,
@@ -165,7 +174,7 @@ def _write_report(path, *, status, implementation_commit, settings, started, res
         "settings": settings,
         "seconds": elapsed_offset + time.perf_counter() - started,
         "best": default_leader,
-        "best_perplexity": leaders[f"{default_objective}_perplexity"],
+        "best_perplexity": leaders.get(f"{default_objective}_perplexity"),
         "best_robust": default_leader,
         "leaders": leaders,
         "shortlist": proxy_shortlist(ordered_results, min(8, len(ordered_results))) if ordered_results else [],
@@ -304,6 +313,15 @@ def main() -> int:
     parser.add_argument("--model", default="/local-models/Llama-3.2-1B-Instruct")
     parser.add_argument("--dataset", default="madrylab/gsm8k-platinum")
     parser.add_argument("--dataset-config", default="main")
+    parser.add_argument(
+        "--corpus",
+        action="append",
+        choices=("c4", "pg19"),
+        default=None,
+        help="Use repeated language-modeling corpora instead of GSM8K (C4 train and/or PG-19 train).",
+    )
+    parser.add_argument("--windows-per-corpus", type=int, default=256)
+    parser.add_argument("--window-tokens", type=int, default=1024)
     parser.add_argument("--task-config", type=Path, default=REPO_ROOT / "configs/gsm8k-platinum-cot-llama.yaml")
     parser.add_argument("--row-start", type=int, default=272)
     parser.add_argument("--rows", type=int, default=32)
@@ -360,13 +378,24 @@ def main() -> int:
     parser.add_argument("--report-every", type=int, default=10)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
+    if args.corpus and args.forbid_range:
+        parser.error("--forbid-range applies only to indexed GSM8K screening")
     tuning_range = (args.row_start, args.row_start + args.rows)
     forbidden_ranges = args.forbid_range or []
     overlaps = [interval for interval in forbidden_ranges if _overlaps(tuning_range, interval)]
     if overlaps:
         parser.error(f"tuning range {tuning_range} overlaps forbidden evaluation range(s): {overlaps}")
-    if min(args.rows, args.report_every, args.candidate_workers, args.row_batch_size) < 1:
+    if min(
+        args.rows,
+        args.report_every,
+        args.candidate_workers,
+        args.row_batch_size,
+        args.windows_per_corpus,
+        args.window_tokens,
+    ) < 1:
         parser.error("rows, reporting intervals, and worker/batch sizes must be positive")
+    if args.corpus and args.window_tokens < 3:
+        parser.error("--window-tokens must be at least 3")
     if args.max_distance is not None and args.max_distance < 1:
         parser.error("max-distance must be positive when supplied")
     if args.scheduler == "sequential" and args.candidate_workers != 1:
@@ -397,25 +426,67 @@ def main() -> int:
         .eval()
         .to("cuda")
     )
-    fewshots, _ = _task_contract(args.task_config)
-    dataset = load_dataset(args.dataset, name=args.dataset_config, split="test")
-    stop = args.row_start + args.rows
-    if stop > len(dataset):
-        parser.error("requested row range exceeds the dataset")
-    documents = [dataset[index] for index in range(args.row_start, stop)]
-    prompts = [_prompt_ids(tokenizer, str(document["question"]), fewshots) for document in documents]
-    gold_answers = [_gold_answer(str(document["answer"])) for document in documents]
-    common_length = min(_common_prefix_length(prompts), min(len(prompt) - 1 for prompt in prompts))
-    prefix = torch.tensor([prompts[0][:common_length]], dtype=torch.long, device="cuda")
-    contexts = []
-    for prompt, document, gold_answer in zip(prompts, documents, gold_answers):
-        row = {}
-        full_target = gsm8k_solution_target(str(document["answer"]), gold_answer)
-        row["full_solution"] = (
-            prompt[common_length:],
-            tokenizer(full_target, add_special_tokens=False).input_ids,
-        )
-        contexts.append(row)
+    corpus_counts = {}
+    if args.corpus:
+        specs = {
+            "c4": ("allenai/c4", "en"),
+            "pg19": ("emozilla/pg19", None),
+        }
+        contexts = []
+        for corpus in args.corpus:
+            dataset_name, dataset_config = specs[corpus]
+            stream = load_dataset(dataset_name, name=dataset_config, split="train", streaming=True)
+            accepted = 0
+            examined = 0
+            for document in stream:
+                examined += 1
+                token_ids = tokenizer(
+                    str(document["text"]),
+                    add_special_tokens=False,
+                    truncation=True,
+                    max_length=args.window_tokens,
+                ).input_ids
+                if len(token_ids) < args.window_tokens:
+                    continue
+                contexts.append({"language_modeling": ([int(token_ids[0])], list(map(int, token_ids[1:])))})
+                accepted += 1
+                if accepted == args.windows_per_corpus:
+                    break
+            if accepted != args.windows_per_corpus:
+                parser.error(f"{corpus} yielded only {accepted} qualifying windows after {examined} documents")
+            corpus_counts[corpus] = {"windows": accepted, "documents_examined": examined}
+        if tokenizer.bos_token_id is None:
+            parser.error("corpus screening requires a tokenizer BOS token")
+        prefix = torch.tensor([[tokenizer.bos_token_id]], dtype=torch.long, device="cuda")
+        common_length = 1
+        args.dataset = "+".join(args.corpus)
+        args.dataset_config = "train"
+        args.row_start = 0
+        args.rows = len(contexts)
+        stop = len(contexts)
+        forbidden_ranges = []
+    else:
+        fewshots, _ = _task_contract(args.task_config)
+        dataset = load_dataset(args.dataset, name=args.dataset_config, split="test")
+        stop = args.row_start + args.rows
+        if stop > len(dataset):
+            parser.error("requested row range exceeds the dataset")
+        documents = [dataset[index] for index in range(args.row_start, stop)]
+        prompts = [_prompt_ids(tokenizer, str(document["question"]), fewshots) for document in documents]
+        gold_answers = [_gold_answer(str(document["answer"])) for document in documents]
+        common_length = min(_common_prefix_length(prompts), min(len(prompt) - 1 for prompt in prompts))
+        prefix = torch.tensor([prompts[0][:common_length]], dtype=torch.long, device="cuda")
+        contexts = []
+        for prompt, document, gold_answer in zip(prompts, documents, gold_answers):
+            full_target = gsm8k_solution_target(str(document["answer"]), gold_answer)
+            contexts.append(
+                {
+                    "full_solution": (
+                        prompt[common_length:],
+                        tokenizer(full_target, add_special_tokens=False).input_ids,
+                    )
+                }
+            )
     baseline_contract = _baseline_contract(
         args,
         common_prefix_tokens=common_length,
@@ -535,6 +606,9 @@ def main() -> int:
         "split_role": "tuning",
         "model": args.model,
         "dataset": args.dataset,
+        "corpora": args.corpus,
+        "corpus_counts": corpus_counts,
+        "window_tokens": args.window_tokens if args.corpus else None,
         "row_start": args.row_start,
         "rows": args.rows,
         "row_stop_exclusive": stop,

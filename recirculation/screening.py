@@ -9,6 +9,8 @@ import re
 
 _CALCULATOR_ANNOTATION = re.compile(r"<<[^<>]*>>")
 PROXY_RANKINGS = (
+    ("language_modeling_perplexity", "language_modeling", False),
+    ("language_modeling_robust", "language_modeling", True),
     ("final_answer_perplexity", "final_answer", False),
     ("final_answer_robust", "final_answer", True),
     ("full_solution_perplexity", "full_solution", False),
@@ -132,17 +134,15 @@ def screen_leaders(results: list[dict]) -> dict[str, dict | None]:
     leaders = {}
     available_objectives = set(results[0].get("objectives", {})) if results else set()
     for name, objective, robust in PROXY_RANKINGS:
-        leaders[name] = (
-            min(
-                results,
-                key=lambda result, selected_objective=objective, selected_robust=robust: objective_result_key(
-                    result,
-                    selected_objective,
-                    robust=selected_robust,
-                ),
-            )
-            if objective in available_objectives
-            else None
+        if objective not in available_objectives:
+            continue
+        leaders[name] = min(
+            results,
+            key=lambda result, selected_objective=objective, selected_robust=robust: objective_result_key(
+                result,
+                selected_objective,
+                robust=selected_robust,
+            ),
         )
     return leaders
 
@@ -219,6 +219,7 @@ def render_screen_report_markdown(report: dict) -> str:
             f"| {name} | {leader['source_layer']}→{leader['destination_layer']} | "
             f"{leader['alpha']:.6g} | {metric:.9g} |"
         )
+    language_modeling = bool(results and "language_modeling" in results[0].get("objectives", {}))
     lines.extend(
         [
             "",
@@ -226,14 +227,36 @@ def render_screen_report_markdown(report: dict) -> str:
             "",
             "The promotion shortlist is recalculated from this entire table, never only from the most recent result.",
             "",
-            (
-                "| Path | Alpha | Seconds | Final PPL | Final ΔNLL | Final robust | Final tail harm | "
-                "Final I/R/N | Full PPL | Full ΔNLL | Full robust | Full tail harm | Full I/R/N |"
-            ),
-            "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
         ]
     )
+    if language_modeling:
+        lines.extend(
+            [
+                "| Path | Alpha | Seconds | LM PPL | LM ΔNLL | LM robust | LM tail harm | LM I/R/N |",
+                "|---:|---:|---:|---:|---:|---:|---:|---:|",
+            ]
+        )
+    else:
+        lines.extend(
+            [
+                (
+                    "| Path | Alpha | Seconds | Final PPL | Final ΔNLL | Final robust | Final tail harm | "
+                    "Final I/R/N | Full PPL | Full ΔNLL | Full robust | Full tail harm | Full I/R/N |"
+                ),
+                "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+            ]
+        )
     for result in results:
+        if language_modeling:
+            metrics = result["objectives"]["language_modeling"]
+            lines.append(
+                f"| {result['source_layer']}→{result['destination_layer']} | {result['alpha']:.6g} | "
+                f"{result.get('seconds', 0.0):.3f} | {metrics['target_perplexity']:.9g} | "
+                f"{metrics['native_delta_nll']:.9g} | {metrics['screen_score']:.9g} | "
+                f"{metrics['tail_harm_nll']:.9g} | "
+                f"{metrics['improved_rows']}/{metrics['regressed_rows']}/{metrics['neutral_rows']} |"
+            )
+            continue
         final = result.get("objectives", {}).get("final_answer")
         full = result.get("objectives", {}).get("full_solution")
 

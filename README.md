@@ -79,6 +79,22 @@ This is a **13.56% relative accuracy increase**. The search rows and evaluation 
 
 The path search, alpha search, and locked evaluation ranges are pairwise disjoint.
 
+For a paper-style language-modeling shortlist, corpus mode streams fixed windows from C4 and PG-19 train. The example
+below uses 256 qualifying documents per corpus and scores one 1024-token window from each. It does not add an answer
+cue; GSM8K natural generation remains the downstream promotion gate.
+
+```bash
+python scripts/screen_cuda_recirculation.py \
+  --model /local-models/Llama-3.2-1B-Instruct \
+  --corpus c4 \
+  --corpus pg19 \
+  --windows-per-corpus 256 \
+  --window-tokens 1024 \
+  --row-batch-size 256 \
+  --alpha 0.10 \
+  --output results/cuda_c4_pg19_paths.json
+```
+
 ## Install and test
 
 Python 3.10 or newer is required.
