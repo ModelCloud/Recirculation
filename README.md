@@ -102,6 +102,14 @@ Every optimized forward must be compared against this unfused reference over the
 is `max(relative L2 error, normalized maximum error) <= 2e-3`. A faster result that exceeds this limit must not be
 promoted or documented as an accepted optimization.
 
+### Accepted optimization 1: compiled exact norm/mix
+
+`CompiledNormMix` uses `mx.compile` on the unchanged reference expression. On the test Apple M4, the isolated
+2,048-element operation improved from 191.75 us to 108.04 us median (`1.77x`). A warmed 64-token dense Llama 3.2 1B
+prefill improved from 375.94 ms to 368.08 ms median (`1.021x`). The accumulated full-logit trace error was exactly zero
+under the metrics above. See `results/mlx_compiled_mix_m4_64_tokens.json` and reproduce with
+`scripts/benchmark_mlx_prefill.py`.
+
 ## Citation
 
 ```bibtex

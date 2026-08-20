@@ -55,6 +55,24 @@ def mix_reference(destination: mx.array, source: mx.array, config: Recirculation
     return config.beta * destination + config.alpha * source
 
 
+class CompiledNormMix:
+    """MLX-compiled form of the exact norm-ratio reference expression."""
+
+    def __init__(self, config: RecirculationConfig):
+        self.config = config
+
+        @mx.compile
+        def compiled(destination, source):
+            return mix_reference(destination, source, config)
+
+        self._compiled = compiled
+
+    def __call__(self, destination: mx.array, source: mx.array, config: RecirculationConfig) -> mx.array:
+        if config != self.config:
+            raise ValueError("compiled mixer configuration cannot change after compilation")
+        return self._compiled(destination, source)
+
+
 class MLXRecirculator:
     """Run a loaded MLX-LM Llama model with delayed deep-to-shallow feedback."""
 
@@ -124,6 +142,7 @@ class MLXRecirculator:
 
 __all__ = [
     "MAX_FORWARD_ERROR",
+    "CompiledNormMix",
     "ForwardError",
     "MLXRecirculator",
     "measure_forward_error",

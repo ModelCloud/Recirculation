@@ -29,6 +29,28 @@ def test_mlx_reference_mixture_matches_published_norm_ratio_equation():
     assert mx.allclose(mixed, mx.array([[[2.7, 4.1]]])).item()
 
 
+def test_mlx_compiled_mixture_passes_128_step_accumulation_gate():
+    mx = __import__("mlx.core", fromlist=["core"])
+    from recirculation.mlx_backend import CompiledNormMix, measure_forward_error, mix_reference
+
+    mx.random.seed(7)
+    config = RecirculationConfig(source_layer=12, destination_layer=5, alpha=0.1)
+    source = mx.random.normal((1, 1, 2048)).astype(mx.float16)
+    reference = mx.random.normal((1, 1, 2048)).astype(mx.float16)
+    candidate = reference
+    compiled = CompiledNormMix(config)
+    reference_trace = []
+    candidate_trace = []
+    for _ in range(128):
+        reference = mix_reference(reference, source, config)
+        candidate = compiled(candidate, source, config)
+        reference_trace.append(reference)
+        candidate_trace.append(candidate)
+        source = 0.997 * source + 0.003 * reference
+    error = measure_forward_error(mx.concatenate(reference_trace), mx.concatenate(candidate_trace))
+    error.require()
+
+
 class _BiasLayer(nn.Module):
     def __init__(self, value: float):
         super().__init__()

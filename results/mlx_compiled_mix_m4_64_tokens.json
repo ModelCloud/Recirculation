@@ -1,0 +1,11 @@
+{
+  "compiled_median_ms": 368.0767910045688,
+  "compiled_ms": [368.0767910045688, 367.62870800157543, 368.61550000321586],
+  "forward_error": {"max_absolute": 0.0, "normalized_max": 0.0, "relative_l2": 0.0},
+  "forward_error_rate": 0.0,
+  "reference_median_ms": 375.9435410029255,
+  "reference_ms": [379.13654099975247, 374.3635830032872, 375.9435410029255],
+  "repetitions": 3,
+  "speedup": 1.0213725781973009,
+  "tokens": 64
+}
