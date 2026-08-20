@@ -78,7 +78,7 @@ def _implementation_commit() -> str:
     return completed.stdout.strip()
 
 
-def _write_report(path, *, status, implementation_commit, settings, started, results, total):
+def _write_report(path, *, status, implementation_commit, settings, started, results, total, elapsed_offset=0.0):
     ordered_results = sorted(results, key=screen_result_key)
     complete = len(ordered_results)
     report = {
@@ -88,7 +88,7 @@ def _write_report(path, *, status, implementation_commit, settings, started, res
         "pending": max(total - complete - (1 if status == "running" and complete < total else 0), 0),
         "implementation_commit": implementation_commit,
         "settings": settings,
-        "seconds": time.perf_counter() - started,
+        "seconds": elapsed_offset + time.perf_counter() - started,
         "best": ordered_results[0] if ordered_results else None,
         "results": ordered_results,
     }
@@ -235,6 +235,13 @@ def main() -> int:
     parser.add_argument("--tail-quantile", type=float, default=0.9)
     parser.add_argument("--tail-weight", type=float, default=1.0)
     parser.add_argument("--harm-tolerance", type=float, default=0.0)
+    parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--empty-cache-every",
+        type=int,
+        default=4,
+        help="Release unused CUDA allocator blocks every N completed candidates; zero disables it.",
+    )
     parser.add_argument(
         "--graph-prefix",
         action="store_true",
@@ -266,6 +273,8 @@ def main() -> int:
         parser.error("tail-quantile must be in [0, 1)")
     if args.tail_weight < 0.0 or args.harm_tolerance < 0.0:
         parser.error("tail-weight and harm-tolerance must be non-negative")
+    if args.empty_cache_every < 0:
+        parser.error("empty-cache-every must be non-negative")
 
     torch.set_num_threads(int(os.environ["OMP_NUM_THREADS"]))
     local_files_only = not args.allow_download
@@ -311,24 +320,66 @@ def main() -> int:
         ]
     alphas = args.alpha or [0.1]
     candidates = [(source, destination, alpha) for source, destination in paths for alpha in alphas]
+    candidate_keys = set(candidates)
     results = []
     started = time.perf_counter()
     implementation_commit = _implementation_commit()
-    native_candidate = (paths[0][0], paths[0][1], 0.0)
-    LOG.info(f"Scoring paired native alpha=0 baseline with path {paths[0][0]}->{paths[0][1]}")
-    native = _score_candidate(
-        model,
-        prefix,
-        contexts,
-        native_candidate,
-        args.scheduler,
-        args.python_threads,
-        args.row_batch_size,
-        int(tokenizer.pad_token_id or tokenizer.eos_token_id),
-        args.graph_prefix,
-    )
-    native_nll = native.pop("row_nll_totals")
-    native_counts = native.pop("row_target_counts")
+    elapsed_offset = 0.0
+    resumed_from_commit = None
+    if args.resume and args.output.exists():
+        previous = json.loads(args.output.read_text(encoding="utf-8"))
+        previous_settings = previous.get("settings", {})
+        expected_settings = {
+            "model": args.model,
+            "dataset": args.dataset,
+            "row_start": args.row_start,
+            "rows": args.rows,
+            "target_mode": args.target_mode,
+            "tail_quantile": args.tail_quantile,
+            "tail_weight": args.tail_weight,
+            "harm_tolerance": args.harm_tolerance,
+        }
+        mismatches = {
+            key: (previous_settings.get(key), value)
+            for key, value in expected_settings.items()
+            if previous_settings.get(key) != value
+        }
+        if mismatches:
+            parser.error(f"cannot resume output with different settings: {mismatches}")
+        results = [
+            item
+            for item in previous.get("results", [])
+            if (item["source_layer"], item["destination_layer"], item["alpha"]) in candidate_keys
+        ]
+        if results:
+            native_rows = results[0]["row_metrics"]
+            native_counts = [int(row["target_tokens"]) for row in native_rows]
+            native_nll = [float(row["native_nll"]) * count for row, count in zip(native_rows, native_counts)]
+            native = dict(previous_settings["native_baseline"])
+            elapsed_offset = float(previous.get("seconds", 0.0))
+            resumed_from_commit = previous.get("implementation_commit")
+            LOG.info(
+                f"Resuming {len(results)}/{len(candidates)} completed candidates from {args.output} "
+                f"at commit {resumed_from_commit}"
+            )
+    if not results:
+        native_candidate = (paths[0][0], paths[0][1], 0.0)
+        LOG.info(f"Scoring paired native alpha=0 baseline with path {paths[0][0]}->{paths[0][1]}")
+        native = _score_candidate(
+            model,
+            prefix,
+            contexts,
+            native_candidate,
+            args.scheduler,
+            args.python_threads,
+            args.row_batch_size,
+            int(tokenizer.pad_token_id or tokenizer.eos_token_id),
+            args.graph_prefix,
+        )
+        native_nll = native.pop("row_nll_totals")
+        native_counts = native.pop("row_target_counts")
+        if args.empty_cache_every:
+            torch.cuda.empty_cache()
     settings = {
         "split_role": "tuning",
         "model": args.model,
@@ -349,6 +400,9 @@ def main() -> int:
         "tail_quantile": args.tail_quantile,
         "tail_weight": args.tail_weight,
         "harm_tolerance": args.harm_tolerance,
+        "resume": args.resume,
+        "resumed_from_commit": resumed_from_commit,
+        "empty_cache_every": args.empty_cache_every,
         "ranking": "native_delta_nll + tail_weight * worst-tail positive per-row delta",
         "native_baseline": {
             **native,
@@ -381,7 +435,10 @@ def main() -> int:
         started=started,
         results=results,
         total=len(candidates),
+        elapsed_offset=elapsed_offset,
     )
+    completed_keys = {(item["source_layer"], item["destination_layer"], item["alpha"]) for item in results}
+    remaining_candidates = [candidate for candidate in candidates if candidate not in completed_keys]
     torch.cuda.synchronize()
     with ThreadPoolExecutor(max_workers=args.candidate_workers, thread_name_prefix="recirculation-screen") as executor:
         futures = {
@@ -397,7 +454,7 @@ def main() -> int:
                 int(tokenizer.pad_token_id or tokenizer.eos_token_id),
                 args.graph_prefix,
             ): candidate
-            for candidate in candidates
+            for candidate in remaining_candidates
         }
         for future in as_completed(futures):
             result = future.result()
@@ -424,7 +481,10 @@ def main() -> int:
                 started=started,
                 results=results,
                 total=len(candidates),
+                elapsed_offset=elapsed_offset,
             )
+            if args.empty_cache_every and len(results) % args.empty_cache_every == 0:
+                torch.cuda.empty_cache()
             if len(results) % args.report_every == 0 or len(results) == len(candidates):
                 best = min(results, key=screen_result_key)
                 LOG.info(
@@ -442,6 +502,7 @@ def main() -> int:
         started=started,
         results=results,
         total=len(candidates),
+        elapsed_offset=elapsed_offset,
     )
     LOG.info(f"Wrote {args.output}")
     return 0
