@@ -146,6 +146,22 @@ def _generate_cuda_batch(runner, tokenizer, prompt_ids_batch, device, max_new_to
     ]
 
 
+@torch.inference_mode()
+def _generate_cuda_graph_prefill(graph, runner, tokenizer, prompt_ids, device, max_new_tokens, until):
+    """Use a fixed-shape graph for prompt prefill, then stream the decode tail."""
+    tokens = torch.tensor([prompt_ids], dtype=torch.long, device=device)
+    logits, cache, pending, _ = graph.prefill(tokens)
+    generated = tokens.clone()
+    for _ in range(max_new_tokens):
+        token = logits[:, -1, :].argmax(dim=-1, keepdim=True)
+        generated = torch.cat((generated, token), dim=1)
+        if bool((token == int(tokenizer.eos_token_id)).all()):
+            break
+        logits, cache, pending = runner.step(token, cache, pending)
+    continuation = generated[0, tokens.shape[1] :].detach().cpu().tolist()
+    return _generation_result(tokenizer, continuation, until)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default="meta-llama/Llama-3.2-1B-Instruct")
@@ -162,6 +178,11 @@ def main() -> int:
         type=Path,
         default=None,
         help="Load the top candidates from a robust CUDA screen instead of passing --candidate repeatedly.",
+    )
+    parser.add_argument(
+        "--cuda-graph-prefill",
+        action="store_true",
+        help="Capture fixed-shape CUDA graph prefill per candidate/prompt length before decode.",
     )
     parser.add_argument("--top-k", type=int, default=5)
     parser.add_argument(
@@ -263,6 +284,7 @@ def main() -> int:
             )
             for source, destination, alpha in args.candidate
         }
+    graph_prefills = {}
 
     samples = []
     for relative_index, document in enumerate(documents):
@@ -317,6 +339,38 @@ def main() -> int:
             for group in groups.values():
                 for start in range(0, len(group), args.cuda_batch_size):
                     batch = group[start : start + args.cuda_batch_size]
+                    use_graph = args.cuda_graph_prefill and len(batch) == 1
+                    if use_graph:
+                        graph_key = (arm, len(batch[0]["prompt_ids"]))
+                        if graph_key not in graph_prefills:
+                            from recirculation.cuda_backend import CUDAGraphedConcurrentPrefill
+
+                            example = torch.tensor(
+                                [batch[0]["prompt_ids"]], dtype=torch.long, device=device
+                            )
+                            try:
+                                graph_prefills[graph_key] = CUDAGraphedConcurrentPrefill(
+                                    candidate_runners[arm], example, warmups=0
+                                )
+                            except ValueError as error:
+                                print(f"CUDA graph prefill unavailable for length {example.shape[1]}: {error}", flush=True)
+                                graph_prefills[graph_key] = False
+                        if graph_prefills[graph_key] is False:
+                            use_graph = False
+                    if use_graph:
+                        result = _generate_cuda_graph_prefill(
+                            graph_prefills[graph_key],
+                            candidate_runners[arm],
+                            tokenizer,
+                            batch[0]["prompt_ids"],
+                            device,
+                            args.max_new_tokens,
+                            until,
+                        )
+                        batch[0][arm] = result
+                        completed += 1
+                        maybe_status(f"candidate-{candidate_index}")
+                        continue
                     results = _generate_cuda_batch(
                         candidate_runners[arm],
                         tokenizer,
@@ -456,6 +510,8 @@ def main() -> int:
             "top_k": args.top_k,
             "harm_weight": args.harm_weight,
             "max_correct_to_wrong": args.max_correct_to_wrong,
+            "cuda_batch_size": args.cuda_batch_size,
+            "cuda_graph_prefill": args.cuda_graph_prefill,
         },
         "seconds": time.perf_counter() - started,
         "summaries": summaries,
