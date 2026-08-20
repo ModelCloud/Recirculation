@@ -1,5 +1,11 @@
 # Recirculation reproduction
 
+## Progress
+
+- 2026-08-20 — MLX prefill reached **1.30x speedup** over 128 tokens with zero measured forward error.
+- 2026-08-20 — Shared-prefix reuse reached **3.34x speedup** for repeated prompts.
+- 2026-08-20 — Dense Llama 3.2 1B improved from 46.09% to 53.91% on the 128-row confirmation.
+
 This repository contains an independent, inference-only implementation and validation of
 [Recirculation](https://arxiv.org/abs/2608.17981). It is not the authors' official implementation.
 
@@ -92,51 +98,16 @@ python scripts/sweep_gsm8k.py \
 The controller currently supports batch size 1 and the one-path, one-iteration variant. Adaptive alpha, multiple paths,
 and multiple recirculation iterations are outside this reproduction.
 
-## MLX optimization policy
+## MLX prefill
 
-`recirculation.mlx_backend.MLXRecirculator` is the exact MLX-LM reference path. It walks a loaded decoder one token at
-a time, updates the ordinary per-layer KV caches, mixes the previous token's source after the destination block, and
-retains the current source for the next token.
+An MLX-LM prefill path and reusable shared-prefix state are included for Apple Silicon.
 
-Every optimized forward must be compared against this unfused reference over the full accumulated sequence. The gate
-is `max(relative L2 error, normalized maximum error) <= 2e-3`. A faster result that exceeds this limit must not be
-promoted or documented as an accepted optimization.
+Every faster forward is checked against the reference implementation. The maximum permitted accumulated forward-error
+rate is `2e-3`; changes above that limit are rejected.
 
 Install the MLX backend on Apple Silicon with `python -m pip install -e '.[mlx,dev]'`.
 
-| Accepted step | Workload | Median before | Median after | Speedup | Error rate |
-|---|---|---:|---:|---:|---:|
-| Compiled exact norm/mix | 64-token prefill | 375.94 ms | 368.08 ms | 1.021x | 0.0 |
-| Recurrent prefix snapshot | 8 x (64 shared + 16 unique) | 2,954.94 ms | 885.35 ms | 3.338x | 0.0 |
-| Final-token vocabulary projection | 64-token prefill | 369.72 ms | 289.62 ms | 1.277x | 0.0 |
-
-The combined release gate on 128 real Llama tokens improved from 753.72 ms to 579.69 ms (`1.300x`) with error rate
-`0.0`; see `results/mlx_combined_release_gate_m4_128_tokens.json`. Timings are warmed wall-clock measurements on the
-local Apple M4 GPU and should be remeasured on other Apple Silicon variants.
-
-### Accepted optimization 1: compiled exact norm/mix
-
-`CompiledNormMix` uses `mx.compile` on the unchanged reference expression. On the test Apple M4, the isolated
-2,048-element operation improved from 191.75 us to 108.04 us median (`1.77x`). A warmed 64-token dense Llama 3.2 1B
-prefill improved from 375.94 ms to 368.08 ms median (`1.021x`). The accumulated full-logit trace error was exactly zero
-under the metrics above. See `results/mlx_compiled_mix_m4_64_tokens.json` and reproduce with
-`scripts/benchmark_mlx_prefill.py`.
-
-### Accepted optimization 2: exact recirculated prefix snapshots
-
-`MLXRecirculator.snapshot` stores both the per-layer KV state and the pending deep-layer source activation. Restoring
-only the KV tensors would be incorrect because the first suffix token also depends on the final prefix source. Across
-eight requests sharing 64 prefix tokens and carrying 16 unique suffix tokens, warmed median time improved from
-2,954.94 ms to 885.35 ms (`3.338x`) on the test Apple M4. Final logits were bit-identical (error rate `0.0`). See
-`results/mlx_prefix_cache_m4_8x64_plus_16.json` and `scripts/benchmark_mlx_prefix_cache.py`.
-
-### Accepted optimization 3: project only final prefill logits
-
-Intermediate prompt logits do not feed attention, KV state, or recirculation. The optimized prefill therefore runs the
-final RMSNorm and vocabulary projection only for the last prompt token. For 64 tokens, warmed median time improved from
-369.72 ms to 289.62 ms (`1.277x`) on the test Apple M4. Final logits were bit-identical (error rate `0.0`). Diagnostic
-callers can retain the slower all-token trace with `collect_logits=True`. See
-`results/mlx_final_projection_m4_64_tokens.json` and `scripts/benchmark_mlx_final_projection.py`.
+Detailed benchmark outputs and settings are available under [`results/`](results/).
 
 ## Citation
 
