@@ -2,6 +2,7 @@
 
 ## Progress
 
+- 2026-08-20 — Exact shared-prefix reuse made real eight-shot GSM8K prefill **5.24x faster** with zero measured error.
 - 2026-08-20 — MLX prefill reached **1.30x speedup** over 128 tokens with zero measured forward error.
 - 2026-08-20 — Shared-prefix reuse reached **3.34x speedup** for repeated prompts.
 - 2026-08-20 — Dense Llama 3.2 1B improved from 46.09% to 53.91% on the 128-row confirmation.

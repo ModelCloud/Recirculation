@@ -1,0 +1,14 @@
+{
+  "cached_median_ms": 8573.047916,
+  "cached_ms": [8365.003333, 9188.590292, 8573.047916],
+  "common_prefix_tokens": 1078,
+  "forward_error": {"max_absolute": 0.0, "normalized_max": 0.0, "relative_l2": 0.0},
+  "forward_error_rate": 0.0,
+  "full_median_ms": 44912.323375,
+  "full_ms": [44912.323375, 44131.075375, 48909.4965],
+  "prompt_lengths": [1170, 1133, 1156, 1141, 1161, 1148, 1172, 1208],
+  "repetitions": 3,
+  "rows": 8,
+  "speedup": 5.23878133133719,
+  "suffix_lengths": [92, 55, 78, 63, 83, 70, 94, 130]
+}
