@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import json
 import statistics
+import subprocess
 import time
 from pathlib import Path
 
@@ -19,8 +20,8 @@ from recirculation.cuda_backend import (
     CUDAConcurrentRunner,
     CUDAGraphedConcurrentPrefill,
     CUDAPrefillRunner,
+    log_concurrency_mode,
     measure_forward_error,
-    require_gil_disabled,
 )
 
 
@@ -35,6 +36,18 @@ def time_prefill(runner, tokens, repetitions):
     return samples
 
 
+def implementation_commit() -> str:
+    repository = Path(__file__).resolve().parents[1]
+    completed = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repository,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return completed.stdout.strip()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default="/local-models/Llama-3.2-1B-Instruct")
@@ -46,7 +59,7 @@ def main() -> None:
     parser.add_argument("--ramp-tokens", type=int, default=0)
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
-    require_gil_disabled()
+    log_concurrency_mode()
 
     tokenizer = AutoTokenizer.from_pretrained(args.model, local_files_only=True)
     model = (
@@ -107,6 +120,7 @@ def main() -> None:
         concurrent_ms = time_prefill(concurrent, token_ids, args.repetitions)
         graphed_ms = time_prefill(graphed, token_ids, args.repetitions)
         result = {
+            "implementation_commit": implementation_commit(),
             "model": str(args.model),
             "tokens": token_ids.shape[1],
             "repetitions": args.repetitions,

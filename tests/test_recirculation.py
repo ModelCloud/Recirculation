@@ -72,7 +72,7 @@ def test_cuda_concurrent_stacks_match_sequential_scheduler(monkeypatch):
     transformers = pytest.importorskip("transformers")
     from recirculation.cuda_backend import CUDAConcurrentRunner, CUDAPrefillRunner
 
-    monkeypatch.setattr(__import__("sys"), "_is_gil_enabled", lambda: False)
+    monkeypatch.setattr(__import__("sys"), "_is_gil_enabled", lambda: True)
 
     model = (
         transformers.LlamaForCausalLM(
@@ -142,14 +142,6 @@ def test_cuda_concurrent_graph_matches_eager_for_changed_tokens(monkeypatch):
         pending_error.require()
     finally:
         concurrent.close()
-
-
-def test_cuda_concurrent_runner_rejects_gil_enabled_python(monkeypatch):
-    from recirculation.cuda_backend import CUDAConcurrentRunner
-
-    monkeypatch.setattr(__import__("sys"), "_is_gil_enabled", lambda: True)
-    with pytest.raises(RuntimeError, match="GIL=1 detected"):
-        CUDAConcurrentRunner(None, RecirculationConfig(source_layer=2, destination_layer=0))
 
 
 def test_mlx_forward_error_gate_accepts_exact_and_rejects_excess_error():

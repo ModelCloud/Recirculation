@@ -2,7 +2,7 @@
 
 ## Progress
 
-- 2026-08-20 — Two-stack CUDA execution is enabled only when free-threaded Python reports `GIL=0`.
+- 2026-08-20 — Two-stack CUDA execution supports both GIL-enabled and free-threaded Python.
 - 2026-08-20 — Ramping now follows the paper's zero-based 10-step schedule exactly.
 - 2026-08-20 — Corrected CUDA same-token replay reached **4.533x prefill speedup** within the `2e-3` error gate.
 - 2026-08-20 — Corrected recirculation to replay each token's own upper stack and replace its upper-layer KV state.
@@ -111,14 +111,13 @@ python scripts/benchmark_cuda_prefill.py \
 `CUDAConcurrentRunner` implements the paper's two-stack schedule: token `t-1` replays the upper stack on one CUDA
 stream while token `t` runs through the destination layer on another, and the streams join before token `t` enters
 its upper stack. Persistent Python worker threads enqueue the disjoint branches concurrently. The runner is enabled
-only when `sys._is_gil_enabled()` reports `False`; otherwise LogBar emits guidance and construction fails before any
-threads or streams are allocated. Use a free-threaded build such as CPython 3.14t with `-X gil=0` or `PYTHON_GIL=0`.
-Readout remains on the token's first pass, as specified by the paper. The current API supports batch-one, unpadded
-inference.
+with both `GIL=1` and `GIL=0`: PyTorch releases the GIL around the CUDA operations used by the worker paths. LogBar
+records the detected mode. A free-threaded build such as CPython 3.14t with `-X gil=0` or `PYTHON_GIL=0` may still
+reduce host scheduling overhead. Readout remains on the token's first pass, as specified by the paper. The current API
+supports batch-one, unpadded inference.
 
-The development benchmark recorded `1.065x` speedup with zero measured logits or pending-state error, but it used a
-GIL-enabled runtime before this guard was introduced. New concurrency benchmarks require `GIL=0` and record the
-detected runtime state in their output.
+The development benchmark recorded `1.065x` speedup on a GIL-enabled runtime with zero measured logits or
+pending-state error. New benchmark artifacts record the detected runtime state and implementation commit.
 
 `CUDAGraphedConcurrentPrefill` captures the lower and replay streams, their event dependencies, and the joined upper
 stack as one fixed-shape CUDA Graph. A process-wide lock covers all warmups and capture, preventing two threads from

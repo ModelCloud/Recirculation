@@ -27,21 +27,22 @@ LOG = LogBar.shared()
 _CUDA_GRAPH_CAPTURE_LOCK = threading.Lock()
 
 
-def require_gil_disabled() -> None:
-    """Enable concurrent CUDA scheduling only on a free-threaded Python runtime."""
+def log_concurrency_mode() -> bool:
+    """Log and return the GIL mode used by the concurrent CUDA scheduler."""
 
     gil_enabled = bool(getattr(sys, "_is_gil_enabled", lambda: True)())
     if gil_enabled:
-        message = (
-            "GIL=1 detected: CUDAConcurrentRunner is disabled. For faster parallel inference, use a free-threaded "
-            "Python build with the GIL disabled, such as CPython 3.14t with -X gil=0 or PYTHON_GIL=0."
+        LOG.info.once(
+            "GIL=1 detected: CUDAConcurrentRunner is enabled because PyTorch CUDA operations can release the GIL. "
+            "A free-threaded build such as CPython 3.14t with -X gil=0 or PYTHON_GIL=0 may further reduce host-side "
+            "scheduling overhead."
         )
-        LOG.warn.once(message)
-        raise RuntimeError(message)
-    LOG.info.once(
-        "GIL=0 detected: CUDAConcurrentRunner is enabled for faster parallel inference with Python workers and "
-        "CUDA streams."
-    )
+    else:
+        LOG.info.once(
+            "GIL=0 detected: CUDAConcurrentRunner is enabled for faster parallel inference with Python workers and "
+            "CUDA streams."
+        )
+    return gil_enabled
 
 
 @dataclass(frozen=True)
@@ -270,7 +271,6 @@ class CUDAConcurrentRunner:
         *,
         fused: bool = True,
     ):
-        require_gil_disabled()
         if not hasattr(model, "get_decoder") or model.get_output_embeddings() is None:
             raise TypeError("concurrent CUDA inference requires a Hugging Face causal language model")
         device = next(model.parameters()).device
@@ -290,7 +290,7 @@ class CUDAConcurrentRunner:
         self.lower_done_event = torch.cuda.Event()
         self.replay_done_event = torch.cuda.Event()
         self.executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="recirculation-cuda")
-        self.gil_enabled = False
+        self.gil_enabled = log_concurrency_mode()
 
     def close(self) -> None:
         self.executor.shutdown(wait=True)
@@ -617,7 +617,7 @@ __all__ = [
     "CUDARecirculationState",
     "ForwardError",
     "FusedNormMix",
+    "log_concurrency_mode",
     "measure_forward_error",
     "mix_reference",
-    "require_gil_disabled",
 ]
