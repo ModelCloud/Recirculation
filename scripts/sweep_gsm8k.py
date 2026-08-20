@@ -190,6 +190,11 @@ def main() -> int:
         default=256,
         help="Maximum prompt length captured by CUDA graphs (raise cautiously for long prefixes).",
     )
+    parser.add_argument(
+        "--cuda-compile",
+        action="store_true",
+        help="Compile the CUDA model with max-autotune before evaluation.",
+    )
     parser.add_argument("--top-k", type=int, default=5)
     parser.add_argument(
         "--harm-weight",
@@ -261,6 +266,9 @@ def main() -> int:
     attn_implementation = "sdpa" if device.type == "cuda" else "eager"
     if device.type == "cuda":
         torch.set_float32_matmul_precision("high")
+        torch.backends.cuda.enable_flash_sdp(True)
+        torch.backends.cuda.enable_mem_efficient_sdp(True)
+        torch.backends.cuda.enable_math_sdp(False)
     fewshots, until = _task_contract(args.task_config)
     dataset = load_dataset(args.dataset, name=args.dataset_config, split="test")
     stop = min(args.row_start + args.rows, len(dataset))
@@ -279,6 +287,14 @@ def main() -> int:
         .eval()
         .to(device)
     )
+    compile_used = False
+    if args.cuda_compile and device.type == "cuda":
+        try:
+            model = torch.compile(model, mode="max-autotune", fullgraph=False, dynamic=True)
+            compile_used = True
+            print("CUDA torch.compile enabled (max-autotune, dynamic=True)", flush=True)
+        except (RuntimeError, torch.AcceleratorError) as error:
+            print(f"CUDA torch.compile unavailable; using eager SDPA: {error}", flush=True)
     # Construct each CUDA runner once.  Creating a controller per row defeats
     # the fused replay and two-stream scheduling used by the benchmark path.
     candidate_runners = {}
@@ -524,6 +540,8 @@ def main() -> int:
             "cuda_batch_size": args.cuda_batch_size,
             "cuda_graph_prefill": args.cuda_graph_prefill,
             "cuda_graph_max_tokens": args.cuda_graph_max_tokens,
+            "cuda_compile_requested": args.cuda_compile,
+            "cuda_compile_used": compile_used,
         },
         "seconds": time.perf_counter() - started,
         "summaries": summaries,
