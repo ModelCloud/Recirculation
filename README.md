@@ -1,4 +1,13 @@
-# Recirculation reproduction
+# Recirculation
+
+## Paper and authors
+
+This independent reproduction is based on
+[Recirculation](https://arxiv.org/html/2608.17981v1) by **Michael C. Mozer, Shoaib Ahmed Siddiqui, Danny Sawyer,
+Sunny Sanyal, and Rosanne Liu**. Their central contribution is a training-free inference method that feeds a small,
+norm-matched amount of each token's deeper representation back into a shallower layer, giving the model a recurrent
+state across token steps while retaining first-pass readout. The implementation, validation, and optimization in this
+repository all build on that method. This is not the authors' official implementation.
 
 ## Progress
 
@@ -8,8 +17,6 @@
 - 2026-08-20 — Corrected recirculation to replay each token's own upper stack and replace its upper-layer KV state.
 - 2026-08-20 — With zero feedback, replay now matches ordinary serial inference exactly in Torch and MLX.
 
-This repository contains an independent, inference-only implementation and validation of
-[Recirculation](https://arxiv.org/abs/2608.17981). It is not the authors' official implementation.
 The code aims to remain as faithful to the upstream method as possible. Backend implementations may differ slightly,
 especially during inference, where MLX, CUDA, ROCm, and their underlying hardware impose different execution and
 kernel constraints. Such backend-specific differences should preserve the published mathematical and state behavior
