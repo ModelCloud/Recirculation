@@ -27,6 +27,7 @@ from recirculation import (
 from recirculation.screening import paired_selection_entry, proxy_shortlist
 from scripts.eval_gsm8k_platinum import (
     _generate,
+    _generate_cuda,
     _gold_answer,
     _prompt_ids,
     _summary,
@@ -219,6 +220,19 @@ def main() -> int:
         .eval()
         .to(device)
     )
+    # Construct each CUDA runner once.  Creating a controller per row defeats
+    # the fused replay and two-stream scheduling used by the benchmark path.
+    candidate_runners = {}
+    if device.type == "cuda":
+        from recirculation.cuda_backend import CUDAConcurrentRunner
+
+        candidate_runners = {
+            _arm_name(source, destination, alpha): CUDAConcurrentRunner(
+                model,
+                RecirculationConfig(source_layer=source, destination_layer=destination, alpha=alpha),
+            )
+            for source, destination, alpha in args.candidate
+        }
 
     samples = []
     for relative_index, document in enumerate(documents):
@@ -266,16 +280,26 @@ def main() -> int:
         config = RecirculationConfig(source_layer=source, destination_layer=destination, alpha=alpha)
         arm = _arm_name(source, destination, alpha)
         for sample_index, sample in enumerate(samples):
-            with RecirculationController(model, config) as controller:
-                sample[arm] = _generate(
-                    model,
+            if device.type == "cuda":
+                sample[arm] = _generate_cuda(
+                    candidate_runners[arm],
                     tokenizer,
                     sample["prompt_ids"],
                     device,
                     args.max_new_tokens,
                     until,
-                    controller=controller,
                 )
+            else:
+                with RecirculationController(model, config) as controller:
+                    sample[arm] = _generate(
+                        model,
+                        tokenizer,
+                        sample["prompt_ids"],
+                        device,
+                        args.max_new_tokens,
+                        until,
+                        controller=controller,
+                    )
             maybe_status(f"candidate-{candidate_index}")
             if (sample_index + 1) % 4 == 0:
                 correct = sum(
@@ -396,6 +420,8 @@ def main() -> int:
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     maybe_status("complete", force=True)
+    for runner in candidate_runners.values():
+        runner.close()
     print(json.dumps(summaries, indent=2), flush=True)
     print(f"Wrote {output}", flush=True)
     return 0
