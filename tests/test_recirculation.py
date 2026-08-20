@@ -200,6 +200,41 @@ def test_cuda_concurrent_stacks_match_sequential_scheduler(monkeypatch):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_cuda_generation_matches_updated_torch_controller(monkeypatch):
+    transformers = pytest.importorskip("transformers")
+    from recirculation.cuda_backend import CUDAConcurrentRunner
+
+    monkeypatch.setattr(__import__("sys"), "_is_gil_enabled", lambda: True)
+    torch.manual_seed(20260821)
+    model = (
+        transformers.LlamaForCausalLM(
+            transformers.LlamaConfig(
+                vocab_size=64,
+                hidden_size=64,
+                intermediate_size=128,
+                num_hidden_layers=4,
+                num_attention_heads=4,
+                num_key_value_heads=2,
+                max_position_embeddings=64,
+            )
+        )
+        .half()
+        .eval()
+        .cuda()
+    )
+    config = RecirculationConfig(source_layer=2, destination_layer=0, alpha=0.2, ramp_tokens=4)
+    tokens = torch.tensor([[1, 7, 11, 13, 17, 19]], device="cuda")
+    expected = RecirculationController(model, config).generate(tokens, max_new_tokens=8)
+    runner = CUDAConcurrentRunner(model, config)
+    try:
+        candidate = runner.generate(tokens, max_new_tokens=8)
+    finally:
+        runner.close()
+
+    torch.testing.assert_close(candidate, expected, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
 def test_cuda_single_thread_stream_enqueue_matches_threaded(monkeypatch):
     transformers = pytest.importorskip("transformers")
     from recirculation.cuda_backend import CUDAConcurrentRunner

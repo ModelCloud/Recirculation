@@ -21,7 +21,13 @@ try:
 except ImportError as error:  # pragma: no cover - depends on the CUDA installation
     raise ImportError("The CUDA backend requires Triton. Install the 'cuda' extra.") from error
 
-from .controller import RecirculationConfig, RecirculationController, _mixing_coefficients, torch_mix_reference
+from .controller import (
+    RecirculationConfig,
+    RecirculationController,
+    _mixing_coefficients,
+    _PendingFirstIterationState,
+    torch_mix_reference,
+)
 
 MAX_FORWARD_ERROR = 2e-3
 LOG = LogBar.shared()
@@ -77,9 +83,23 @@ class ForwardError:
 class CUDARecirculationState:
     """First-pass activations waiting for their same-token upper replay."""
 
-    destination: torch.Tensor
-    source: torch.Tensor
-    token_position: int
+    destination_residual: torch.Tensor
+    source_residual: torch.Tensor
+    input_step: int
+
+    # Compatibility aliases for artifacts and callers created before the
+    # controller adopted the paper's first/additional-iteration terminology.
+    @property
+    def destination(self) -> torch.Tensor:
+        return self.destination_residual
+
+    @property
+    def source(self) -> torch.Tensor:
+        return self.source_residual
+
+    @property
+    def token_position(self) -> int:
+        return self.input_step
 
 
 @dataclass(frozen=True)
@@ -96,9 +116,9 @@ def _snapshot_cuda_state(cache, pending: CUDARecirculationState) -> CUDAPrefillS
         for layer_data in cache
     )
     frozen_pending = CUDARecirculationState(
-        pending.destination.detach().clone(),
-        pending.source.detach().clone(),
-        pending.token_position,
+        pending.destination_residual.detach().clone(),
+        pending.source_residual.detach().clone(),
+        pending.input_step,
     )
     return CUDAPrefillSnapshot(cache_data, frozen_pending)
 
@@ -231,6 +251,37 @@ class CUDAPrefillRunner:
         self.skip_intermediate_logits = skip_intermediate_logits
         self.allow_terminal_padding = allow_terminal_padding
 
+    def _attach_controller_state(
+        self,
+        pending: CUDARecirculationState | None,
+        next_input_step: int,
+    ) -> None:
+        """Bridge the public CUDA state into the Torch controller's oracle state."""
+
+        self.controller.attach()
+        self.controller._next_input_step = next_input_step
+        self.controller._first_iteration_destination = None
+        if pending is None:
+            self.controller._pending_first_iteration = None
+            return
+        if pending.input_step != next_input_step - 1:
+            raise ValueError("pending input step does not precede the next CUDA input step")
+        self.controller._pending_first_iteration = _PendingFirstIterationState(
+            destination_residual=pending.destination_residual,
+            source_residual=pending.source_residual,
+            input_step=pending.input_step,
+        )
+
+    def _export_controller_state(self) -> CUDARecirculationState:
+        pending = self.controller._pending_first_iteration
+        if pending is None:
+            raise RuntimeError("prefill did not capture pending first-iteration state")
+        return CUDARecirculationState(
+            destination_residual=pending.destination_residual.detach(),
+            source_residual=pending.source_residual.detach(),
+            input_step=pending.input_step,
+        )
+
     @torch.inference_mode()
     def prefill(
         self,
@@ -264,9 +315,7 @@ class CUDAPrefillRunner:
 
         logits = None
         collected = []
-        self.controller.attach()
-        self.controller._pending = pending
-        self.controller._position = prefix_length
+        self._attach_controller_state(pending, prefix_length)
         try:
             for position in range(tokens.shape[1]):
                 prefix_mask = attention_mask[:, : prefix_length + position + 1]
@@ -285,12 +334,9 @@ class CUDAPrefillRunner:
                     logits = self.output_embeddings(output.last_hidden_state[:, -1:, :])
                 if collect_logits or is_final:
                     collected.append(logits)
-            pending = self.controller._pending
-            if logits is None or pending is None:  # pragma: no cover - guarded by model/config validation
-                raise RuntimeError("prefill did not produce logits and pending replay state")
-            state = CUDARecirculationState(
-                pending.destination.detach(), pending.source.detach(), pending.token_position
-            )
+            if logits is None:  # pragma: no cover - guarded by model/config validation
+                raise RuntimeError("prefill did not produce logits")
+            state = self._export_controller_state()
             return logits, cache, state, torch.cat(collected, dim=1)
         finally:
             self.controller.detach()
@@ -300,7 +346,7 @@ class CUDAPrefillRunner:
 
     def restore(self, snapshot: CUDAPrefillSnapshot, *, batch_size: int = 1):
         cache = DynamicCache(snapshot.cache_data, config=self.model.config)
-        snapshot_batch = snapshot.pending.destination.shape[0]
+        snapshot_batch = snapshot.pending.destination_residual.shape[0]
         if batch_size % snapshot_batch:
             raise ValueError("requested batch size must be a multiple of the snapshot batch size")
         repeats = batch_size // snapshot_batch
@@ -308,9 +354,9 @@ class CUDAPrefillRunner:
         if repeats > 1:
             cache.batch_repeat_interleave(repeats)
             pending = CUDARecirculationState(
-                pending.destination.repeat_interleave(repeats, dim=0),
-                pending.source.repeat_interleave(repeats, dim=0),
-                pending.token_position,
+                pending.destination_residual.repeat_interleave(repeats, dim=0),
+                pending.source_residual.repeat_interleave(repeats, dim=0),
+                pending.input_step,
             )
         return cache, pending
 
@@ -360,9 +406,7 @@ class CUDAPrefillRunner:
         target_count = 0
         row_nll = torch.zeros(tokens.shape[0], dtype=torch.float32, device=device)
         row_counts = [0] * tokens.shape[0]
-        self.controller.attach()
-        self.controller._pending = pending
-        self.controller._position = prefix_length
+        self._attach_controller_state(pending, prefix_length)
         try:
             for position in range(tokens.shape[1]):
                 prefix_mask = attention_mask[:, : prefix_length + position + 1]
@@ -451,10 +495,10 @@ class CUDAConcurrentRunner:
         self.close()
 
     def _mix(self, pending: CUDARecirculationState) -> torch.Tensor:
-        alpha, beta = _mixing_coefficients(self.config, pending.token_position)
+        alpha, beta = _mixing_coefficients(self.config, pending.input_step)
         return self.mixer(
-            pending.destination,
-            pending.source,
+            pending.destination_residual,
+            pending.source_residual,
             alpha,
             beta,
             self.config.normalize_source,
@@ -505,7 +549,7 @@ class CUDAConcurrentRunner:
             for layer_cache in cache.layers[first_upper_layer:]:
                 layer_cache.crop(-1)
             hidden = self._mix(pending)
-            position_ids, position_embeddings = self._position(hidden, pending.token_position)
+            position_ids, position_embeddings = self._position(hidden, pending.input_step)
             self._run_upper(
                 hidden,
                 cache,
@@ -544,8 +588,8 @@ class CUDAConcurrentRunner:
                 raise ValueError("a non-empty cache requires pending recirculation state")
             destination, position_ids, position_embeddings = self._run_lower(token, cache, token_position)
         else:
-            if pending.token_position != token_position - 1:
-                raise ValueError("pending token position does not precede the current cache position")
+            if pending.input_step != token_position - 1:
+                raise ValueError("pending input step does not precede the current cache position")
             self.dependency_event.record(main_stream)
             if self.executor is None:
                 self._replay_branch(pending, cache, self.dependency_event)
