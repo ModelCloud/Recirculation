@@ -2,6 +2,7 @@
 
 ## Progress
 
+- 2026-08-20 — CUDA fused prefill ran **1.018x faster** over 128 tokens within the forward-error gate.
 - 2026-08-20 — Exact shared-prefix reuse made real eight-shot GSM8K prefill **5.24x faster** with zero measured error.
 - 2026-08-20 — MLX prefill reached **1.30x speedup** over 128 tokens with zero measured forward error.
 - 2026-08-20 — Shared-prefix reuse reached **3.34x speedup** for repeated prompts.
@@ -109,6 +110,20 @@ rate is `2e-3`; changes above that limit are rejected.
 Install the MLX backend on Apple Silicon with `python -m pip install -e '.[mlx,dev]'`.
 
 Detailed benchmark outputs and settings are available under [`results/`](results/).
+
+## CUDA prefill
+
+The CUDA backend preserves token-serial KV-cache updates while fusing the two L2 reductions, source normalization, and
+residual mixture into one Triton kernel. It also skips the vocabulary projection for every non-final prompt token.
+Fused results are gated against the ordinary PyTorch expression with the same `2e-3` maximum forward-error rate.
+
+```bash
+python -m pip install -e '.[cuda,eval,dev]'
+python scripts/benchmark_cuda_prefill.py \
+  --model /local-models/Llama-3.2-1B-Instruct \
+  --tokens 128 \
+  --output results/cuda_fused_prefill_128_tokens.json
+```
 
 ## Citation
 

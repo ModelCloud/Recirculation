@@ -1,13 +1,27 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import pytest
 import torch
 from torch import nn
 
 from recirculation import RecirculationConfig, RecirculationController
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_cuda_fused_mixture_passes_forward_error_gate():
+    from recirculation.cuda_backend import FusedNormMix, measure_forward_error, mix_reference
+
+    torch.manual_seed(7)
+    destination = torch.randn(4, 1, 2048, device="cuda", dtype=torch.float16)
+    source = torch.randn_like(destination)
+    reference = mix_reference(destination, source, 0.1, 0.9, True)
+    candidate = FusedNormMix()(destination, source, 0.1, 0.9, True)
+    error = measure_forward_error(reference, candidate)
+    error.require()
+
+
 def test_mlx_forward_error_gate_accepts_exact_and_rejects_excess_error():
-    mx = __import__("mlx.core", fromlist=["core"])
+    mx = pytest.importorskip("mlx.core")
     from recirculation.mlx_backend import measure_forward_error
 
     reference = mx.array([1.0, 2.0, 3.0])
@@ -19,7 +33,7 @@ def test_mlx_forward_error_gate_accepts_exact_and_rejects_excess_error():
 
 
 def test_mlx_reference_mixture_matches_published_norm_ratio_equation():
-    mx = __import__("mlx.core", fromlist=["core"])
+    mx = pytest.importorskip("mlx.core")
     from recirculation.mlx_backend import mix_reference
 
     destination = mx.array([[[3.0, 4.0]]])
@@ -30,7 +44,7 @@ def test_mlx_reference_mixture_matches_published_norm_ratio_equation():
 
 
 def test_mlx_compiled_mixture_passes_128_step_accumulation_gate():
-    mx = __import__("mlx.core", fromlist=["core"])
+    mx = pytest.importorskip("mlx.core")
     from recirculation.mlx_backend import CompiledNormMix, measure_forward_error, mix_reference
 
     mx.random.seed(7)
@@ -52,7 +66,7 @@ def test_mlx_compiled_mixture_passes_128_step_accumulation_gate():
 
 
 def test_mlx_prefill_snapshot_holds_cache_and_pending_source():
-    mx = __import__("mlx.core", fromlist=["core"])
+    mx = pytest.importorskip("mlx.core")
     from recirculation.mlx_backend import MLXPrefillSnapshot
 
     snapshot = MLXPrefillSnapshot(((mx.array([1.0]), mx.array([2.0])),), mx.array([3.0]))

@@ -14,10 +14,14 @@ dependencies = ["torch>=2.1"]
 [project.optional-dependencies]
 eval = ["datasets>=2.18", "pyyaml>=6", "transformers>=5.0"]
 mlx = ["mlx>=0.31.2", "mlx-lm>=0.31.3"]
+cuda = ["triton>=3.0; platform_system == 'Linux'"]
 dev = ["pytest>=8", "ruff>=0.6"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.setuptools]
+packages = ["recirculation"]
 
 [tool.ruff]
 line-length = 119

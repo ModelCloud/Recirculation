@@ -11,6 +11,7 @@ weights or checkpoint tensors. The controller's ``generate`` method performs ser
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -91,7 +92,13 @@ class RecirculationController:
     serialized metadata. Use :meth:`generate` for paper-faithful serial prefill.
     """
 
-    def __init__(self, model: nn.Module, config: RecirculationConfig):
+    def __init__(
+        self,
+        model: nn.Module,
+        config: RecirculationConfig,
+        *,
+        mixer: Callable[[torch.Tensor, torch.Tensor, float, float, bool], torch.Tensor] | None = None,
+    ):
         self.model = model
         self.config = config
         layers = _find_decoder_layers(model)
@@ -105,6 +112,7 @@ class RecirculationController:
         self._pending_source: torch.Tensor | None = None
         self._position = 0
         self._active = False
+        self._mixer = mixer
 
     def reset(self) -> None:
         """Discard delayed state before starting another prompt."""
@@ -121,10 +129,6 @@ class RecirculationController:
             raise RuntimeError(
                 "Recirculation source/destination shapes differ; use standard generation with a stable batch size."
             )
-        if self.config.normalize_source:
-            destination_norm = hidden_states.float().norm(dim=-1, keepdim=True).clamp_min(torch.finfo(torch.float32).eps)
-            source_norm = source.float().norm(dim=-1, keepdim=True).clamp_min(torch.finfo(torch.float32).eps)
-            source = source * (destination_norm.to(source.dtype) / source_norm.to(source.dtype))
         strength = self.config.alpha
         if self.config.ramp_tokens:
             strength *= min(1.0, self._position / float(self.config.ramp_tokens))
@@ -133,6 +137,16 @@ class RecirculationController:
         beta = self.config.beta
         if self.config.beta == 1.0 - self.config.alpha:
             beta = 1.0 - strength
+        if self._mixer is not None:
+            mixed = self._mixer(hidden_states, source, strength, beta, self.config.normalize_source)
+            self._pending_source = None
+            return _replace_hidden_states_output(output, mixed)
+        if self.config.normalize_source:
+            destination_norm = (
+                hidden_states.float().norm(dim=-1, keepdim=True).clamp_min(torch.finfo(torch.float32).eps)
+            )
+            source_norm = source.float().norm(dim=-1, keepdim=True).clamp_min(torch.finfo(torch.float32).eps)
+            source = source * (destination_norm.to(source.dtype) / source_norm.to(source.dtype))
         mixed = beta * hidden_states + strength * source
         self._pending_source = None
         return _replace_hidden_states_output(output, mixed)
@@ -214,9 +228,7 @@ class RecirculationController:
                 generated = torch.cat((generated, token), dim=1)
                 if eos_token_id is not None and bool((token == eos_token_id).all()):
                     break
-                full_mask = torch.ones(
-                    (1, generated.shape[1]), dtype=attention_mask.dtype, device=generated.device
-                )
+                full_mask = torch.ones((1, generated.shape[1]), dtype=attention_mask.dtype, device=generated.device)
                 outputs = self.model(
                     input_ids=token,
                     attention_mask=full_mask,
