@@ -49,10 +49,10 @@ The parallel result comes from [`cuda_concurrent_128_tokens.json`](cuda_concurre
 same GPU/runtime family at commit `a6a040c2e58f5e1206d2979d262c74647b43436e`. That paired run used five repetitions
 and reported zero logits and pending-state error between sequential and parallel recirculation.
 
-It predates the `GIL=0` enforcement added by commit `42b08dc981d97a9775558c9889d92722d530f5ed`. The current Python
-binary reports `GIL=1` and rejects `-X gil=0`, so a fresh `CUDAConcurrentRunner` measurement cannot be made on this
-interpreter. This historical number must not be represented as a free-threaded Python result. Rerun all three modes
-under a supported GIL-free build before drawing a final conclusion about parallel speedup.
+It predates the temporary `GIL=0` enforcement added by commit `42b08dc981d97a9775558c9889d92722d530f5ed` and removed by
+commit `b8777b57e94ae4f6e204c57f48e99b4675edbdd7`. A fresh GIL-enabled eager and graphed dual-stream benchmark is
+available in [`cuda_concurrent_graph_gil1_128_tokens.md`](cuda_concurrent_graph_gil1_128_tokens.md). This historical
+number must not be represented as a free-threaded Python result.
 
 [^cross-run]: The dense and parallel values were collected in separate benchmark runs and at different commits.
     Only the fresh dense/sequential ratio and the historical sequential/parallel ratio are paired comparisons.

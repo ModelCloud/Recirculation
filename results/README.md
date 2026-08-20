@@ -11,3 +11,7 @@ It was collected on a GIL-enabled runtime, which is now supported by `CUDAConcur
 The three-mode latency comparison in
 [`cuda_dense_vs_recirculation_128_tokens.md`](cuda_dense_vs_recirculation_128_tokens.md) records tested commit IDs,
 fresh dense/sequential timings, and the provenance and limitations of the historical parallel measurement.
+
+The GIL-enabled eager and CUDA Graph dual-stream comparison is recorded in
+[`cuda_concurrent_graph_gil1_128_tokens.md`](cuda_concurrent_graph_gil1_128_tokens.md), including its implementation
+commit, raw JSON artifact, environment, and accuracy gates.

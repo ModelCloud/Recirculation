@@ -116,8 +116,12 @@ records the detected mode. A free-threaded build such as CPython 3.14t with `-X 
 reduce host scheduling overhead. Readout remains on the token's first pass, as specified by the paper. The current API
 supports batch-one, unpadded inference.
 
-The development benchmark recorded `1.065x` speedup on a GIL-enabled runtime with zero measured logits or
-pending-state error. New benchmark artifacts record the detected runtime state and implementation commit.
+On a GIL-enabled Python 3.14.6 runtime, the current 128-token benchmark measured eager dual-stream execution at
+`1.054x` faster than sequential recirculation. Capturing the full dual-stream schedule measured `5.260x` speedup over
+sequential and `4.990x` over eager dual-stream execution, with zero measured logits or pending-state error, including
+changed-token graph replay. See
+[`results/cuda_concurrent_graph_gil1_128_tokens.md`](results/cuda_concurrent_graph_gil1_128_tokens.md). Benchmark
+artifacts record the detected runtime state and implementation commit.
 
 `CUDAGraphedConcurrentPrefill` captures the lower and replay streams, their event dependencies, and the joined upper
 stack as one fixed-shape CUDA Graph. A process-wide lock covers all warmups and capture, preventing two threads from
