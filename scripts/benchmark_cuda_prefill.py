@@ -15,7 +15,7 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from recirculation import RecirculationConfig
-from recirculation.cuda_backend import CUDAPrefillRunner, measure_forward_error
+from recirculation.cuda_backend import CUDAGraphedPrefill, CUDAPrefillRunner, measure_forward_error
 
 
 def time_prefill(runner, tokens, repetitions):
@@ -58,10 +58,18 @@ def main() -> None:
     fused_logits = fused.prefill(token_ids, collect_logits=True)[3]
     error = measure_forward_error(reference_logits, fused_logits)
     error.require()
+    graphed = CUDAGraphedPrefill(fused, token_ids)
+    graph_logits = graphed.prefill(token_ids)[0]
+    graph_error = measure_forward_error(reference_logits[:, -1:, :], graph_logits)
+    graph_error.require()
+    replay_tokens = torch.roll(token_ids, shifts=1, dims=1)
+    replay_reference = fused.prefill(replay_tokens)[0]
+    replay_candidate = graphed.prefill(replay_tokens)[0]
+    replay_input_error = measure_forward_error(replay_reference, replay_candidate)
+    replay_input_error.require()
     reference.prefill(token_ids[:, :8])
-    fused.prefill(token_ids[:, :8])
     reference_ms = time_prefill(reference, token_ids, args.repetitions)
-    optimized_ms = time_prefill(fused, token_ids, args.repetitions)
+    optimized_ms = time_prefill(graphed, token_ids, args.repetitions)
     result = {
         "model": str(args.model),
         "tokens": token_ids.shape[1],
@@ -74,6 +82,10 @@ def main() -> None:
         "forward_error": error.__dict__,
         "forward_error_limit": 2e-3,
         "forward_error_rate": error.rate,
+        "graphed_final_error": graph_error.__dict__,
+        "graphed_final_error_rate": graph_error.rate,
+        "graphed_new_input_error": replay_input_error.__dict__,
+        "graphed_new_input_error_rate": replay_input_error.rate,
     }
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)

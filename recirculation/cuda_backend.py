@@ -213,8 +213,74 @@ class CUDAPrefillRunner:
             self.controller.detach()
 
 
+class CUDAGraphedPrefill:
+    """Replay a captured fixed-length prefill without per-token CPU dispatch.
+
+    Capture is specific to the model, sequence length, tensor shapes, and CUDA
+    device. The static input buffers are updated before every replay, so token
+    values and attention-mask values may change without recapturing.
+    """
+
+    def __init__(
+        self,
+        runner: CUDAPrefillRunner,
+        example_tokens: torch.Tensor,
+        *,
+        attention_mask: torch.Tensor | None = None,
+        warmups: int = 3,
+    ):
+        if warmups < 1:
+            raise ValueError("CUDA graph capture requires at least one warmup")
+        if example_tokens.ndim == 1:
+            example_tokens = example_tokens.unsqueeze(0)
+        if example_tokens.ndim != 2 or example_tokens.shape[0] != 1 or example_tokens.shape[1] == 0:
+            raise ValueError("graph capture requires tokens with shape [sequence] or [1, sequence]")
+        device = next(runner.model.parameters()).device
+        if device.type != "cuda":
+            raise ValueError("CUDA graph capture requires a CUDA model")
+        self.runner = runner
+        self.static_tokens = example_tokens.to(device=device, dtype=torch.long).clone()
+        if attention_mask is None:
+            attention_mask = torch.ones_like(self.static_tokens)
+        if attention_mask.shape != self.static_tokens.shape:
+            raise ValueError("attention_mask must have the same shape as tokens")
+        self.static_attention_mask = attention_mask.to(device=device).clone()
+
+        warmup_stream = torch.cuda.Stream(device=device)
+        warmup_stream.wait_stream(torch.cuda.current_stream(device))
+        with torch.cuda.stream(warmup_stream):
+            for _ in range(warmups):
+                self.outputs = runner.prefill(self.static_tokens, attention_mask=self.static_attention_mask)
+        torch.cuda.current_stream(device).wait_stream(warmup_stream)
+        torch.cuda.synchronize(device)
+        self.graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(self.graph):
+            self.outputs = runner.prefill(self.static_tokens, attention_mask=self.static_attention_mask)
+
+    @torch.inference_mode()
+    def prefill(self, tokens: Sequence[int] | torch.Tensor, *, attention_mask: torch.Tensor | None = None):
+        """Copy new values into the static buffers and replay the captured prefill."""
+
+        if not isinstance(tokens, torch.Tensor):
+            tokens = torch.tensor(list(tokens), dtype=torch.long, device=self.static_tokens.device)
+        if tokens.ndim == 1:
+            tokens = tokens.unsqueeze(0)
+        if tokens.shape != self.static_tokens.shape:
+            raise ValueError(f"captured prefill requires tokens with shape {tuple(self.static_tokens.shape)}")
+        self.static_tokens.copy_(tokens.to(device=self.static_tokens.device, dtype=torch.long))
+        if attention_mask is None:
+            self.static_attention_mask.fill_(1)
+        else:
+            if attention_mask.shape != self.static_attention_mask.shape:
+                raise ValueError("attention_mask must have the captured token shape")
+            self.static_attention_mask.copy_(attention_mask.to(device=self.static_attention_mask.device))
+        self.graph.replay()
+        return self.outputs
+
+
 __all__ = [
     "MAX_FORWARD_ERROR",
+    "CUDAGraphedPrefill",
     "CUDAPrefillRunner",
     "ForwardError",
     "FusedNormMix",

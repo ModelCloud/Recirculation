@@ -2,7 +2,7 @@
 
 ## Progress
 
-- 2026-08-20 — CUDA fused prefill ran **1.018x faster** over 128 tokens within the forward-error gate.
+- 2026-08-20 — Graphed CUDA fused prefill ran **3.987x faster** over 128 tokens within the forward-error gate.
 - 2026-08-20 — Exact shared-prefix reuse made real eight-shot GSM8K prefill **5.24x faster** with zero measured error.
 - 2026-08-20 — MLX prefill reached **1.30x speedup** over 128 tokens with zero measured forward error.
 - 2026-08-20 — Shared-prefix reuse reached **3.34x speedup** for repeated prompts.
@@ -114,8 +114,10 @@ Detailed benchmark outputs and settings are available under [`results/`](results
 ## CUDA prefill
 
 The CUDA backend preserves token-serial KV-cache updates while fusing the two L2 reductions, source normalization, and
-residual mixture into one Triton kernel. It also skips the vocabulary projection for every non-final prompt token.
-Fused results are gated against the ordinary PyTorch expression with the same `2e-3` maximum forward-error rate.
+residual mixture into one Triton kernel. It also skips the vocabulary projection for every non-final prompt token. For
+repeated inference at a known prompt length, `CUDAGraphedPrefill` captures the complete serial loop and replays it with
+new token and mask values, removing per-token CPU dispatch. Fused results are gated against the ordinary PyTorch
+expression with the same `2e-3` maximum forward-error rate.
 
 ```bash
 python -m pip install -e '.[cuda,eval,dev]'
