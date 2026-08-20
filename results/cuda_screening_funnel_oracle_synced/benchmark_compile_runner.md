@@ -10,6 +10,11 @@ and 16 incremental decode tokens. Model loading and prompt prefill are excluded.
 
 The compiled runner is 2.55× faster in warm decode. Its first measured decode
 call took 12.96 seconds while Inductor compiled the dynamic shapes; subsequent
-calls took 0.146 and 0.141 seconds. CUDA sweeps enable it by default because the
-one-time cost is amortized over many rows. Use `--no-cuda-compile-runner` for
-short smoke/debug runs.
+calls took 0.146 and 0.141 seconds.
+
+An end-to-end two-row, 32-token-cap sweep took 48 seconds with shared-prefix
+eager execution and 114 seconds with compilation, showing that compiler startup
+dominates small jobs. The measured break-even is approximately 4,700 generated
+tokens per candidate. CUDA sweeps therefore enable runner compilation
+automatically only when `rows × max_new_tokens >= 5000`. Explicit
+`--cuda-compile-runner` and `--no-cuda-compile-runner` override the policy.

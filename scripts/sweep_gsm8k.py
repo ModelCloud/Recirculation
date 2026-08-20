@@ -235,8 +235,8 @@ def main() -> int:
     parser.add_argument(
         "--cuda-compile-runner",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Compile recirculation lower/upper stacks with CUDA graph trees disabled (default: enabled).",
+        default=None,
+        help="Compile recirculation stacks; defaults to automatic break-even selection.",
     )
     parser.add_argument(
         "--cuda-shared-prefix",
@@ -285,6 +285,11 @@ def main() -> int:
         parser.error("cuda-batch-size must be positive")
     if args.cuda_graph_max_tokens < 1:
         parser.error("cuda-graph-max-tokens must be positive")
+    cuda_compile_runner = (
+        args.cuda_compile_runner
+        if args.cuda_compile_runner is not None
+        else args.rows * args.max_new_tokens >= 5_000
+    )
     selected_screen_items = {}
     if args.screen_results is not None:
         screen = json.loads(args.screen_results.read_text(encoding="utf-8"))
@@ -358,7 +363,7 @@ def main() -> int:
             )
             for source, destination, alpha in args.candidate
         }
-        if args.cuda_compile_runner:
+        if cuda_compile_runner:
             for runner in candidate_runners.values():
                 compile_options = {"triton.cudagraphs": False}
                 runner._run_lower = torch.compile(runner._run_lower, dynamic=True, options=compile_options)
@@ -655,7 +660,8 @@ def main() -> int:
             "cuda_compile_used": compile_used,
             "cuda_python_threads": args.cuda_python_threads,
             "cuda_static_cache": args.cuda_static_cache,
-            "cuda_compile_runner": args.cuda_compile_runner,
+            "cuda_compile_runner_requested": args.cuda_compile_runner,
+            "cuda_compile_runner": cuda_compile_runner,
             "cuda_shared_prefix": args.cuda_shared_prefix,
             "common_prefix_tokens": _common_prefix_length(samples),
         },
