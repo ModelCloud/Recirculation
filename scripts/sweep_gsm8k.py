@@ -201,6 +201,11 @@ def main() -> int:
         default=True,
         help="Use Python worker threads to enqueue the two CUDA streams per decode step.",
     )
+    parser.add_argument(
+        "--cuda-static-cache",
+        action="store_true",
+        help="Request Transformers StaticCache for dense CUDA generation.",
+    )
     parser.add_argument("--top-k", type=int, default=5)
     parser.add_argument(
         "--harm-weight",
@@ -354,7 +359,23 @@ def main() -> int:
     maybe_status("baseline", force=True)
     if not args.skip_baseline:
         for sample_index, sample in enumerate(samples):
-            sample["baseline"] = _generate(model, tokenizer, sample["prompt_ids"], device, args.max_new_tokens, until)
+            try:
+                sample["baseline"] = _generate(
+                    model,
+                    tokenizer,
+                    sample["prompt_ids"],
+                    device,
+                    args.max_new_tokens,
+                    until,
+                    cache_implementation="static" if args.cuda_static_cache and device.type == "cuda" else None,
+                )
+            except (ValueError, RuntimeError, torch.AcceleratorError) as error:
+                if not args.cuda_static_cache:
+                    raise
+                print(f"StaticCache unavailable; falling back to DynamicCache: {error}", flush=True)
+                sample["baseline"] = _generate(
+                    model, tokenizer, sample["prompt_ids"], device, args.max_new_tokens, until
+                )
             maybe_status("baseline")
             if (sample_index + 1) % 4 == 0:
                 print(f"baseline rows {sample_index + 1}/{len(samples)}", flush=True)
@@ -550,6 +571,7 @@ def main() -> int:
             "cuda_compile_requested": args.cuda_compile,
             "cuda_compile_used": compile_used,
             "cuda_python_threads": args.cuda_python_threads,
+            "cuda_static_cache": args.cuda_static_cache,
         },
         "seconds": time.perf_counter() - started,
         "summaries": summaries,

@@ -221,17 +221,23 @@ def _generate(
     max_new_tokens: int,
     until,
     controller=None,
+    cache_implementation: str | None = None,
 ):
     input_ids = torch.tensor([prompt_ids], dtype=torch.long, device=device)
     if controller is None:
+        generate_kwargs = {
+            "input_ids": input_ids,
+            "attention_mask": torch.ones_like(input_ids),
+            "do_sample": False,
+            "max_new_tokens": max_new_tokens,
+            "pad_token_id": int(tokenizer.pad_token_id),
+            "eos_token_id": int(tokenizer.eos_token_id),
+            "use_cache": True,
+        }
+        if cache_implementation is not None:
+            generate_kwargs["cache_implementation"] = cache_implementation
         generated = model.generate(
-            input_ids=input_ids,
-            attention_mask=torch.ones_like(input_ids),
-            do_sample=False,
-            max_new_tokens=max_new_tokens,
-            pad_token_id=int(tokenizer.pad_token_id),
-            eos_token_id=int(tokenizer.eos_token_id),
-            use_cache=True,
+            **generate_kwargs,
         )
     else:
         generated = controller.generate(
