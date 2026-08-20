@@ -1,5 +1,10 @@
 # Recirculation reproduction
 
+> [!WARNING]
+> **Implementation status:** The current implementation has known bugs and inconsistencies with the paper. The code and
+> reported results should therefore be treated as provisional and not yet as a paper-faithful reproduction. A fix and
+> renewed validation are underway.
+
 ## Progress
 
 - 2026-08-20 — Graphed CUDA fused prefill ran **3.987x faster** over 128 tokens within the forward-error gate.
