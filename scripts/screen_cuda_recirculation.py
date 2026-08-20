@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 
-"""Rank CUDA recirculation paths and alphas with shared-prefix answer NLL."""
+"""Shortlist CUDA recirculation paths with shared-prefix full-solution NLL.
+
+This proxy never injects an answer cue into the prompt. Final selection belongs
+to ``sweep_gsm8k.py``, which lets each model arm generate autoregressively.
+"""
 
 from __future__ import annotations
 
@@ -317,9 +321,9 @@ def main() -> int:
     parser.add_argument("--row-batch-size", type=int, default=32)
     parser.add_argument(
         "--target-mode",
-        choices=("dual", "full_solution", "final_answer"),
-        default="dual",
-        help="Score full-solution and historical final-answer continuations together by default.",
+        choices=("full_solution",),
+        default="full_solution",
+        help="Teacher-force the complete gold solution only as a shortlist proxy; final selection uses natural generation.",
     )
     parser.add_argument("--tail-quantile", type=float, default=0.9)
     parser.add_argument("--tail-weight", type=float, default=1.0)
@@ -404,20 +408,13 @@ def main() -> int:
     common_length = min(_common_prefix_length(prompts), min(len(prompt) - 1 for prompt in prompts))
     prefix = torch.tensor([prompts[0][:common_length]], dtype=torch.long, device="cuda")
     contexts = []
-    final_answer_prefix = tokenizer("The final answer is ", add_special_tokens=False).input_ids
     for prompt, document, gold_answer in zip(prompts, documents, gold_answers):
         row = {}
-        if args.target_mode in ("dual", "full_solution"):
-            full_target = gsm8k_solution_target(str(document["answer"]), gold_answer)
-            row["full_solution"] = (
-                prompt[common_length:],
-                tokenizer(full_target, add_special_tokens=False).input_ids,
-            )
-        if args.target_mode in ("dual", "final_answer"):
-            row["final_answer"] = (
-                prompt[common_length:] + final_answer_prefix,
-                tokenizer(gold_answer, add_special_tokens=False).input_ids,
-            )
+        full_target = gsm8k_solution_target(str(document["answer"]), gold_answer)
+        row["full_solution"] = (
+            prompt[common_length:],
+            tokenizer(full_target, add_special_tokens=False).input_ids,
+        )
         contexts.append(row)
     baseline_contract = _baseline_contract(
         args,

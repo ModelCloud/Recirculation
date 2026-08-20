@@ -55,10 +55,11 @@ branches before `t+1` enters the upper stack. The intervention changes neither m
 Results produced before the same-token replay correction measured a different delayed cross-token intervention and
 are withdrawn as recirculation evidence. The initial corrected candidate was selected by final-answer likelihood. On
 128 disjoint rows, Evalution scored the baseline at 59 correct and recirculation at 67 correct; the positive estimate
-is still statistically noise-consistent, so the candidate remains provisional. The CUDA screening funnel now scores
-the historical final-answer continuation and the complete gold solution in the same candidate batch. It retains plain
-perplexity and harmed-row-penalized rankings for both objectives, sends their union to paired generation, and only then
-applies the actual correct-to-wrong flip penalty. See [`results/`](results/) for the complete record.
+is still statistically noise-consistent, so the candidate remains provisional. The CUDA screening funnel no longer
+injects `The final answer is ` into the prompt. It uses complete-gold-solution likelihood only as a cheap shortlist
+proxy, then lets the dense and recirculation arms generate autoregressively with no answer cue. Only naturally
+generated paired accuracy can promote a candidate, and promotion requires both a positive net correction count and a
+positive harmed-row-penalized score. See [`results/`](results/) for the complete record.
 
 | Arm | Configuration | Correct | Accuracy | Change vs. baseline |
 |---|---|---:|---:|---:|

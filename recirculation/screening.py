@@ -270,7 +270,12 @@ def paired_selection_entry(
 
     paired = summary["paired_vs_baseline"]["numeric"]
     correct_to_wrong = paired["correct_to_wrong"]
-    valid = max_correct_to_wrong is None or correct_to_wrong <= max_correct_to_wrong
+    selection_score = paired["wrong_to_correct"] - harm_weight * correct_to_wrong
+    within_harm_cap = max_correct_to_wrong is None or correct_to_wrong <= max_correct_to_wrong
+    # A cap alone used to label the least-bad losing candidate as valid.  Proxy
+    # likelihood can shortlist an arm, but only a positive naturally generated
+    # paired result may be promoted.
+    valid = within_harm_cap and paired["net_correct"] > 0 and selection_score > 0
     return {
         "source_layer": source,
         "destination_layer": destination,
@@ -279,7 +284,7 @@ def paired_selection_entry(
         "correct_to_wrong": correct_to_wrong,
         "net_correct": paired["net_correct"],
         "harm_weight": harm_weight,
-        "selection_score": paired["wrong_to_correct"] - harm_weight * correct_to_wrong,
+        "selection_score": selection_score,
         "valid": valid,
         "primary_metric": "numeric",
         "numeric_correct": summary["numeric_correct"],

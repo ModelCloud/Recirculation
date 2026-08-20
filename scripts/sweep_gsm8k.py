@@ -614,7 +614,9 @@ def main() -> int:
     best_perplexity = (
         min(
             candidates_with_proxy,
-            key=lambda item: item["proxy_objectives"]["final_answer"]["target_perplexity"],
+            key=lambda item: item["proxy_objectives"].get(
+                "full_solution", item["proxy_objectives"].get("final_answer")
+            )["target_perplexity"],
         )
         if candidates_with_proxy
         else None

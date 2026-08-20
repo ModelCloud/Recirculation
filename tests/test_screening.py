@@ -149,3 +149,37 @@ def test_e2e_selection_penalizes_correct_to_wrong_more_than_wrong_to_correct():
     entry = paired_selection_entry(8, 2, 0.2, summary, harm_weight=2.0, max_correct_to_wrong=5)
     assert entry["selection_score"] == -4
     assert not entry["valid"]
+
+
+def test_e2e_selection_rejects_losing_candidate_even_without_harm_cap():
+    summary = {
+        "numeric_correct": 16,
+        "numeric_accuracy": 0.5,
+        "paired_vs_baseline": {
+            "numeric": {
+                "wrong_to_correct": 1,
+                "correct_to_wrong": 2,
+                "net_correct": -1,
+            }
+        },
+    }
+    entry = paired_selection_entry(4, 2, 0.2, summary, harm_weight=2.0, max_correct_to_wrong=None)
+    assert entry["selection_score"] == -3
+    assert not entry["valid"]
+
+
+def test_e2e_selection_accepts_positive_natural_generation_gain():
+    summary = {
+        "numeric_correct": 20,
+        "numeric_accuracy": 0.625,
+        "paired_vs_baseline": {
+            "numeric": {
+                "wrong_to_correct": 5,
+                "correct_to_wrong": 1,
+                "net_correct": 4,
+            }
+        },
+    }
+    entry = paired_selection_entry(8, 2, 0.2, summary, harm_weight=2.0, max_correct_to_wrong=None)
+    assert entry["selection_score"] == 3
+    assert entry["valid"]

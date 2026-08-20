@@ -58,7 +58,7 @@ def _screen_base(args, output: Path) -> list[str]:
         "--candidate-workers",
         str(args.candidate_workers),
         "--target-mode",
-        "dual",
+        "full_solution",
         "--tail-quantile",
         str(args.tail_quantile),
         "--tail-weight",
@@ -181,7 +181,7 @@ def main() -> int:
     e2e_report = json.loads(e2e.read_text(encoding="utf-8"))
     winner = e2e_report.get("best")
     if winner is None or not winner["valid"]:
-        raise RuntimeError("no E2E candidate passed the correct-to-wrong validity gate")
+        raise RuntimeError("no naturally generated E2E candidate produced a positive harm-adjusted gain")
 
     holdout = args.output_dir / "stage4_holdout.json"
     holdout_command = [
