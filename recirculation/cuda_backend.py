@@ -737,8 +737,8 @@ class CUDAGraphedPrefill:
             )
         if example_tokens.ndim == 1:
             example_tokens = example_tokens.unsqueeze(0)
-        if example_tokens.ndim != 2 or example_tokens.shape[0] != 1 or example_tokens.shape[1] == 0:
-            raise ValueError("graph capture requires tokens with shape [sequence] or [1, sequence]")
+        if example_tokens.ndim != 2 or example_tokens.shape[0] == 0 or example_tokens.shape[1] == 0:
+            raise ValueError("graph capture requires tokens with shape [sequence] or [batch, sequence]")
         device = next(runner.model.parameters()).device
         if device.type != "cuda":
             raise ValueError("CUDA graph capture requires a CUDA model")
