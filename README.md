@@ -11,6 +11,7 @@ repository all build on that method. This is not the authors' official implement
 
 ## Progress
 
+- 2026-08-20 — MLX ran the matched short Apple M4 evaluation 2.86x faster than Torch/MPS.
 - 2026-08-20 — Evaluation now auto-selects CUDA or MLX and can compare same-destination candidates together.
 - 2026-08-20 — Torch is now the single reference for MLX and CUDA accuracy checks.
 - 2026-08-20 — Locked disjoint evaluation completed at 59/128 baseline and 67/128 with recirculation.
