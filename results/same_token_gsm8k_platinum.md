@@ -277,12 +277,12 @@ Selected configuration: **source layer 8 → destination layer 2, alpha 0.20, be
 
 ## Locked 128-row generated evaluation
 
-Status: pending fresh paired run.
+Status: complete.
 
 The evaluator runs the dense non-recirculated baseline and corrected recirculation arm on each identical prompt,
 using greedy generation and a 256-token generation limit. Primary scoring imports Evalution 0.0.7's
 format-insensitive GSM8K-Platinum numeric target, answer extractor, and numeric equality functions. Legacy strict
-and flexible extraction is retained only as a diagnostic. The output artifact will be
+and flexible extraction is retained only as a diagnostic. The output artifact is
 `results/gsm8k_platinum_same_token_8_2_alpha020_rows144_271.json`.
 
 Exact command:
@@ -315,5 +315,19 @@ python3 scripts/eval_gsm8k_platinum.py \
 
 | Arm | Correct/128 | Accuracy | Delta vs baseline |
 |---|---:|---:|---:|
-| Dense baseline | Pending | Pending | — |
-| Recirculation 8→2, alpha 0.20 | Pending | Pending | Pending |
+| Dense baseline | 59 | 46.09% | — |
+| Recirculation 8→2, alpha 0.20 | 67 | 52.34% | **+6.25 percentage points** |
+
+Relative accuracy increased by **13.56%** and errors decreased by **11.59%**. Evaluation took 3,902.959 seconds
+(65.05 minutes).
+
+| Paired transition | Rows |
+|---|---:|
+| Wrong → correct | 16 |
+| Correct → wrong | 8 |
+| Net additional correct | **8** |
+| Generated answer changed | 65 |
+
+The exact two-sided paired McNemar p-value is `0.1516`. The paired bootstrap percentile 95% interval for the accuracy
+change is `[-0.78, +14.06]` percentage points. The primary result is therefore a positive point estimate but is
+**noise-consistent**, not a conclusive accuracy gain at 128 rows.
