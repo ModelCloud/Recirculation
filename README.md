@@ -2,6 +2,7 @@
 
 ## Progress
 
+- 2026-08-20 — Ramping now follows the paper's zero-based 10-step schedule exactly.
 - 2026-08-20 — Corrected CUDA same-token replay reached **4.533x prefill speedup** within the `2e-3` error gate.
 - 2026-08-20 — Corrected recirculation to replay each token's own upper stack and replace its upper-layer KV state.
 - 2026-08-20 — With zero feedback, replay now matches ordinary serial inference exactly in Torch and MLX.

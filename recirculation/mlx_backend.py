@@ -10,7 +10,7 @@ from dataclasses import dataclass
 import mlx.core as mx
 from mlx_lm.models.base import create_attention_mask
 
-from .controller import RecirculationConfig
+from .controller import RecirculationConfig, _mixing_coefficients
 
 MAX_FORWARD_ERROR = 2e-3
 
@@ -34,6 +34,7 @@ class ForwardError:
 class PendingRecirculation:
     destination: mx.array
     source: mx.array
+    token_position: int
 
 
 @dataclass(frozen=True)
@@ -56,15 +57,31 @@ def measure_forward_error(reference: mx.array, candidate: mx.array) -> ForwardEr
     return ForwardError(max_absolute, relative_l2, normalized_max)
 
 
-def mix_reference(destination: mx.array, source: mx.array, config: RecirculationConfig) -> mx.array:
-    """Published convex/non-convex norm-ratio mixture using ordinary MLX ops."""
-
+def _mix_expression(
+    destination: mx.array,
+    source: mx.array,
+    alpha: float,
+    beta: float,
+    normalize_source: bool,
+) -> mx.array:
     source = source.astype(destination.dtype)
-    if config.normalize_source:
+    if normalize_source:
         destination_norm = mx.linalg.norm(destination.astype(mx.float32), axis=-1, keepdims=True)
         source_norm = mx.linalg.norm(source.astype(mx.float32), axis=-1, keepdims=True)
         source = source * (destination_norm / mx.maximum(source_norm, mx.array(1e-12))).astype(source.dtype)
-    return config.beta * destination + config.alpha * source
+    return beta * destination + alpha * source
+
+
+def mix_reference(
+    destination: mx.array,
+    source: mx.array,
+    config: RecirculationConfig,
+    token_position: int | None = None,
+) -> mx.array:
+    """Published convex/non-convex norm-ratio mixture using ordinary MLX ops."""
+
+    alpha, beta = _mixing_coefficients(config, token_position)
+    return _mix_expression(destination, source, alpha, beta, config.normalize_source)
 
 
 class CompiledNormMix:
@@ -74,15 +91,22 @@ class CompiledNormMix:
         self.config = config
 
         @mx.compile
-        def compiled(destination, source):
-            return mix_reference(destination, source, config)
+        def compiled(destination, source, alpha, beta):
+            return _mix_expression(destination, source, alpha, beta, config.normalize_source)
 
         self._compiled = compiled
 
-    def __call__(self, destination: mx.array, source: mx.array, config: RecirculationConfig) -> mx.array:
+    def __call__(
+        self,
+        destination: mx.array,
+        source: mx.array,
+        config: RecirculationConfig,
+        token_position: int | None = None,
+    ) -> mx.array:
         if config != self.config:
             raise ValueError("compiled mixer configuration cannot change after compilation")
-        return self._compiled(destination, source)
+        alpha, beta = _mixing_coefficients(config, token_position)
+        return self._compiled(destination, source, alpha, beta)
 
 
 class MLXRecirculator:
@@ -92,7 +116,7 @@ class MLXRecirculator:
         self,
         model,
         config: RecirculationConfig,
-        mixer: Callable[[mx.array, mx.array, RecirculationConfig], mx.array] = mix_reference,
+        mixer: Callable[[mx.array, mx.array, RecirculationConfig, int], mx.array] = mix_reference,
     ):
         if not hasattr(model, "model") or not hasattr(model.model, "layers"):
             raise TypeError("MLX recirculation requires an MLX-LM decoder model")
@@ -132,7 +156,12 @@ class MLXRecirculator:
         for layer_cache in cache[first_upper_layer:]:
             if layer_cache.trim(1) != 1:
                 raise RuntimeError("cannot rewind the preceding token for recirculation")
-        hidden = self.mixer(pending.destination, pending.source, self.config)
+        hidden = self.mixer(
+            pending.destination,
+            pending.source,
+            self.config,
+            pending.token_position,
+        )
         full_mask = create_attention_mask(hidden, cache[first_upper_layer])
         sliding_mask = None
         if decoder.swa_idx is not None:
@@ -161,6 +190,7 @@ class MLXRecirculator:
         if token.shape != (1, 1):
             raise ValueError("step requires one token with shape [1, 1]")
         decoder = self.model.model
+        token_position = int(cache[decoder.fa_idx].size())
         self._recirculate_pending(cache, pending)
         hidden = decoder.embed_tokens(token)
         full_mask = create_attention_mask(hidden, cache[decoder.fa_idx])
@@ -179,7 +209,7 @@ class MLXRecirculator:
                 source = hidden
         if destination is None or source is None:
             raise RuntimeError("recirculation path activations were not captured")
-        next_pending = PendingRecirculation(destination, source)
+        next_pending = PendingRecirculation(destination, source, token_position)
         if not project_logits:
             return None, next_pending
         hidden = decoder.norm(hidden)

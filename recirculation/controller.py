@@ -50,6 +50,25 @@ class RecirculationConfig:
 class _PendingRecirculation:
     destination: torch.Tensor
     source: torch.Tensor
+    token_position: int
+
+
+def _mixing_coefficients(config: RecirculationConfig, token_position: int | None = None) -> tuple[float, float]:
+    """Return the paper's alpha_t and its configured beta coefficient."""
+
+    if token_position is not None and token_position < 0:
+        raise ValueError("Recirculation token_position must be non-negative.")
+    strength = config.alpha
+    if config.ramp_tokens:
+        if token_position is None:
+            raise ValueError("Recirculation token_position is required when ramp_tokens is enabled.")
+        strength *= min(token_position / float(config.ramp_tokens), 1.0)
+    # The paper's convex mixture uses beta_t = 1 - alpha_t. An explicitly
+    # non-convex beta remains fixed while alpha ramps.
+    beta = config.beta
+    if config.beta == 1.0 - config.alpha:
+        beta = 1.0 - strength
+    return float(strength), float(beta)
 
 
 def _find_decoder_layers(model: nn.Module) -> nn.ModuleList:
@@ -123,16 +142,9 @@ class RecirculationController:
             self._current_destination = hidden_states[:, -1:, :].detach()
         return output
 
-    def _mix(self, destination: torch.Tensor, source: torch.Tensor) -> torch.Tensor:
+    def _mix(self, destination: torch.Tensor, source: torch.Tensor, token_position: int) -> torch.Tensor:
         source = source.to(device=destination.device, dtype=destination.dtype)
-        strength = self.config.alpha
-        if self.config.ramp_tokens:
-            strength *= min(1.0, self._position / float(self.config.ramp_tokens))
-        # With the default convex mixture, ramping alpha also ramps beta so
-        # the residual magnitude does not collapse on the first positions.
-        beta = self.config.beta
-        if self.config.beta == 1.0 - self.config.alpha:
-            beta = 1.0 - strength
+        strength, beta = _mixing_coefficients(self.config, token_position)
         if self._mixer is not None:
             return self._mixer(destination, source, strength, beta, self.config.normalize_source)
         if self.config.normalize_source:
@@ -149,11 +161,15 @@ class RecirculationController:
             return output
         if self._current_destination is None:
             raise RuntimeError("destination activation was not captured before source activation")
+        token_count = int(hidden_states.shape[1])
+        if token_count < 1:
+            raise RuntimeError("source activation contains no token positions")
         self._pending = _PendingRecirculation(
             self._current_destination,
             hidden_states[:, -1:, :].detach(),
+            self._position + token_count - 1,
         )
-        self._position += int(hidden_states.shape[1])
+        self._position += token_count
         return output
 
     def _recirculate_pending(self, past_key_values, attention_mask: torch.Tensor) -> None:
@@ -166,7 +182,11 @@ class RecirculationController:
         first_upper_layer = self.config.destination_layer + 1
         for layer in past_key_values.layers[first_upper_layer:]:
             layer.crop(-1)
-        hidden_states = self._mix(self._pending.destination, self._pending.source)
+        hidden_states = self._mix(
+            self._pending.destination,
+            self._pending.source,
+            self._pending.token_position,
+        )
         # Construct directly on-device so fixed-length replay remains CUDA graph capture-safe.
         position_ids = torch.full((1, 1), sequence_length - 1, dtype=torch.long, device=hidden_states.device)
         capturing = hidden_states.is_cuda and torch.cuda.is_current_stream_capturing()
