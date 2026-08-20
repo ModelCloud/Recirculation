@@ -78,6 +78,24 @@ def _implementation_commit() -> str:
     return completed.stdout.strip()
 
 
+def _write_report(path, *, status, implementation_commit, settings, started, results, total):
+    ordered_results = sorted(results, key=lambda item: item["answer_nll"])
+    complete = len(ordered_results)
+    report = {
+        "status": status,
+        "complete": complete,
+        "active": 1 if status == "running" and complete < total else 0,
+        "pending": max(total - complete - (1 if status == "running" and complete < total else 0), 0),
+        "implementation_commit": implementation_commit,
+        "settings": settings,
+        "seconds": time.perf_counter() - started,
+        "best": ordered_results[0] if ordered_results else None,
+        "results": ordered_results,
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
 def _score_candidate(
     model,
     prefix,
@@ -274,6 +292,50 @@ def main() -> int:
     candidates = [(source, destination, alpha) for source, destination in paths for alpha in alphas]
     results = []
     started = time.perf_counter()
+    implementation_commit = _implementation_commit()
+    settings = {
+        "split_role": "tuning",
+        "model": args.model,
+        "dataset": args.dataset,
+        "row_start": args.row_start,
+        "rows": args.rows,
+        "row_stop_exclusive": stop,
+        "forbidden_ranges": forbidden_ranges,
+        "common_prefix_tokens": common_length,
+        "alphas": alphas,
+        "max_distance": args.max_distance,
+        "scheduler": args.scheduler,
+        "candidate_workers": args.candidate_workers,
+        "python_threads": args.python_threads,
+        "row_batch_size": args.row_batch_size,
+        "graph_prefix": args.graph_prefix,
+        "python": platform.python_version(),
+        "python_gil_enabled": bool(getattr(sys, "_is_gil_enabled", lambda: True)()),
+        "torch": torch.__version__,
+        "cuda": torch.version.cuda,
+        "gpu": torch.cuda.get_device_name(0),
+        "pytorch_alloc_conf": os.environ.get("PYTORCH_ALLOC_CONF"),
+        "thread_environment": {
+            name: os.environ[name]
+            for name in (
+                "OMP_NUM_THREADS",
+                "OPENBLAS_NUM_THREADS",
+                "MKL_NUM_THREADS",
+                "BLIS_NUM_THREADS",
+                "VECLIB_MAXIMUM_THREADS",
+                "NUMEXPR_NUM_THREADS",
+            )
+        },
+    }
+    _write_report(
+        args.output,
+        status="running",
+        implementation_commit=implementation_commit,
+        settings=settings,
+        started=started,
+        results=results,
+        total=len(candidates),
+    )
     torch.cuda.synchronize()
     with ThreadPoolExecutor(max_workers=args.candidate_workers, thread_name_prefix="recirculation-screen") as executor:
         futures = {
@@ -293,50 +355,28 @@ def main() -> int:
         }
         for future in as_completed(futures):
             results.append(future.result())
+            _write_report(
+                args.output,
+                status="running",
+                implementation_commit=implementation_commit,
+                settings=settings,
+                started=started,
+                results=results,
+                total=len(candidates),
+            )
             if len(results) % args.report_every == 0 or len(results) == len(candidates):
                 best = min(results, key=lambda item: item["answer_nll"])
                 LOG.info(f"candidates={len(results)}/{len(candidates)} best={best}")
 
-    report = {
-        "implementation_commit": _implementation_commit(),
-        "settings": {
-            "split_role": "tuning",
-            "model": args.model,
-            "dataset": args.dataset,
-            "row_start": args.row_start,
-            "rows": args.rows,
-            "row_stop_exclusive": stop,
-            "forbidden_ranges": forbidden_ranges,
-            "common_prefix_tokens": common_length,
-            "alphas": alphas,
-            "max_distance": args.max_distance,
-            "scheduler": args.scheduler,
-            "candidate_workers": args.candidate_workers,
-            "python_threads": args.python_threads,
-            "row_batch_size": args.row_batch_size,
-            "graph_prefix": args.graph_prefix,
-            "python": platform.python_version(),
-            "python_gil_enabled": bool(getattr(sys, "_is_gil_enabled", lambda: True)()),
-            "torch": torch.__version__,
-            "cuda": torch.version.cuda,
-            "gpu": torch.cuda.get_device_name(0),
-            "thread_environment": {
-                name: os.environ[name]
-                for name in (
-                    "OMP_NUM_THREADS",
-                    "OPENBLAS_NUM_THREADS",
-                    "MKL_NUM_THREADS",
-                    "BLIS_NUM_THREADS",
-                    "VECLIB_MAXIMUM_THREADS",
-                    "NUMEXPR_NUM_THREADS",
-                )
-            },
-        },
-        "seconds": time.perf_counter() - started,
-        "results": sorted(results, key=lambda item: item["answer_nll"]),
-    }
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    _write_report(
+        args.output,
+        status="complete",
+        implementation_commit=implementation_commit,
+        settings=settings,
+        started=started,
+        results=results,
+        total=len(candidates),
+    )
     LOG.info(f"Wrote {args.output}")
     return 0
 
