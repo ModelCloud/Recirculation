@@ -639,14 +639,25 @@ class CUDAConcurrentRunner:
         if max_new_tokens < 0:
             raise ValueError("max_new_tokens must be non-negative")
         logits, cache, pending, _ = self.prefill(input_ids)
-        generated = input_ids.to(device=self.device, dtype=torch.long).clone()
-        for _ in range(max_new_tokens):
+        prompt = input_ids.to(device=self.device, dtype=torch.long)
+        batch_size, prompt_length = prompt.shape
+        # Keep the decode buffer on CUDA and fill in place.  Repeated cat()
+        # creates and copies an ever-growing tensor at every token.
+        generated = torch.empty(
+            (batch_size, prompt_length + max_new_tokens),
+            dtype=torch.long,
+            device=self.device,
+        )
+        generated[:, :prompt_length] = prompt
+        if max_new_tokens == 0:
+            return generated[:, :prompt_length]
+        for offset in range(max_new_tokens):
             token = logits[:, -1, :].argmax(dim=-1, keepdim=True)
-            generated = torch.cat((generated, token), dim=1)
+            generated[:, prompt_length + offset : prompt_length + offset + 1] = token
             if eos_token_id is not None and bool((token == eos_token_id).all()):
                 break
             logits, cache, pending = self.step(token, cache, pending)
-        return generated
+        return generated[:, : prompt_length + offset + 1]
 
 
 class CUDAGraphedConcurrentPrefill:
