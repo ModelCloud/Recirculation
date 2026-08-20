@@ -184,6 +184,12 @@ def main() -> int:
         action="store_true",
         help="Capture fixed-shape CUDA graph prefill per candidate/prompt length before decode.",
     )
+    parser.add_argument(
+        "--cuda-graph-max-tokens",
+        type=int,
+        default=256,
+        help="Maximum prompt length captured by CUDA graphs (raise cautiously for long prefixes).",
+    )
     parser.add_argument("--top-k", type=int, default=5)
     parser.add_argument(
         "--harm-weight",
@@ -223,6 +229,8 @@ def main() -> int:
         parser.error("status-every must be positive")
     if args.cuda_batch_size < 1:
         parser.error("cuda-batch-size must be positive")
+    if args.cuda_graph_max_tokens < 1:
+        parser.error("cuda-graph-max-tokens must be positive")
     selected_screen_items = {}
     if args.screen_results is not None:
         screen = json.loads(args.screen_results.read_text(encoding="utf-8"))
@@ -350,9 +358,12 @@ def main() -> int:
                             )
                             try:
                                 graph_prefills[graph_key] = CUDAGraphedConcurrentPrefill(
-                                    candidate_runners[arm], example, warmups=0
+                                    candidate_runners[arm],
+                                    example,
+                                    warmups=0,
+                                    max_tokens=args.cuda_graph_max_tokens,
                                 )
-                            except ValueError as error:
+                            except (ValueError, RuntimeError, torch.AcceleratorError) as error:
                                 print(f"CUDA graph prefill unavailable for length {example.shape[1]}: {error}", flush=True)
                                 graph_prefills[graph_key] = False
                         if graph_prefills[graph_key] is False:
@@ -512,6 +523,7 @@ def main() -> int:
             "max_correct_to_wrong": args.max_correct_to_wrong,
             "cuda_batch_size": args.cuda_batch_size,
             "cuda_graph_prefill": args.cuda_graph_prefill,
+            "cuda_graph_max_tokens": args.cuda_graph_max_tokens,
         },
         "seconds": time.perf_counter() - started,
         "summaries": summaries,

@@ -667,6 +667,7 @@ class CUDAGraphedConcurrentPrefill:
         capture_error_mode: str = "global",
         keep_graph: bool = False,
         capture_stream_priority: int = 0,
+        max_tokens: int = 256,
     ):
         if warmups < 0:
             raise ValueError("concurrent CUDA graph warmups must be non-negative")
@@ -680,10 +681,11 @@ class CUDAGraphedConcurrentPrefill:
             example_tokens = example_tokens.unsqueeze(0)
         if example_tokens.ndim != 2 or example_tokens.shape[0] != 1 or example_tokens.shape[1] == 0:
             raise ValueError("concurrent graph capture requires tokens with shape [sequence] or [1, sequence]")
-        if example_tokens.shape[1] > 256:
+        if max_tokens < 1:
+            raise ValueError("max_tokens must be positive")
+        if example_tokens.shape[1] > max_tokens:
             raise ValueError(
-                "concurrent graph capture is limited to 256 tokens because larger graphs are unstable; "
-                "use eager or bounded static-cache graph blocks"
+                f"concurrent graph capture is limited to {max_tokens} tokens; use eager or a larger bounded graph limit"
             )
         self.runner = runner
         self.static_tokens = example_tokens.to(device=runner.device, dtype=torch.long).clone()
