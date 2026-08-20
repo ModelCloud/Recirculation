@@ -54,6 +54,13 @@ are withdrawn as recirculation evidence. The initial corrected candidate was sel
 is still statistically noise-consistent, so the candidate remains provisional. A full-solution screening funnel is
 available for future searches. See [`results/`](results/) for the complete record.
 
+| Arm | Configuration | Correct | Accuracy | Change vs. baseline |
+|---|---|---:|---:|---:|
+| Dense baseline | No recirculation | 59/128 | 46.09% | — |
+| Recirculation | 8→2, alpha 0.20 | **67/128** | **52.34%** | **+8 correct / +6.25 percentage points** |
+
+This is a **13.56% relative accuracy increase**. The search rows and evaluation rows are disjoint.
+
 ## Install and test
 
 Python 3.10 or newer is required.
