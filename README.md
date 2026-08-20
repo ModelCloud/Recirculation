@@ -11,6 +11,7 @@ repository all build on that method. This is not the authors' official implement
 
 ## Progress
 
+- 2026-08-20 — Evaluation now auto-selects CUDA or MLX and can compare same-destination candidates together.
 - 2026-08-20 — Torch is now the single reference for MLX and CUDA accuracy checks.
 - 2026-08-20 — Locked disjoint evaluation completed at 59/128 baseline and 67/128 with recirculation.
 - 2026-08-20 — CUDA screening jointly evaluates historical final-answer and full-solution perplexity, then applies
@@ -89,11 +90,12 @@ The tests verify the published norm-ratio mixture, prohibit cross-token injectio
 
 ## Run the confirmation evaluation
 
-Use `mps` on Apple Silicon, `cuda` on NVIDIA, or `cpu`:
+The evaluator defaults to `--backend auto`: it selects the accelerated CUDA path when CUDA and Triton are available,
+MLX on Apple Silicon, then Torch on MPS or CPU. Use `--backend` and `--device` only when an explicit override is
+needed.
 
 ```bash
 python scripts/eval_gsm8k_platinum.py \
-  --device mps \
   --row-start 144 \
   --rows 128 \
   --forbid-range 272:304 \
@@ -105,8 +107,22 @@ python scripts/eval_gsm8k_platinum.py \
   --output results/reproduction.json
 ```
 
-The baseline uses ordinary Hugging Face generation. The intervention arm uses the same model, tokenizer, prompts,
+The baseline uses ordinary backend-native generation. The intervention arm uses the same model, tokenizer, prompts,
 greedy decoding settings, and row order, but performs paper-faithful serial prefill.
+
+Multiple same-destination candidates can share one baseline and their common lower-layer work:
+
+```bash
+python scripts/eval_gsm8k_platinum.py \
+  --row-start 144 \
+  --rows 128 \
+  --forbid-range 272:304 \
+  --forbid-range 304:336 \
+  --path 8:2 \
+  --path 4:2 \
+  --alpha 0.10 \
+  --output results/comparison.json
+```
 
 ## Screen layer pairs
 

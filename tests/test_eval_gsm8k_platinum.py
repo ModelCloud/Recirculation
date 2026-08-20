@@ -3,7 +3,17 @@
 from evalution.benchmarks import gsm8k_platinum
 from evalution.scorers.gsm8k import INVALID_ANSWER
 
-from scripts.eval_gsm8k_platinum import REPO_ROOT, _gold_answer, _instruction, _paired, _summary, _task_contract
+import scripts.eval_gsm8k_platinum as evaluation
+from scripts.eval_gsm8k_platinum import (
+    REPO_ROOT,
+    _candidate_batches,
+    _candidate_specs,
+    _gold_answer,
+    _instruction,
+    _paired,
+    _summary,
+    _task_contract,
+)
 
 
 def _arm(numeric_answer: str):
@@ -41,6 +51,40 @@ def test_evalution_numeric_scoring_is_the_primary_paired_metric():
         "correct_to_wrong": 1,
         "net_correct": 0,
     }
+
+
+def test_paired_scoring_accepts_named_multi_candidate_arms():
+    samples = [
+        {
+            "gold_answer": "42",
+            "baseline": _arm("41"),
+            "source8_destination2_alpha0.1": _arm("42"),
+        }
+    ]
+
+    assert _paired(samples, "source8_destination2_alpha0.1")["numeric"]["net_correct"] == 1
+
+
+def test_candidate_matrix_batches_same_destination_paths_together():
+    specs = _candidate_specs([(8, 2), (4, 2)], [0.1], None, 0)
+
+    assert [arm for arm, _ in specs] == [
+        "source8_destination2_alpha0.1",
+        "source4_destination2_alpha0.1",
+    ]
+    batches = _candidate_batches(specs, batch_size=8)
+    assert len(batches) == 1
+    assert [config.source_layer for _, config in batches[0]] == [8, 4]
+
+
+def test_backend_auto_prefers_cuda_then_mlx(monkeypatch):
+    monkeypatch.setattr(evaluation, "_cuda_accelerator_available", lambda: True)
+    monkeypatch.setattr(evaluation, "_mlx_accelerator_available", lambda: True)
+    assert evaluation._resolve_backend("auto", "auto") == ("cuda", "cuda")
+
+    monkeypatch.setattr(evaluation, "_cuda_accelerator_available", lambda: False)
+    assert evaluation._resolve_backend("auto", "auto") == ("mlx", "metal")
+    assert evaluation._resolve_backend("auto", "mps") == ("torch", "mps")
 
 
 def test_gold_answer_uses_evalution_numeric_canonicalization():

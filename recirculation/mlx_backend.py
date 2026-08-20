@@ -53,6 +53,11 @@ class MLXPrefillSnapshot:
     pending: PendingRecirculation
 
 
+@dataclass(frozen=True)
+class MLXCandidateGroupSnapshot:
+    snapshots: tuple[MLXPrefillSnapshot, ...]
+
+
 def measure_forward_error(reference: mx.array, candidate: mx.array) -> ForwardError:
     """Measure an optimized MLX forward against values from the Torch oracle."""
 
@@ -289,10 +294,274 @@ class MLXRecirculator:
         )
 
 
+class MLXCandidateGroupRecirculator:
+    """Share an exact lower stack across same-destination MLX candidates.
+
+    Candidate upper stacks retain batch-one execution, which preserves the
+    numerical behavior of independent :class:`MLXRecirculator` runs.  During a
+    common teacher-forced stream, layers through the shared destination execute
+    once.  Greedy decoding keeps sharing while candidate tokens agree and
+    automatically clones the lower KV state when they diverge.
+    """
+
+    def __init__(
+        self,
+        model,
+        configs: Sequence[RecirculationConfig],
+        mixers: Sequence[Callable[[mx.array, mx.array, RecirculationConfig, int], mx.array]] | None = None,
+    ):
+        self.configs = tuple(configs)
+        if not self.configs:
+            raise ValueError("grouped MLX recirculation requires at least one candidate")
+        destinations = {config.destination_layer for config in self.configs}
+        if len(destinations) != 1:
+            raise ValueError("grouped MLX candidates must share one destination layer")
+        selected_mixers = tuple(mixers) if mixers is not None else tuple(mix_reference for _ in self.configs)
+        if len(selected_mixers) != len(self.configs):
+            raise ValueError("grouped MLX recirculation requires one mixer per candidate")
+        self.runners = tuple(
+            MLXRecirculator(model, config, mixer)
+            for config, mixer in zip(self.configs, selected_mixers)
+        )
+        self.model = model
+        self.destination_layer = self.configs[0].destination_layer
+
+    @property
+    def candidate_count(self) -> int:
+        return len(self.runners)
+
+    def make_caches(self):
+        return [runner.make_cache() for runner in self.runners]
+
+    def _share_lower_cache(self, caches) -> None:
+        reference = caches[0]
+        for layer_index in range(self.destination_layer + 1):
+            state = reference[layer_index].state
+            for cache in caches[1:]:
+                cache[layer_index].state = state
+
+    def _detach_lower_caches(self, caches) -> None:
+        reference = caches[0]
+        copied = []
+        for cache in caches[1:]:
+            for layer_index in range(self.destination_layer + 1):
+                cache[layer_index].state = tuple(
+                    value + mx.zeros_like(value) for value in reference[layer_index].state
+                )
+                copied.extend(cache[layer_index].state)
+        if copied:
+            mx.eval(*copied)
+
+    def snapshot(self, caches, pendings) -> MLXCandidateGroupSnapshot:
+        return MLXCandidateGroupSnapshot(
+            tuple(runner.snapshot(cache, pending) for runner, cache, pending in zip(self.runners, caches, pendings))
+        )
+
+    def restore(self, snapshot: MLXCandidateGroupSnapshot):
+        if len(snapshot.snapshots) != self.candidate_count:
+            raise ValueError("snapshot candidate count differs from the grouped runner")
+        restored = [runner.restore(item) for runner, item in zip(self.runners, snapshot.snapshots)]
+        caches = [item[0] for item in restored]
+        pendings = [item[1] for item in restored]
+        self._share_lower_cache(caches)
+        return caches, pendings
+
+    def _run_shared_lower(self, token: mx.array, cache):
+        decoder = self.model.model
+        hidden = decoder.embed_tokens(token)
+        full_mask = create_attention_mask(hidden, cache[decoder.fa_idx])
+        sliding_mask = None
+        if decoder.swa_idx is not None:
+            sliding_mask = create_attention_mask(hidden, cache[decoder.swa_idx], window_size=decoder.sliding_window)
+        for layer, layer_cache in zip(
+            decoder.layers[: self.destination_layer + 1], cache[: self.destination_layer + 1]
+        ):
+            mask = sliding_mask if layer.use_sliding else full_mask
+            hidden = layer(hidden, mask, cache=layer_cache)
+        return hidden
+
+    def _run_candidate_upper(
+        self,
+        row: int,
+        destination: mx.array,
+        cache,
+        token_position: int,
+        *,
+        project_logits: bool,
+    ):
+        decoder = self.model.model
+        config = self.configs[row]
+        first_upper_layer = self.destination_layer + 1
+        hidden = destination
+        full_mask = create_attention_mask(hidden, cache[first_upper_layer])
+        sliding_mask = None
+        if decoder.swa_idx is not None:
+            sliding_mask = create_attention_mask(hidden, cache[first_upper_layer], window_size=decoder.sliding_window)
+        source = None
+        for index, (layer, layer_cache) in enumerate(
+            zip(decoder.layers[first_upper_layer:], cache[first_upper_layer:]),
+            start=first_upper_layer,
+        ):
+            mask = sliding_mask if layer.use_sliding else full_mask
+            hidden = layer(hidden, mask, cache=layer_cache)
+            if index == config.source_layer:
+                source = hidden
+        if source is None:
+            raise RuntimeError("recirculation source activation was not captured")
+        pending = PendingRecirculation(destination, source, token_position)
+        if not project_logits:
+            return None, pending
+        hidden = decoder.norm(hidden)
+        if self.model.args.tie_word_embeddings:
+            logits = decoder.embed_tokens.as_linear(hidden)
+        else:
+            logits = self.model.lm_head(hidden)
+        return logits, pending
+
+    def step_shared(self, token: mx.array, caches, pendings, *, project_logits: bool = True):
+        """Advance a token shared by candidates without changing batch-one math."""
+
+        if token.ndim == 1:
+            token = token[None, :]
+        if token.shape != (1, 1):
+            raise ValueError("shared grouped step requires one token with shape [1, 1]")
+        decoder = self.model.model
+        positions = [int(cache[decoder.fa_idx].size()) for cache in caches]
+        if len(set(positions)) != 1:
+            raise ValueError("grouped lower-stack sharing requires equal candidate cache lengths")
+        token_position = positions[0]
+        for runner, cache, pending in zip(self.runners, caches, pendings):
+            if pending is not None and pending.token_position != token_position - 1:
+                raise ValueError("pending token position does not precede the current cache position")
+            runner._recirculate_pending(cache, pending)
+        destination = self._run_shared_lower(token.astype(mx.int32), caches[0])
+        self._share_lower_cache(caches)
+        outputs = [
+            self._run_candidate_upper(
+                row,
+                destination,
+                cache,
+                token_position,
+                project_logits=project_logits,
+            )
+            for row, cache in enumerate(caches)
+        ]
+        logits = [item[0] for item in outputs]
+        next_pendings = [item[1] for item in outputs]
+        mx.eval(
+            *(value for value in logits if value is not None),
+            *(pending.destination for pending in next_pendings),
+            *(pending.source for pending in next_pendings),
+        )
+        return logits, next_pendings
+
+    def prefill(
+        self,
+        tokens: Sequence[int] | mx.array,
+        *,
+        caches=None,
+        pendings=None,
+        collect_logits: bool = False,
+    ):
+        if isinstance(tokens, mx.array):
+            tokens = tokens.reshape(-1).tolist()
+        tokens = list(tokens)
+        if not tokens:
+            raise ValueError("prefill requires at least one token")
+        caches = self.make_caches() if caches is None else caches
+        pendings = [None] * self.candidate_count if pendings is None else pendings
+        collected = [[] for _ in self.runners]
+        logits = None
+        for token_index, token in enumerate(tokens):
+            project_logits = collect_logits or token_index == len(tokens) - 1
+            logits, pendings = self.step_shared(
+                mx.array([[int(token)]], dtype=mx.int32),
+                caches,
+                pendings,
+                project_logits=project_logits,
+            )
+            if project_logits:
+                for row, value in enumerate(logits):
+                    collected[row].append(value)
+        return (
+            logits,
+            caches,
+            pendings,
+            [mx.concatenate(values, axis=1) for values in collected],
+        )
+
+    def prefill_from_snapshot(
+        self,
+        tokens: Sequence[int] | mx.array,
+        snapshot: MLXCandidateGroupSnapshot,
+        *,
+        collect_logits: bool = False,
+    ):
+        caches, pendings = self.restore(snapshot)
+        return self.prefill(
+            tokens,
+            caches=caches,
+            pendings=pendings,
+            collect_logits=collect_logits,
+        )
+
+    def generate(
+        self,
+        prompt: Sequence[int] | mx.array,
+        *,
+        max_new_tokens: int,
+        eos_token_id: int | None = None,
+    ) -> list[list[int]]:
+        if max_new_tokens < 0:
+            raise ValueError("max_new_tokens must be non-negative")
+        if max_new_tokens == 0:
+            return [[] for _ in self.runners]
+        logits, caches, pendings, _ = self.prefill(prompt)
+        continuations: list[list[int]] = [[] for _ in self.runners]
+        active = [True] * self.candidate_count
+        sharing_lower = True
+        for step_index in range(max_new_tokens):
+            token_values = [int(mx.argmax(value[:, -1, :], axis=-1).item()) for value in logits]
+            for row, value in enumerate(token_values):
+                if active[row]:
+                    continuations[row].append(value)
+                    if eos_token_id is not None and value == eos_token_id:
+                        active[row] = False
+            if step_index + 1 == max_new_tokens or not any(active):
+                break
+            can_share = all(active) and len(set(token_values)) == 1
+            if sharing_lower and can_share:
+                logits, pendings = self.step_shared(
+                    mx.array([[token_values[0]]], dtype=mx.int32), caches, pendings
+                )
+                continue
+            if sharing_lower:
+                self._detach_lower_caches(caches)
+                sharing_lower = False
+            next_logits = list(logits)
+            for row, runner in enumerate(self.runners):
+                if not active[row]:
+                    continue
+                next_logits[row], pendings[row] = runner.step(
+                    mx.array([[token_values[row]]], dtype=mx.int32),
+                    caches[row],
+                    pendings[row],
+                )
+            logits = next_logits
+            mx.eval(
+                *(logits[row] for row in range(self.candidate_count) if active[row]),
+                *(pendings[row].destination for row in range(self.candidate_count) if active[row]),
+                *(pendings[row].source for row in range(self.candidate_count) if active[row]),
+            )
+        return continuations
+
+
 __all__ = [
     "MAX_FORWARD_ERROR",
     "CompiledNormMix",
     "ForwardError",
+    "MLXCandidateGroupRecirculator",
+    "MLXCandidateGroupSnapshot",
     "MLXPrefillSnapshot",
     "MLXRecirculator",
     "PendingRecirculation",

@@ -397,6 +397,83 @@ def test_mlx_mixture_rejects_shapes_rejected_by_torch_reference():
         CompiledNormMix(config)(destination, source, config)
 
 
+def test_mlx_candidate_group_requires_a_shared_destination():
+    pytest.importorskip("mlx.core")
+    from recirculation.mlx_backend import MLXCandidateGroupRecirculator
+
+    model = SimpleNamespace(model=SimpleNamespace(layers=[object()] * 4))
+    configs = (
+        RecirculationConfig(source_layer=2, destination_layer=0, alpha=0.1),
+        RecirculationConfig(source_layer=3, destination_layer=1, alpha=0.1),
+    )
+    with pytest.raises(ValueError, match="share one destination"):
+        MLXCandidateGroupRecirculator(model, configs)
+
+
+def test_mlx_candidate_group_is_exact_for_shared_and_divergent_tokens():
+    mx = pytest.importorskip("mlx.core")
+    pytest.importorskip("mlx_lm")
+    from mlx_lm.models.llama import Model, ModelArgs
+
+    from recirculation.mlx_backend import (
+        CompiledNormMix,
+        MLXCandidateGroupRecirculator,
+        MLXRecirculator,
+        measure_forward_error,
+    )
+
+    mx.random.seed(9)
+    model = Model(
+        ModelArgs(
+            model_type="llama",
+            hidden_size=16,
+            num_hidden_layers=4,
+            intermediate_size=32,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            rms_norm_eps=1e-5,
+            vocab_size=32,
+            max_position_embeddings=64,
+        )
+    )
+    mx.eval(model.parameters())
+    configs = (
+        RecirculationConfig(source_layer=3, destination_layer=0, alpha=0.1),
+        RecirculationConfig(source_layer=2, destination_layer=0, alpha=0.2),
+    )
+    scalar_runners = [MLXRecirculator(model, config, CompiledNormMix(config)) for config in configs]
+    grouped = MLXCandidateGroupRecirculator(
+        model, configs, [CompiledNormMix(config) for config in configs]
+    )
+    tokens = [1, 2, 3, 4]
+    references = [runner.prefill(tokens, collect_logits=True) for runner in scalar_runners]
+    candidate = grouped.prefill(tokens, collect_logits=True)
+
+    for row, reference in enumerate(references):
+        measure_forward_error(reference[3], candidate[3][row]).require(limit=0)
+        measure_forward_error(reference[2].destination, candidate[2][row].destination).require(limit=0)
+        measure_forward_error(reference[2].source, candidate[2][row].source).require(limit=0)
+        for reference_cache, candidate_cache in zip(reference[1], candidate[1][row]):
+            for reference_value, candidate_value in zip(reference_cache.state, candidate_cache.state):
+                measure_forward_error(reference_value, candidate_value).require(limit=0)
+
+    grouped._detach_lower_caches(candidate[1])
+    for row, runner in enumerate(grouped.runners):
+        grouped_logits, grouped_pending = runner.step(
+            mx.array([[5 + row]], dtype=mx.int32),
+            candidate[1][row],
+            candidate[2][row],
+        )
+        reference_logits, reference_pending = scalar_runners[row].step(
+            mx.array([[5 + row]], dtype=mx.int32),
+            references[row][1],
+            references[row][2],
+        )
+        measure_forward_error(reference_logits, grouped_logits).require(limit=0)
+        measure_forward_error(reference_pending.destination, grouped_pending.destination).require(limit=0)
+        measure_forward_error(reference_pending.source, grouped_pending.source).require(limit=0)
+
+
 @pytest.mark.parametrize(
     ("destination_values", "source_values"),
     (

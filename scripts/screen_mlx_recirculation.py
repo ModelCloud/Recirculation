@@ -18,7 +18,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 from recirculation import RecirculationConfig
-from recirculation.mlx_backend import CompiledNormMix, MLXRecirculator
+from recirculation.mlx_backend import CompiledNormMix, MLXCandidateGroupRecirculator
 from scripts.eval_gsm8k_platinum import _gold_answer, _prompt_ids, _task_contract
 
 
@@ -48,6 +48,19 @@ def _overlaps(left, right):
     return left[0] < right[1] and right[0] < left[1]
 
 
+def _candidate_batches(candidates, batch_size):
+    """Keep one destination per MLX batch while preserving candidate order."""
+
+    by_destination = {}
+    for candidate in candidates:
+        by_destination.setdefault(candidate[1], []).append(candidate)
+    return [
+        group[start : start + batch_size]
+        for group in by_destination.values()
+        for start in range(0, len(group), batch_size)
+    ]
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True)
@@ -63,8 +76,16 @@ def main() -> int:
     parser.add_argument("--alpha", action="append", type=float, default=None)
     parser.add_argument("--path", action="append", type=_parse_path, default=None)
     parser.add_argument("--max-distance", type=int, default=12)
+    parser.add_argument(
+        "--candidate-batch-size",
+        type=int,
+        default=8,
+        help="Evaluate this many same-destination candidates in each exact MLX shared-lower group.",
+    )
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
+    if args.candidate_batch_size < 1:
+        parser.error("candidate-batch-size must be positive")
     tuning_range = (args.row_start, args.row_start + args.rows)
     forbidden_ranges = args.forbid_range or []
     overlaps = [interval for interval in forbidden_ranges if _overlaps(tuning_range, interval)]
@@ -93,37 +114,48 @@ def main() -> int:
         ]
     alphas = args.alpha or [0.1]
     candidates = [(source, destination, alpha) for source, destination in paths for alpha in alphas]
+    candidate_batches = _candidate_batches(candidates, args.candidate_batch_size)
     results = []
     started = time.perf_counter()
-    for candidate_index, (source, destination, alpha) in enumerate(candidates):
-        config = RecirculationConfig(source_layer=source, destination_layer=destination, alpha=alpha)
-        runner = MLXRecirculator(model, config, CompiledNormMix(config))
-        _, cache, pending, _ = runner.prefill(prefix)
-        snapshot = runner.snapshot(cache, pending)
-        total_nll = 0.0
-        answer_tokens = 0
+    completed = 0
+    for candidate_batch in candidate_batches:
+        configs = [
+            RecirculationConfig(source_layer=source, destination_layer=destination, alpha=alpha)
+            for source, destination, alpha in candidate_batch
+        ]
+        runner = MLXCandidateGroupRecirculator(model, configs, [CompiledNormMix(config) for config in configs])
+        _, caches, pendings, _ = runner.prefill(prefix)
+        snapshot = runner.snapshot(caches, pendings)
+        total_nll = [0.0] * len(candidate_batch)
+        answer_tokens = [0] * len(candidate_batch)
         for context, answer_ids in contexts:
-            logits, cache, pending, _ = runner.prefill_from_snapshot(context, snapshot)
+            logits, caches, pendings, _ = runner.prefill_from_snapshot(context, snapshot)
             for token_index, token in enumerate(answer_ids):
-                token_logits = logits[0, -1].astype(mx.float32)
-                total_nll += float((mx.logsumexp(token_logits) - token_logits[int(token)]).item())
-                answer_tokens += 1
+                losses = [
+                    mx.logsumexp(value[0, -1].astype(mx.float32)) - value[0, -1, int(token)].astype(mx.float32)
+                    for value in logits
+                ]
+                mx.eval(*losses)
+                for candidate_index, loss in enumerate(losses):
+                    total_nll[candidate_index] += float(loss.item())
+                    answer_tokens[candidate_index] += 1
                 if token_index + 1 < len(answer_ids):
-                    logits, pending = runner.step(
-                        mx.array([[int(token)]], dtype=mx.int32), cache, pending
+                    logits, pendings = runner.step_shared(
+                        mx.array([[int(token)]], dtype=mx.int32), caches, pendings
                     )
-                    mx.eval(logits, pending.destination, pending.source)
-        result = {
-            "source_layer": source,
-            "destination_layer": destination,
-            "alpha": alpha,
-            "answer_nll": total_nll / answer_tokens,
-            "answer_tokens": answer_tokens,
-        }
-        results.append(result)
-        if (candidate_index + 1) % 10 == 0 or candidate_index + 1 == len(candidates):
-            best = min(results, key=lambda item: item["answer_nll"])
-            print(f"candidates={candidate_index + 1}/{len(candidates)} best={best}", flush=True)
+        for candidate_index, (source, destination, alpha) in enumerate(candidate_batch):
+            results.append(
+                {
+                    "source_layer": source,
+                    "destination_layer": destination,
+                    "alpha": alpha,
+                    "answer_nll": total_nll[candidate_index] / answer_tokens[candidate_index],
+                    "answer_tokens": answer_tokens[candidate_index],
+                }
+            )
+        completed += len(candidate_batch)
+        best = min(results, key=lambda item: item["answer_nll"])
+        print(f"candidates={completed}/{len(candidates)} best={best}", flush=True)
     report = {
         "settings": {
             "split_role": "tuning",
@@ -134,6 +166,8 @@ def main() -> int:
             "common_prefix_tokens": common_length,
             "alphas": alphas,
             "max_distance": args.max_distance,
+            "candidate_batch_size": args.candidate_batch_size,
+            "candidate_batches": len(candidate_batches),
         },
         "seconds": time.perf_counter() - started,
         "results": sorted(results, key=lambda item: item["answer_nll"]),
