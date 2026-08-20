@@ -1,14 +1,15 @@
 # Compiled recirculation runner benchmark
 
-Warm workload: Llama 3.2 1B Instruct, SDPA, 128-token prompt, 16 generated
-tokens, two repetitions. Model load and compiler warmup are excluded from the
-reported decode timings.
+Workload: Llama 3.2 1B Instruct, SDPA, a prefetched 128-token prompt snapshot,
+and 16 incremental decode tokens. Model loading and prompt prefill are excluded.
 
 | Runner | Median throughput |
 |---|---:|
-| Eager CUDAConcurrentRunner | ~5.0 tok/s |
-| Compiled lower/upper stacks (`triton.cudagraphs=False`) | 11.17 tok/s |
+| Eager CUDAConcurrentRunner | 42.95 tok/s |
+| Compiled lower/upper stacks (`triton.cudagraphs=False`) | 109.65 tok/s |
 
-The compiled runner is approximately 2.2× faster in warm decode. Compilation
-has substantial one-time overhead, so it remains opt-in via
-`--cuda-compile-runner` and should be used for sufficiently large sweeps.
+The compiled runner is 2.55× faster in warm decode. Its first measured decode
+call took 12.96 seconds while Inductor compiled the dynamic shapes; subsequent
+calls took 0.146 and 0.141 seconds. CUDA sweeps enable it by default because the
+one-time cost is amortized over many rows. Use `--no-cuda-compile-runner` for
+short smoke/debug runs.

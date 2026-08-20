@@ -234,8 +234,9 @@ def main() -> int:
     )
     parser.add_argument(
         "--cuda-compile-runner",
-        action="store_true",
-        help="Compile recirculation lower/upper stacks with CUDA graph trees disabled.",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Compile recirculation lower/upper stacks with CUDA graph trees disabled (default: enabled).",
     )
     parser.add_argument(
         "--cuda-shared-prefix",
