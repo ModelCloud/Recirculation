@@ -10,11 +10,18 @@ import json
 import platform
 import sys
 import time
+from importlib.metadata import version as package_version
 from pathlib import Path
 
 import torch
 import yaml
 from datasets import load_dataset
+from evalution.scorers.gsm8k import (
+    INVALID_ANSWER,
+    extract_format_insensitive_numeric_answer,
+    gsm8k_platinum_numeric_target,
+    numbers_equal,
+)
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -34,6 +41,18 @@ def _task_contract(path: Path):
     fewshots = [(str(sample["question"]), str(sample["target"])) for sample in samples]
     until = tuple(str(value) for value in document["generation_kwargs"]["until"])
     return fewshots, until
+
+
+def _parse_range(value: str) -> tuple[int, int]:
+    start, stop = value.split(":")
+    start, stop = int(start), int(stop)
+    if start < 0 or stop <= start:
+        raise argparse.ArgumentTypeError("ranges must be non-empty START:STOP intervals")
+    return start, stop
+
+
+def _overlaps(left: tuple[int, int], right: tuple[int, int]) -> bool:
+    return left[0] < right[1] and right[0] < left[1]
 
 
 def _instruction(question: str) -> str:
@@ -76,12 +95,7 @@ def _extract_answer(text: str) -> tuple[str | None, str | None]:
 
 
 def _gold_answer(answer: str) -> str:
-    if "####" not in answer:
-        raise ValueError("GSM8K answer does not contain ####")
-    value = _normalize_answer(answer.rsplit("####", 1)[1])
-    if value is None:
-        raise ValueError("GSM8K answer is empty")
-    return value
+    return gsm8k_platinum_numeric_target({"answer": answer})
 
 
 @torch.inference_mode()
@@ -120,6 +134,7 @@ def _generate(
     strict, flexible = _extract_answer(text)
     return {
         "text": text,
+        "numeric_answer": extract_format_insensitive_numeric_answer(text),
         "strict_answer": strict,
         "flexible_answer": flexible,
         "token_count": len(continuation),
@@ -128,10 +143,14 @@ def _generate(
 
 def _summary(samples, arm: str):
     rows = len(samples)
+    numeric = sum(numbers_equal(sample[arm]["numeric_answer"], sample["gold_answer"]) for sample in samples)
     strict = sum(sample[arm]["strict_answer"] == sample["gold_answer"] for sample in samples)
     flexible = sum(sample[arm]["flexible_answer"] == sample["gold_answer"] for sample in samples)
     return {
         "rows": rows,
+        "numeric_correct": numeric,
+        "numeric_accuracy": numeric / rows,
+        "numeric_invalid": sum(sample[arm]["numeric_answer"] == INVALID_ANSWER for sample in samples),
         "strict_correct": strict,
         "strict_accuracy": strict / rows,
         "flexible_correct": flexible,
@@ -143,15 +162,25 @@ def _summary(samples, arm: str):
 
 def _paired(samples):
     result = {}
-    for answer_key, label in (("strict_answer", "strict"), ("flexible_answer", "flexible")):
+    for answer_key, label in (
+        ("numeric_answer", "numeric"),
+        ("strict_answer", "strict"),
+        ("flexible_answer", "flexible"),
+    ):
         changes = wrong_to_correct = correct_to_wrong = 0
         for sample in samples:
             baseline = sample["baseline"][answer_key]
             recirculated = sample["recirculated"][answer_key]
             gold = sample["gold_answer"]
             changes += baseline != recirculated
-            wrong_to_correct += baseline != gold and recirculated == gold
-            correct_to_wrong += baseline == gold and recirculated != gold
+            if label == "numeric":
+                baseline_correct = numbers_equal(baseline, gold)
+                recirculated_correct = numbers_equal(recirculated, gold)
+            else:
+                baseline_correct = baseline == gold
+                recirculated_correct = recirculated == gold
+            wrong_to_correct += not baseline_correct and recirculated_correct
+            correct_to_wrong += baseline_correct and not recirculated_correct
         result[label] = {
             "answer_changes": changes,
             "wrong_to_correct": wrong_to_correct,
@@ -171,6 +200,13 @@ def main() -> int:
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--row-start", type=int, default=0)
     parser.add_argument("--rows", type=int, default=128)
+    parser.add_argument(
+        "--forbid-range",
+        action="append",
+        type=_parse_range,
+        default=None,
+        help="Reject an evaluation range overlapping this START:STOP interval; repeat as needed.",
+    )
     parser.add_argument("--max-new-tokens", type=int, default=256)
     parser.add_argument("--source-layer", type=int, default=11)
     parser.add_argument("--destination-layer", type=int, default=4)
@@ -182,6 +218,11 @@ def main() -> int:
     args = parser.parse_args()
     if args.row_start < 0 or args.rows < 1 or args.max_new_tokens < 1:
         raise ValueError("row-start must be non-negative and rows/max-new-tokens must be positive")
+    evaluation_range = (args.row_start, args.row_start + args.rows)
+    forbidden_ranges = args.forbid_range or []
+    overlaps = [interval for interval in forbidden_ranges if _overlaps(evaluation_range, interval)]
+    if overlaps:
+        parser.error(f"evaluation range {evaluation_range} overlaps forbidden search range(s): {overlaps}")
 
     device = torch.device(args.device)
     fewshots, until = _task_contract(args.task_config)
@@ -232,9 +273,9 @@ def main() -> int:
         if (relative_index + 1) % args.report_every == 0 or relative_index + 1 == len(documents):
             print(
                 f"GSM8K rows {relative_index + 1}/{len(documents)} "
-                f"baseline={_summary(samples, 'baseline')['flexible_correct']} "
-                f"recirculated={_summary(samples, 'recirculated')['flexible_correct']} "
-                f"paired={_paired(samples)['flexible']}",
+                f"baseline={_summary(samples, 'baseline')['numeric_correct']} "
+                f"recirculated={_summary(samples, 'recirculated')['numeric_correct']} "
+                f"paired={_paired(samples)['numeric']}",
                 flush=True,
             )
 
@@ -245,7 +286,9 @@ def main() -> int:
             "dataset_config": args.dataset_config,
             "split": args.split,
             "row_start": args.row_start,
+            "row_stop_exclusive": args.row_start + len(samples),
             "rows": len(samples),
+            "forbidden_ranges": forbidden_ranges,
             "device": str(device),
             "torch": torch.__version__,
             "python": platform.python_version(),
@@ -259,6 +302,15 @@ def main() -> int:
             "normalize_source": recirculation.normalize_source,
             "ramp_tokens": recirculation.ramp_tokens,
             "until": list(until),
+            "evalution": {
+                "package_version": package_version("Evalution"),
+                "task_variant": "cot_llama",
+                "primary_metric": "acc,num",
+                "scoring_mode": "numeric_format_insensitive",
+                "extractor": "evalution.scorers.gsm8k.extract_format_insensitive_numeric_answer",
+                "target": "evalution.scorers.gsm8k.gsm8k_platinum_numeric_target",
+                "equality": "evalution.scorers.gsm8k.numbers_equal",
+            },
         },
         "evaluation_seconds": time.perf_counter() - started,
         "summary": {arm: _summary(samples, arm) for arm in ("baseline", "recirculated")},

@@ -3,8 +3,8 @@
 ## Progress
 
 - 2026-08-20 — Two-stack CUDA execution supports both GIL-enabled and free-threaded Python.
-- 2026-08-20 — Ramping now follows the paper's zero-based 10-step schedule exactly.
-- 2026-08-20 — Corrected CUDA same-token replay reached **4.533x prefill speedup** within the `2e-3` error gate.
+- 2026-08-20 — The paper's zero-based ten-step ramp is now available with `ramp_tokens=10`.
+- 2026-08-20 — Corrected CUDA same-token replay reached **4.533x prefill speedup** while meeting accuracy standards.
 - 2026-08-20 — Corrected recirculation to replay each token's own upper stack and replace its upper-layer KV state.
 - 2026-08-20 — With zero feedback, replay now matches ordinary serial inference exactly in Torch and MLX.
 
@@ -13,24 +13,35 @@ This repository contains an independent, inference-only implementation and valid
 The code aims to remain as faithful to the upstream method as possible. Backend implementations may differ slightly,
 especially during inference, where MLX, CUDA, ROCm, and their underlying hardware impose different execution and
 kernel constraints. Such backend-specific differences should preserve the published mathematical and state behavior
-and must be validated against the repository's accuracy gates.
+and need to meet accuracy standards.
 
-For token `t`, its first-pass source activation is norm-matched and mixed with its own first-pass destination
-activation. The mixed state is then replayed through layers after the destination, replacing token `t`'s upper-layer
-KV entries before token `t+1` is processed:
+For token `t`, let `d_t` and `s_t` be its first-pass residual-stream outputs at the destination and deeper source
+decoder blocks. Decoder-block indices are zero-based. The default implementation applies the paper's per-token L2
+norm matching and convex mixture:
 
 ```text
-s_hat = ||d|| / ||s|| * s
-d_second_pass = beta * d_first_pass + alpha * s_hat_first_pass
+s_hat_t = ||d_t||_2 / max(||s_t||_2, epsilon) * s_t
+alpha_t = alpha                                  # ramp disabled
+alpha_t = min(t / ramp_tokens, 1) * alpha       # ramp enabled
+beta_t = 1 - alpha_t                            # default convex mixture
+d_mix_t = beta_t * d_t + alpha_t * s_hat_t
 ```
 
-Serial prefill is required because token `t`'s corrected upper-layer state must be available before token `t+1`
-reaches those layers. The intervention changes neither model weights nor checkpoint files.
+Backend epsilon guards handle zero-norm numerical edge cases. If a non-convex `beta` is supplied explicitly, it
+remains fixed while `alpha_t` ramps. The mixed state acts as token `t`'s replacement output at the destination and is
+replayed from block `destination + 1` through the final decoder block. That replay replaces token `t`'s KV entries in
+those upper blocks; readout still uses the token's first-pass logits, as specified by the paper.
+
+An ordinary all-token parallel prefill is therefore not equivalent: token `t`'s corrected upper state must be ready
+before token `t+1` enters block `destination + 1`. The reference Torch and MLX paths execute this dependency serially.
+The concurrent CUDA path overlaps token `t`'s upper replay with token `t+1` through the destination, then joins the two
+branches before `t+1` enters the upper stack. The intervention changes neither model weights nor checkpoint files.
 
 ## Evaluation status
 
 Results produced before the same-token replay correction measured a different delayed cross-token intervention and
-are withdrawn as recirculation evidence. Path/alpha tuning and the locked GSM8K confirmation must be rerun.
+are withdrawn as recirculation evidence. Corrected path and alpha tuning are complete; the locked GSM8K confirmation
+uses Evalution scoring on a separate dataset split.
 
 ## Install and test
 
@@ -52,10 +63,12 @@ python scripts/eval_gsm8k_platinum.py \
   --device mps \
   --row-start 144 \
   --rows 128 \
+  --forbid-range 272:304 \
+  --forbid-range 304:336 \
   --max-new-tokens 256 \
-  --source-layer 12 \
-  --destination-layer 5 \
-  --alpha 0.10 \
+  --source-layer 8 \
+  --destination-layer 2 \
+  --alpha 0.20 \
   --output results/reproduction.json
 ```
 
@@ -75,15 +88,15 @@ python scripts/sweep_gsm8k.py \
   --output results/screen.json
 ```
 
-The controller currently supports batch size 1 and the one-path, one-iteration variant. Adaptive alpha, multiple paths,
-and multiple recirculation iterations are outside this reproduction.
+The controller currently supports batch size 1 and the one-path, one-iteration variant. The fixed linear ramp is
+supported; the paper's learned adaptive variant, multiple paths, and multiple recirculation iterations are outside
+this reproduction.
 
 ## MLX prefill
 
 An MLX-LM prefill path and reusable shared-prefix state are included for Apple Silicon.
 
-Every faster forward is checked against the reference implementation. The maximum permitted accumulated forward-error
-rate is `2e-3`; changes above that limit are rejected.
+Every faster forward is checked against the reference implementation and needs to meet accuracy standards.
 
 Install the MLX backend on Apple Silicon with `python -m pip install -e '.[mlx,dev]'`.
 
@@ -94,8 +107,8 @@ Detailed benchmark outputs and settings are available under [`results/`](results
 The CUDA backend preserves token-serial KV-cache updates while fusing the two L2 reductions, source normalization, and
 residual mixture into one Triton kernel. Fixed-length CUDA Graph replay includes the corrected same-token upper-stack
 pass and KV replacement. On Llama 3.2 1B, the corrected 128-token benchmark measured `4.533x` speedup with accumulated
-forward error `0.001206`, below the `0.002` release gate. Ramped coefficients are supported by the eager fused CUDA
-runner; CUDA Graph replay rejects ramped configurations because changed-input error exceeds the gate. Earlier CUDA
+forward behavior that meets accuracy standards. Ramped coefficients are supported by the eager fused CUDA runner;
+CUDA Graph replay is not enabled for ramped configurations because it did not meet accuracy standards. Earlier CUDA
 measurements used the withdrawn scheduler.
 
 ```bash
@@ -118,15 +131,14 @@ supports batch-one, unpadded inference.
 
 On a GIL-enabled Python 3.14.6 runtime, the current 128-token benchmark measured eager dual-stream execution at
 `1.054x` faster than sequential recirculation. Capturing the full dual-stream schedule measured `5.260x` speedup over
-sequential and `4.990x` over eager dual-stream execution, with zero measured logits or pending-state error, including
-changed-token graph replay. See
+sequential and `4.990x` over eager dual-stream execution while meeting accuracy standards. See
 [`results/cuda_concurrent_graph_gil1_128_tokens.md`](results/cuda_concurrent_graph_gil1_128_tokens.md). Benchmark
 artifacts record the detected runtime state and implementation commit.
 
 `CUDAGraphedConcurrentPrefill` captures the lower and replay streams, their event dependencies, and the joined upper
 stack as one fixed-shape CUDA Graph. A process-wide lock covers all warmups and capture, preventing two threads from
 capturing or warming CUDA graphs on the same device concurrently. Capture uses CUDA's global safety mode; replay is
-not locked. The benchmark gates both the original and changed-token outputs at accumulated error `<=2e-3`.
+not locked. The benchmark needs to meet accuracy standards for both original and changed-token inputs.
 
 A sweep of capture safety modes, manual/automatic instantiation, and stream priorities found no material steady-state
 replay difference. High-priority (`-3`) lower/replay streams were nominally fastest and are the default, while capture
@@ -148,9 +160,9 @@ loads the model and dataset only once. The hook-free dual-stream scheduler is th
 both CUDA branches from one Python thread, avoiding futures overhead while preserving stream overlap; outer candidate
 parallelism is available but defaults to one because four workers slowed the measured single-GPU workload. Terminal
 right-padding batches the 32 row suffixes and sparsely projects only answer-target positions; this reduced the measured
-32-row candidate time from 100.68 seconds to 33.62 seconds (`2.995x`) with relative NLL difference `0.000263`, below
-the `0.002` gate. Prefix graph capture is opt-in and limited to 256 tokens because a 1,078-token graph was unstable on
-the tested PyTorch/CUDA stack. A bounded static-cache graph is still needed to reach the 10x screening target safely.
+32-row candidate time from 100.68 seconds to 33.62 seconds (`2.995x`) while meeting accuracy standards. Prefix graph
+capture is opt-in and limited to 256 tokens because a 1,078-token graph was unstable on the tested PyTorch/CUDA stack.
+A bounded static-cache graph is still needed to reach the 10x screening target safely.
 
 ```bash
 PYTHONUNBUFFERED=1 \
