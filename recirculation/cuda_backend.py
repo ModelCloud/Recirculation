@@ -484,9 +484,14 @@ class CUDAGraphedConcurrentPrefill:
         example_tokens: torch.Tensor,
         *,
         warmups: int = 3,
+        capture_error_mode: str = "global",
+        keep_graph: bool = False,
+        capture_stream_priority: int = 0,
     ):
         if warmups < 1:
             raise ValueError("concurrent CUDA graph capture requires at least one warmup")
+        if capture_error_mode not in {"global", "thread_local", "relaxed"}:
+            raise ValueError("capture_error_mode must be global, thread_local, or relaxed")
         if runner.config.ramp_tokens:
             raise ValueError(
                 "concurrent CUDA graph replay with ramp_tokens is disabled until changed-input accuracy is gated"
@@ -497,8 +502,11 @@ class CUDAGraphedConcurrentPrefill:
             raise ValueError("concurrent graph capture requires tokens with shape [sequence] or [1, sequence]")
         self.runner = runner
         self.static_tokens = example_tokens.to(device=runner.device, dtype=torch.long).clone()
-        self.capture_stream = torch.cuda.Stream(device=runner.device)
-        self.graph = torch.cuda.CUDAGraph()
+        self.capture_error_mode = capture_error_mode
+        self.keep_graph = keep_graph
+        self.capture_stream_priority = capture_stream_priority
+        self.capture_stream = torch.cuda.Stream(device=runner.device, priority=capture_stream_priority)
+        self.graph = torch.cuda.CUDAGraph(keep_graph=keep_graph)
 
         LOG.info.once(
             "Serializing two-stream CUDA Graph warmup and capture with the process-wide capture lock."
@@ -514,9 +522,11 @@ class CUDAGraphedConcurrentPrefill:
             with torch.cuda.graph(
                 self.graph,
                 stream=self.capture_stream,
-                capture_error_mode="global",
+                capture_error_mode=capture_error_mode,
             ):
                 self.outputs = runner.prefill(self.static_tokens)
+            if keep_graph:
+                self.graph.instantiate()
             torch.cuda.synchronize(runner.device)
 
     @torch.inference_mode()
