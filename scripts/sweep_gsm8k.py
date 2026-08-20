@@ -202,6 +202,12 @@ def main() -> int:
         raise ValueError("row-start must be non-negative and rows must be positive")
 
     device = torch.device(args.device)
+    # CUDA evaluation must use fused SDPA/Flash attention.  Eager attention
+    # dispatches every attention operation through Python and was the dominant
+    # reason this accuracy sweep was slower than the MLX evaluator.
+    attn_implementation = "sdpa" if device.type == "cuda" else "eager"
+    if device.type == "cuda":
+        torch.set_float32_matmul_precision("high")
     fewshots, until = _task_contract(args.task_config)
     dataset = load_dataset(args.dataset, name=args.dataset_config, split="test")
     stop = min(args.row_start + args.rows, len(dataset))
@@ -215,7 +221,7 @@ def main() -> int:
         AutoModelForCausalLM.from_pretrained(
             args.model,
             dtype=torch.float16,
-            attn_implementation="eager",
+            attn_implementation=attn_implementation,
         )
         .eval()
         .to(device)
@@ -396,6 +402,7 @@ def main() -> int:
             "row_start": args.row_start,
             "rows": args.rows,
             "device": str(device),
+            "attn_implementation": attn_implementation,
             "max_new_tokens": args.max_new_tokens,
             "fewshot_count": len(fewshots),
             "candidates": [list(candidate) for candidate in args.candidate],
