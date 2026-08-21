@@ -634,7 +634,11 @@ def main() -> int:
                 args.scheduler,
                 args.python_threads,
                 args.row_batch_size,
-                int(tokenizer.pad_token_id or tokenizer.eos_token_id),
+                int(
+                    tokenizer.pad_token_id
+                    if tokenizer.pad_token_id is not None
+                    else tokenizer.eos_token_id
+                ),
                 args.graph_prefix,
             )
             native_nll = native.pop("row_nll_totals")
@@ -743,7 +747,11 @@ def main() -> int:
                 args.scheduler,
                 args.python_threads,
                 args.row_batch_size,
-                int(tokenizer.pad_token_id or tokenizer.eos_token_id),
+                int(
+                    tokenizer.pad_token_id
+                    if tokenizer.pad_token_id is not None
+                    else tokenizer.eos_token_id
+                ),
                 args.graph_prefix,
             ): candidate
             for candidate in remaining_candidates
