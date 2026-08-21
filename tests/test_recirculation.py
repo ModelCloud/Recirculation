@@ -755,6 +755,13 @@ class _ReplayModel(nn.Module):
         self.model = _ReplayDecoder()
 
 
+class _LanguageModelWrapper(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.language_model = nn.Module()
+        self.language_model.model = _ReplayDecoder()
+
+
 class _CacheLayer:
     def __init__(self, length):
         self.length = length
@@ -809,6 +816,84 @@ def test_controller_runs_additional_top_stack_iteration_and_rewinds_only_top_sta
     assert torch.equal(model.model.layers[1].last_input, torch.full((1, 1, 2), 3.5))
     assert torch.equal(model.model.layers[2].last_input, torch.full((1, 1, 2), 5.5))
     assert controller._pending_first_iteration is None
+
+
+def test_controller_replay_uses_the_decoder_that_exposed_the_layers():
+    model = _LanguageModelWrapper()
+    decoder = model.language_model.model
+    controller = RecirculationController(
+        model,
+        RecirculationConfig(source_layer=2, destination_layer=0, alpha=0.5, beta=0.5, normalize_source=False),
+    )
+    controller._first_iteration_destination = torch.ones(1, 1, 2)
+    controller._capture_first_iteration_source(decoder.layers[2], (), (torch.full((1, 1, 2), 6.0),))
+    cache = _ReplayCache(decoder.layers, length=1)
+
+    controller._run_pending_top_stack_iteration(cache, torch.ones(1, 1, dtype=torch.long))
+
+    assert torch.equal(decoder.layers[1].last_input, torch.full((1, 1, 2), 3.5))
+
+
+def test_controller_validates_padding_before_mutating_the_replay_cache():
+    model = _ReplayModel()
+    controller = RecirculationController(
+        model,
+        RecirculationConfig(source_layer=2, destination_layer=0, alpha=0.5, beta=0.5, normalize_source=False),
+    )
+    controller._first_iteration_destination = torch.ones(1, 1, 2)
+    controller._capture_first_iteration_source(model.model.layers[2], (), (torch.full((1, 1, 2), 6.0),))
+    cache = _ReplayCache(model.model.layers, length=2)
+
+    with pytest.raises(ValueError, match="requires an unpadded attention mask"):
+        controller.generate(
+            torch.tensor([[1, 0]]),
+            attention_mask=torch.tensor([[1, 0]]),
+            max_new_tokens=0,
+        )
+    controller._first_iteration_destination = torch.ones(1, 1, 2)
+    controller._capture_first_iteration_source(model.model.layers[2], (), (torch.full((1, 1, 2), 6.0),))
+    with pytest.raises(ValueError, match="requires an unpadded batch"):
+        controller._run_pending_top_stack_iteration(cache, torch.tensor([[1, 0]]))
+
+    assert [layer.length for layer in cache.layers] == [2, 2, 2]
+
+
+def test_controller_rejects_non_terminal_padding_before_mutating_the_replay_cache():
+    model = _ReplayModel()
+    controller = RecirculationController(
+        model,
+        RecirculationConfig(source_layer=2, destination_layer=0, alpha=0.5, beta=0.5, normalize_source=False),
+        allow_terminal_padding=True,
+    )
+    controller._first_iteration_destination = torch.ones(1, 1, 2)
+    controller._capture_first_iteration_source(model.model.layers[2], (), (torch.full((1, 1, 2), 6.0),))
+    cache = _ReplayCache(model.model.layers, length=3)
+
+    with pytest.raises(ValueError, match="real token after padding"):
+        controller._run_pending_top_stack_iteration(cache, torch.tensor([[1, 0, 1]]))
+
+    assert [layer.length for layer in cache.layers] == [3, 3, 3]
+
+
+@pytest.mark.parametrize(
+    "mixed",
+    (None, torch.zeros(1, 2, 2), torch.zeros(1, 1, 2, dtype=torch.float64)),
+)
+def test_controller_rejects_invalid_mixer_outputs_before_mutating_the_replay_cache(mixed):
+    model = _ReplayModel()
+    controller = RecirculationController(
+        model,
+        RecirculationConfig(source_layer=2, destination_layer=0),
+        mixer=lambda *_args: mixed,
+    )
+    controller._first_iteration_destination = torch.ones(1, 1, 2)
+    controller._capture_first_iteration_source(model.model.layers[2], (), (torch.full((1, 1, 2), 6.0),))
+    cache = _ReplayCache(model.model.layers, length=1)
+
+    with pytest.raises((TypeError, ValueError), match="mixer must"):
+        controller._run_pending_top_stack_iteration(cache, torch.ones(1, 1, dtype=torch.long))
+
+    assert [layer.length for layer in cache.layers] == [1, 1, 1]
 
 
 def test_controller_ramp_forwards_zero_based_input_step_to_mixer():

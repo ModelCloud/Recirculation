@@ -221,20 +221,28 @@ class RecirculationController:
 
         alpha_t, beta_t = _mixing_coefficients(self.config, input_step)
         if self._mixer is not None:
-            return self._mixer(
+            mixed = self._mixer(
                 destination_residual,
                 source_residual,
                 alpha_t,
                 beta_t,
                 self.config.normalize_source,
             )
-        return torch_mix_reference(
-            destination_residual,
-            source_residual,
-            alpha_t,
-            beta_t,
-            self.config.normalize_source,
-        )
+        else:
+            mixed = torch_mix_reference(
+                destination_residual,
+                source_residual,
+                alpha_t,
+                beta_t,
+                self.config.normalize_source,
+            )
+        if not torch.is_tensor(mixed):
+            raise TypeError("Recirculation mixer must return a tensor.")
+        if mixed.shape != destination_residual.shape:
+            raise ValueError("Recirculation mixer must preserve the destination shape.")
+        if mixed.device != destination_residual.device or mixed.dtype != destination_residual.dtype:
+            raise ValueError("Recirculation mixer must preserve the destination device and dtype.")
+        return mixed
 
     def _capture_first_iteration_source(self, _module: nn.Module, _args: tuple[Any, ...], output: Any):
         """Complete the first-iteration state captured for the current input step."""
@@ -271,8 +279,6 @@ class RecirculationController:
         if sequence_length < 1:
             raise RuntimeError("cannot recirculate an empty KV cache")
         top_stack_start = self.config.destination_layer + 1
-        for layer in past_key_values.layers[top_stack_start:]:
-            layer.crop(-1)
         hidden_states = self._compute_recirculated_destination(
             first_iteration_state.destination_residual,
             first_iteration_state.source_residual,
@@ -282,12 +288,26 @@ class RecirculationController:
         position_ids = torch.full((1, 1), sequence_length - 1, dtype=torch.long, device=hidden_states.device)
         capturing = hidden_states.is_cuda and torch.cuda.is_current_stream_capturing()
         if (
-            not capturing
-            and not self._allow_terminal_padding
-            and not bool(attention_mask[:, :sequence_length].all())
+            attention_mask.ndim != 2
+            or attention_mask.shape[0] != hidden_states.shape[0]
+            or attention_mask.shape[1] < sequence_length
         ):
-            raise ValueError("paper-faithful additional iteration currently requires an unpadded batch")
+            raise ValueError("attention_mask must cover the replay batch and complete KV cache")
+        if attention_mask.device != hidden_states.device:
+            raise ValueError("attention_mask must be on the same device as the replay residuals")
+        replay_attention_mask = attention_mask[:, :sequence_length]
+        if not capturing:
+            if not bool(((replay_attention_mask == 0) | (replay_attention_mask == 1)).all()):
+                raise ValueError("attention_mask must contain only zeros and ones")
+            if self._allow_terminal_padding:
+                if bool((replay_attention_mask[:, 1:] > replay_attention_mask[:, :-1]).any()):
+                    raise ValueError("terminal padding masks cannot contain a real token after padding begins")
+            elif not bool(replay_attention_mask.all()):
+                raise ValueError("paper-faithful additional iteration currently requires an unpadded batch")
         position_embeddings = decoder.rotary_emb(hidden_states, position_ids=position_ids)
+        # All validation must complete before the cache is shortened.
+        for layer in past_key_values.layers[top_stack_start:]:
+            layer.crop(-1)
         self._in_additional_iteration = True
         try:
             for layer in decoder.layers[top_stack_start:]:
@@ -347,6 +367,10 @@ class RecirculationController:
             attention_mask = torch.ones_like(input_ids)
         if attention_mask.shape != input_ids.shape:
             raise ValueError("attention_mask must have the same shape as input_ids.")
+        if attention_mask.device != input_ids.device:
+            raise ValueError("attention_mask must be on the same device as input_ids.")
+        if not bool((attention_mask == 1).all()):
+            raise ValueError("Recirculation generation requires an unpadded attention mask.")
         was_active = self._active
         if not was_active:
             self.attach()
