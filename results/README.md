@@ -1,5 +1,9 @@
 # Result validity
 
+The completed Qwen3-8B C4+PG19 staged CUDA path search at alpha 0.05 is recorded in
+[`qwen3_8b_c4_pg19_path_search_alpha005_b03a904.md`](qwen3_8b_c4_pg19_path_search_alpha005_b03a904.md). It preserves
+the implementation commit, run configuration, stage leaders, both final selection objectives, and every Stage 3 score.
+
 Artifacts dated before the 2026-08-20 same-token replay correction are retained for historical comparison only.
 They measured a delayed cross-token activation intervention and must not be cited as recirculation results.
 
