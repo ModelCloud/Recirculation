@@ -700,6 +700,51 @@ def test_mlx_candidate_group_is_exact_for_shared_and_divergent_tokens():
         measure_forward_error(reference_pending.source, grouped_pending.source).require(limit=0)
 
 
+def test_mlx_candidate_group_snapshot_generation_matches_full_prompt():
+    mx = pytest.importorskip("mlx.core")
+    pytest.importorskip("mlx_lm")
+    from mlx_lm.models.llama import Model, ModelArgs
+
+    from recirculation.mlx_backend import CompiledNormMix, MLXCandidateGroupRecirculator
+
+    mx.random.seed(15)
+    model = Model(
+        ModelArgs(
+            model_type="llama",
+            hidden_size=16,
+            num_hidden_layers=4,
+            intermediate_size=32,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            rms_norm_eps=1e-5,
+            vocab_size=32,
+            max_position_embeddings=64,
+        )
+    )
+    mx.eval(model.parameters())
+    configs = (
+        RecirculationConfig(source_layer=3, destination_layer=0, alpha=0.1),
+        RecirculationConfig(source_layer=2, destination_layer=0, alpha=0.2),
+    )
+    grouped = MLXCandidateGroupRecirculator(
+        model,
+        configs,
+        [CompiledNormMix(config) for config in configs],
+    )
+    prompt = [1, 2, 3, 4]
+    expected = grouped.generate(prompt, max_new_tokens=4, eos_token_id=None)
+    _, caches, pendings, _ = grouped.prefill(prompt[:2])
+    snapshot = grouped.snapshot(caches, pendings)
+    candidate = grouped.generate_from_snapshot(
+        prompt[2:],
+        snapshot,
+        max_new_tokens=4,
+        eos_token_id=None,
+    )
+
+    assert candidate == expected
+
+
 def test_mlx_qwen3_candidate_group_auto_uses_exact_dual_gemv():
     mx = pytest.importorskip("mlx.core")
     pytest.importorskip("mlx_lm")

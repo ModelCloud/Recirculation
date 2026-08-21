@@ -17,6 +17,7 @@ independently verified.
 
 ## Progress
 
+- 2026-08-21 — Qwen3-8B MLX evaluation reached 1.82x faster prompt processing by reusing fixed prompt prefixes.
 - 2026-08-21 — Qwen3-8B MLX recirculation reached 1.57x faster prefill with matching outputs.
 - 2026-08-21 — Qwen3-8B recirculation now runs faster on Torch/MPS and MLX, with MLX preferred on Apple Silicon.
 - 2026-08-21 — Torch/CUDA inference and path/alpha screening now support Qwen3, including its intentional no-BOS
@@ -163,6 +164,9 @@ python scripts/eval_gsm8k_platinum.py \
 
 The baseline uses ordinary backend-native generation. The intervention arm uses the same model, tokenizer, prompts,
 greedy decoding settings, and row order, but performs paper-faithful serial prefill.
+
+On MLX, evaluation automatically snapshots the exact token prefix shared by all selected prompts and restores it for
+each row. This avoids repeatedly processing fixed few-shot examples without changing generated outputs.
 
 Multiple same-destination candidates can share one baseline and their common lower-layer work:
 

@@ -651,6 +651,48 @@ class MLXCandidateGroupRecirculator:
         if max_new_tokens == 0:
             return [[] for _ in self.runners]
         logits, caches, pendings, _ = self.prefill(prompt)
+        return self._generate_from_state(
+            logits,
+            caches,
+            pendings,
+            max_new_tokens=max_new_tokens,
+            eos_token_id=eos_token_id,
+        )
+
+    def generate_from_snapshot(
+        self,
+        suffix: Sequence[int] | mx.array,
+        snapshot: MLXCandidateGroupSnapshot,
+        *,
+        max_new_tokens: int,
+        eos_token_id: int | None = None,
+    ) -> list[list[int]]:
+        """Generate after an exact shared-prefix snapshot without recomputing it."""
+
+        if max_new_tokens < 0:
+            raise ValueError("max_new_tokens must be non-negative")
+        if max_new_tokens == 0:
+            return [[] for _ in self.runners]
+        logits, caches, pendings, _ = self.prefill_from_snapshot(suffix, snapshot)
+        return self._generate_from_state(
+            logits,
+            caches,
+            pendings,
+            max_new_tokens=max_new_tokens,
+            eos_token_id=eos_token_id,
+        )
+
+    def _generate_from_state(
+        self,
+        logits,
+        caches,
+        pendings,
+        *,
+        max_new_tokens: int,
+        eos_token_id: int | None,
+    ) -> list[list[int]]:
+        """Continue greedy generation from materialized per-candidate states."""
+
         continuations: list[list[int]] = [[] for _ in self.runners]
         active = [True] * self.candidate_count
         sharing_lower = True

@@ -189,6 +189,24 @@ def _prompt_ids(tokenizer, question: str, fewshots: list[tuple[str, str]]) -> li
     return [int(token) for token in tokenizer(rendered, add_special_tokens=False).input_ids]
 
 
+def _common_prefix_length(token_sequences, *, minimum_suffix_tokens: int = 0) -> int:
+    """Return the exact token-identical prefix while reserving each required suffix."""
+
+    if minimum_suffix_tokens < 0:
+        raise ValueError("minimum_suffix_tokens must be non-negative")
+    sequences = [list(sequence) for sequence in token_sequences]
+    if not sequences:
+        return 0
+    limit = min(len(sequence) - minimum_suffix_tokens for sequence in sequences)
+    if limit <= 0:
+        return 0
+    for index in range(limit):
+        token = sequences[0][index]
+        if any(sequence[index] != token for sequence in sequences[1:]):
+            return index
+    return limit
+
+
 def _normalize_answer(value: str | None) -> str | None:
     if value is None:
         return None
@@ -275,18 +293,62 @@ def _generate_cuda(runner, tokenizer, prompt_ids: list[int], device, max_new_tok
     return _generation_result(tokenizer, continuation, until)
 
 
-def _generate_mlx_baseline(model, tokenizer, prompt_ids: list[int], max_new_tokens: int, until):
+def _snapshot_mlx_baseline_prefix(model, prefix_ids: list[int]):
+    """Materialize a reusable MLX-LM KV snapshot for an exact token prefix."""
+
+    import mlx.core as mx
+    from mlx_lm.models.cache import make_prompt_cache
+
+    if not prefix_ids:
+        raise ValueError("baseline prefix snapshot requires at least one token")
+    cache = make_prompt_cache(model)
+    logits = model(mx.array([prefix_ids], dtype=mx.int32), cache=cache)
+    states = tuple(tuple(layer_cache.state) for layer_cache in cache)
+    mx.eval(logits, *(value for state in states for value in state))
+    return states
+
+
+def _restore_mlx_baseline_prefix(model, snapshot):
+    from mlx_lm.models.cache import make_prompt_cache
+
+    cache = make_prompt_cache(model)
+    if len(cache) != len(snapshot):
+        raise ValueError("baseline snapshot layer count differs from model cache")
+    for layer_cache, state in zip(cache, snapshot):
+        layer_cache.state = state
+    return cache
+
+
+def _generate_mlx_baseline(
+    model,
+    tokenizer,
+    prompt_ids: list[int],
+    max_new_tokens: int,
+    until,
+    *,
+    prefix_snapshot=None,
+):
     import mlx.core as mx
     from mlx_lm.generate import generate_step
 
+    if not prompt_ids:
+        raise ValueError("MLX baseline generation requires at least one prompt or suffix token")
     continuation = []
     prompt = mx.array(prompt_ids, dtype=mx.int32)
-    for token, _ in generate_step(prompt, model, max_tokens=max_new_tokens):
+    prompt_cache = None if prefix_snapshot is None else _restore_mlx_baseline_prefix(model, prefix_snapshot)
+    for token, _ in generate_step(prompt, model, max_tokens=max_new_tokens, prompt_cache=prompt_cache):
         value = int(token)
         continuation.append(value)
         if value == int(tokenizer.eos_token_id):
             break
     return _generation_result(tokenizer, continuation, until)
+
+
+def _generate_mlx_candidates(runner, prompt_ids, snapshot, max_new_tokens, eos_token_id):
+    kwargs = {"max_new_tokens": max_new_tokens, "eos_token_id": eos_token_id}
+    if snapshot is None:
+        return runner.generate(prompt_ids, **kwargs)
+    return runner.generate_from_snapshot(prompt_ids, snapshot, **kwargs)
 
 
 def _summary(samples, arm: str):
@@ -382,6 +444,11 @@ def main() -> int:
         default=8,
         help="Maximum same-destination candidates per exact MLX shared-lower group.",
     )
+    parser.add_argument(
+        "--no-mlx-shared-prefix",
+        action="store_true",
+        help="Disable exact cross-row MLX prefix snapshots for controlled performance comparisons.",
+    )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--report-every", type=int, default=8)
     args = parser.parse_args()
@@ -418,9 +485,17 @@ def main() -> int:
     tokenizer = Tokenicer.load(args.model, local_files_only=False)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
+    prompt_ids_by_row = [_prompt_ids(tokenizer, str(document["question"]), fewshots) for document in documents]
+    common_prefix_tokens = 0
+    if backend == "mlx" and not args.no_mlx_shared_prefix:
+        # Keep one token in every suffix because MLX-LM generation reads logits
+        # from the suffix's final prompt token.
+        common_prefix_tokens = _common_prefix_length(prompt_ids_by_row, minimum_suffix_tokens=1)
+    shared_prefix = prompt_ids_by_row[0][:common_prefix_tokens] if common_prefix_tokens else []
     device = torch.device(resolved_device) if backend != "mlx" else None
     candidate_runners = []
     mlx_batches = []
+    mlx_baseline_snapshot = None
     if backend == "mlx":
         from mlx_lm import load as load_mlx_model
 
@@ -430,7 +505,7 @@ def main() -> int:
         for batch in _candidate_batches(candidate_specs, args.candidate_batch_size):
             configs = [config for _, config in batch]
             runner = MLXCandidateGroupRecirculator(model, configs, [CompiledNormMix(config) for config in configs])
-            mlx_batches.append((batch, runner))
+            mlx_batches.append((batch, runner, None))
     else:
         model = AutoModelForCausalLM.from_pretrained(
             args.model,
@@ -447,28 +522,44 @@ def main() -> int:
 
     samples = []
     started = time.perf_counter()
+    if backend == "mlx" and shared_prefix:
+        mlx_baseline_snapshot = _snapshot_mlx_baseline_prefix(model, shared_prefix)
+        snapshotted_batches = []
+        for batch, runner, _ in mlx_batches:
+            _, caches, pendings, _ = runner.prefill(shared_prefix)
+            snapshotted_batches.append((batch, runner, runner.snapshot(caches, pendings)))
+        mlx_batches = snapshotted_batches
     print(
         f"Selected backend={backend} device={resolved_device} candidates={len(candidate_specs)} "
-        f"mlx_batches={len(mlx_batches) if backend == 'mlx' else 0}",
+        f"mlx_batches={len(mlx_batches) if backend == 'mlx' else 0} "
+        f"common_prefix_tokens={common_prefix_tokens}",
         flush=True,
     )
     try:
         for relative_index, document in enumerate(documents):
-            prompt_ids = _prompt_ids(tokenizer, str(document["question"]), fewshots)
+            prompt_ids = prompt_ids_by_row[relative_index]
             sample = {
                 "index": args.row_start + relative_index,
                 "question": str(document["question"]),
                 "gold_answer": _gold_answer(str(document["answer"])),
             }
             if backend == "mlx":
+                suffix_ids = prompt_ids[common_prefix_tokens:]
                 sample["baseline"] = _generate_mlx_baseline(
-                    model, tokenizer, prompt_ids, args.max_new_tokens, until
+                    model,
+                    tokenizer,
+                    suffix_ids,
+                    args.max_new_tokens,
+                    until,
+                    prefix_snapshot=mlx_baseline_snapshot,
                 )
-                for batch, runner in mlx_batches:
-                    continuations = runner.generate(
-                        prompt_ids,
-                        max_new_tokens=args.max_new_tokens,
-                        eos_token_id=int(tokenizer.eos_token_id),
+                for batch, runner, snapshot in mlx_batches:
+                    continuations = _generate_mlx_candidates(
+                        runner,
+                        suffix_ids,
+                        snapshot,
+                        args.max_new_tokens,
+                        int(tokenizer.eos_token_id),
                     )
                     for (arm, _), continuation in zip(batch, continuations):
                         sample[arm] = _generation_result(tokenizer, continuation, until)
@@ -551,6 +642,8 @@ def main() -> int:
             "candidates": candidate_settings,
             "candidate_batch_size": args.candidate_batch_size,
             "candidate_batches": len(mlx_batches) if backend == "mlx" else len(candidate_specs),
+            "common_prefix_tokens": common_prefix_tokens,
+            "shared_prefix_reuse": backend == "mlx" and common_prefix_tokens > 0,
             "until": list(until),
             "evalution": {
                 "package_version": package_version("Evalution"),

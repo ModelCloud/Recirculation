@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import sys
+from types import SimpleNamespace
 
 import pytest
 from evalution.benchmarks import gsm8k_platinum
@@ -11,6 +12,7 @@ from scripts.eval_gsm8k_platinum import (
     REPO_ROOT,
     _candidate_batches,
     _candidate_specs,
+    _common_prefix_length,
     _gold_answer,
     _instruction,
     _paired,
@@ -79,6 +81,79 @@ def test_candidate_matrix_batches_same_destination_paths_together():
     batches = _candidate_batches(specs, batch_size=8)
     assert len(batches) == 1
     assert [config.source_layer for _, config in batches[0]] == [8, 4]
+
+
+def test_common_prefix_requires_exact_tokens_and_reserves_a_suffix():
+    prompts = ([1, 2, 3, 4], [1, 2, 3, 7], [1, 2, 3, 9, 10])
+
+    assert _common_prefix_length(prompts) == 3
+    assert _common_prefix_length(prompts, minimum_suffix_tokens=1) == 3
+    assert _common_prefix_length(([1, 2, 3],), minimum_suffix_tokens=1) == 2
+    assert _common_prefix_length([], minimum_suffix_tokens=1) == 0
+    with pytest.raises(ValueError, match="must be non-negative"):
+        _common_prefix_length(prompts, minimum_suffix_tokens=-1)
+
+
+def test_mlx_baseline_prefix_snapshot_matches_full_prompt_generation():
+    mx = pytest.importorskip("mlx.core")
+    pytest.importorskip("mlx_lm")
+    from mlx_lm.models.llama import Model, ModelArgs
+
+    mx.random.seed(31)
+    model = Model(
+        ModelArgs(
+            model_type="llama",
+            hidden_size=16,
+            num_hidden_layers=2,
+            intermediate_size=32,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            rms_norm_eps=1e-5,
+            vocab_size=32,
+            max_position_embeddings=64,
+        )
+    )
+    mx.eval(model.parameters())
+
+    class Tokenizer:
+        eos_token_id = 31
+
+        @staticmethod
+        def decode(tokens, skip_special_tokens=True):
+            del skip_special_tokens
+            return " ".join(str(token) for token in tokens)
+
+    prompt = [1, 2, 3, 4]
+    expected = evaluation._generate_mlx_baseline(model, Tokenizer(), prompt, 4, ())
+    snapshot = evaluation._snapshot_mlx_baseline_prefix(model, prompt[:2])
+    candidate = evaluation._generate_mlx_baseline(
+        model,
+        Tokenizer(),
+        prompt[2:],
+        4,
+        (),
+        prefix_snapshot=snapshot,
+    )
+
+    assert candidate == expected
+
+
+def test_mlx_candidate_generation_dispatches_with_and_without_snapshot():
+    calls = []
+    runner = SimpleNamespace(
+        generate=lambda prompt, **kwargs: calls.append(("full", prompt, kwargs)) or [[1]],
+        generate_from_snapshot=lambda prompt, snapshot, **kwargs: calls.append(
+            ("snapshot", prompt, snapshot, kwargs)
+        )
+        or [[2]],
+    )
+
+    assert evaluation._generate_mlx_candidates(runner, [3], None, 4, 5) == [[1]]
+    assert evaluation._generate_mlx_candidates(runner, [7], "state", 8, 9) == [[2]]
+    assert calls == [
+        ("full", [3], {"max_new_tokens": 4, "eos_token_id": 5}),
+        ("snapshot", [7], "state", {"max_new_tokens": 8, "eos_token_id": 9}),
+    ]
 
 
 def test_explicit_candidates_preserve_path_specific_alphas():
