@@ -17,22 +17,17 @@ independently verified.
 
 ## Progress
 
-- 2026-08-21 — Qwen3-8B MLX evaluation reached 1.82x faster prompt processing by reusing fixed prompt prefixes.
-- 2026-08-21 — Qwen3-8B MLX recirculation reached 1.57x faster prefill with matching outputs.
-- 2026-08-21 — Qwen3-8B recirculation now runs faster on Torch/MPS and MLX, with MLX preferred on Apple Silicon.
-- 2026-08-21 — Torch/CUDA inference and path/alpha screening now support Qwen3, including its intentional no-BOS
-  tokenizer contract.
-- 2026-08-20 — MLX ran the matched short Apple M4 evaluation 2.86x faster than Torch/MPS.
-- 2026-08-20 — Evaluation now auto-selects CUDA or MLX and can compare same-destination candidates together.
-- 2026-08-20 — Torch is now the single reference for MLX and CUDA accuracy checks.
-- 2026-08-20 — Locked disjoint evaluation completed at 59/128 baseline and 67/128 with recirculation.
-- 2026-08-20 — CUDA screening jointly evaluates historical final-answer and full-solution perplexity, then applies
-  the real correct-to-wrong penalty during paired generation.
-- 2026-08-20 — Two-stack CUDA execution supports both GIL-enabled and free-threaded Python.
-- 2026-08-20 — The paper's zero-based ten-step ramp is now available with `ramp_tokens=10`.
-- 2026-08-20 — Corrected CUDA same-token replay reached **4.533x prefill speedup** while meeting accuracy standards.
-- 2026-08-20 — Corrected recirculation to replay each token's own upper stack and replace its upper-layer KV state.
-- 2026-08-20 — With zero feedback, replay now matches ordinary serial inference exactly in Torch and MLX.
+- 2026-08-21 — Added Qwen3-8B support across Torch/CUDA inference and path/alpha screening, including its no-BOS
+  tokenizer contract. Qwen3-8B recirculation runs faster on Torch/MPS and MLX (MLX preferred on Apple Silicon), with
+  1.57x prefill speedup at matching outputs and 1.82x faster prompt processing from fixed-prefix reuse.
+- 2026-08-20 — Corrected same-token replay so each token replays its own upper stack and replaces upper-layer KV
+  state; with zero feedback, replay matches ordinary serial inference in Torch and MLX. CUDA same-token replay reaches
+  **4.533x prefill speedup** while meeting accuracy. Added the paper's zero-based ten-step ramp (`ramp_tokens=10`)
+  and two-stack CUDA execution for both GIL-enabled and free-threaded Python. CUDA screening now jointly evaluates
+  final-answer and full-solution perplexity, then applies the correct-to-wrong penalty during paired generation.
+  Locked disjoint evaluation finished at 59/128 baseline and 67/128 recirculation. Torch is the single reference for
+  MLX and CUDA accuracy, evaluation auto-selects CUDA or MLX, and can compare same-destination candidates together.
+  MLX ran the matched short Apple M4 evaluation 2.86x faster than Torch/MPS.
 
 The Torch path is the absolute reference for the published mathematical and state behavior. MLX and CUDA may use
 hardware-specific execution, but their outputs are checked against Torch and need to meet accuracy standards.
@@ -90,14 +85,24 @@ This is a **13.56% relative accuracy increase**. The search rows and evaluation 
 
 The path search, alpha search, and locked evaluation ranges are pairwise disjoint.
 
-For a paper-style language-modeling shortlist, corpus mode streams fixed windows from C4 and PG-19 train. The example
-below uses 256 qualifying documents per corpus and scores one 1024-token window from each. It does not add an answer
-cue; GSM8K natural generation remains the downstream promotion gate.
+For a paper-style language-modeling shortlist, corpus mode reads fixed windows from local arXiv, C4, and PG-19
+training shards. By default it takes at most two complete 1024-token windows from each document, matching the paper's
+sampling policy. The paper reports 484 arXiv, 488 C4, and 500 PG-19 windows (roughly 1.5 million predicted tokens).
+It does not add an answer cue; GSM8K natural generation remains the downstream promotion gate.
 
-The Torch and CUDA paths support Hugging Face Llama and Qwen3 causal-LM checkpoints. Tokenicer preserves each model's
-special-token contract: Llama corpus windows begin after the checkpoint BOS, while Qwen3—which intentionally has no
-BOS—starts from an empty KV cache and scores the second text token from the first. Recirculation does not substitute
-EOS or PAD as a synthetic Qwen3 BOS. Chat evaluation uses the checkpoint's own chat template.
+The Torch and CUDA paths support Hugging Face Llama, Qwen3, and Gemma 3 text causal-LM checkpoints. This includes
+Gemma 3's alternating local/global RoPE, four decoder normalization sites, GELU-gated MLP, sliding-window KV rollback,
+and the same candidate-batch search API. Gemma keeps separate replay/current BF16 layer calls because merging their
+large projections exceeded the repository's 2e-3 real-checkpoint accuracy gate. Widths above one currently use an
+accuracy-preserving serial fallback for Gemma for the same reason; Llama and Qwen3 retain true fused candidate batches.
+Tokenicer preserves each model's
+special-token contract: Llama and Gemma corpus windows begin after the checkpoint BOS, while Qwen3—which intentionally
+has no BOS—starts from an empty KV cache and scores the second text token from the first. Recirculation does not
+substitute EOS or PAD as a synthetic Qwen3 BOS. Chat evaluation uses the checkpoint's own chat template.
+
+Raw corpus shards are resolved locally from `/local-models/datasets/recirculation-paper` unless
+`--corpus-data-root` overrides it. Network streaming is disabled unless `--allow-download` is explicit. The local
+arXiv source is a documented best-effort reproduction choice because the paper does not publish its exact dataset ID.
 
 ```bash
 python scripts/screen_cuda_recirculation.py \
@@ -111,6 +116,27 @@ python scripts/screen_cuda_recirculation.py \
   --alpha 0.10 \
   --output results/cuda_c4_pg19_paths.json
 ```
+
+Gemma 3 1B supports the same fused, candidate-batched CUDA search. A paper-shaped path/alpha sweep can be launched as:
+
+```bash
+python -X gil=0 scripts/screen_cuda_recirculation.py \
+  --model /local-models/gemma-3-1b-it \
+  --dtype bfloat16 \
+  --corpus arxiv --corpus c4 --corpus pg19 \
+  --windows-per-corpus 500 \
+  --windows-per-document 2 \
+  --window-tokens 1024 \
+  --max-distance 12 \
+  --alpha 0.04 --alpha 0.07 --alpha 0.10 --alpha 0.16 \
+  --scheduler concurrent --dual-gemm \
+  --candidate-batch-size 8 \
+  --corpus-artifact results/gemma3_paper_corpora_windows.json \
+  --output results/gemma3_cuda_paths.json
+```
+
+The paper's final cross-corpus path comparison fixes `alpha=0.10`; its four-alpha arXiv heatmap uses the values shown
+above. Use a separate fixed-`0.10` run when reproducing that exact path-selection step.
 
 For the locally downloaded Qwen3-8B checkpoint, the same search is selected with:
 

@@ -26,8 +26,11 @@ except ImportError as error:  # pragma: no cover - depends on the CUDA installat
 from .controller import (
     RecirculationConfig,
     RecirculationController,
+    _decoder_position_embeddings,
+    _layer_position_embeddings,
     _mixing_coefficients,
     _PendingFirstIterationState,
+    project_causal_lm_logits,
     torch_mix_reference,
 )
 
@@ -37,6 +40,33 @@ _CUDA_GRAPH_CAPTURE_LOCK = threading.Lock()
 # Preserve the existing CUDA-backend API while making the Torch implementation
 # the sole eager reference and fallback.
 mix_reference = torch_mix_reference
+
+
+def _new_recirculation_cache(model, data=None):
+    """Create a cache that can roll back Gemma 3 sliding-window upper layers."""
+
+    return (
+        DynamicCache(data, config=model.config)
+        if data is not None
+        else DynamicCache(config=model.config)
+    )
+
+
+def _activate_upper_cache_recording(cache, top_stack_start: int) -> None:
+    """Preserve rollback state only where recirculation replaces KV entries."""
+
+    for cache_layer in cache.layers[top_stack_start:]:
+        activate = getattr(cache_layer, "activate_past_recording", None)
+        if callable(activate):
+            activate()
+
+
+def _trim_recorded_upper_cache(cache, top_stack_start: int) -> None:
+    """Restrict recorded Gemma sliding caches after the current-token update."""
+
+    for cache_layer in cache.layers[top_stack_start:]:
+        if getattr(cache_layer, "record_past", False):
+            cache_layer.crop(0)
 
 
 def log_concurrency_mode() -> bool:
@@ -337,9 +367,12 @@ class CUDAPrefillRunner:
                     return_dict=True,
                 )
                 cache = output.past_key_values
+                self.controller._trim_recorded_upper_cache(cache)
                 is_final = position == tokens.shape[1] - 1
                 if collect_logits or not self.skip_intermediate_logits or is_final:
-                    logits = self.output_embeddings(output.last_hidden_state[:, -1:, :])
+                    logits = project_causal_lm_logits(
+                        self.model, output.last_hidden_state[:, -1:, :]
+                    )
                 if collect_logits or is_final:
                     collected.append(logits)
             if logits is None:  # pragma: no cover - guarded by model/config validation
@@ -354,7 +387,7 @@ class CUDAPrefillRunner:
         return _snapshot_cuda_state(cache, pending)
 
     def restore(self, snapshot: CUDAPrefillSnapshot, *, batch_size: int = 1):
-        cache = DynamicCache(snapshot.cache_data, config=self.model.config)
+        cache = _new_recirculation_cache(self.model, snapshot.cache_data)
         snapshot_batch = snapshot.pending.destination_residual.shape[0]
         if batch_size % snapshot_batch:
             raise ValueError("requested batch size must be a multiple of the snapshot batch size")
@@ -485,7 +518,7 @@ class CUDAPrefillRunner:
             hidden = torch.cat(projection_hidden, dim=0)
             rows = torch.cat(projection_rows, dim=0)
             targets = torch.cat(projection_targets, dim=0)
-            logits = self.output_embeddings(hidden).float()
+            logits = project_causal_lm_logits(self.model, hidden).float()
             losses = torch.logsumexp(logits, dim=-1) - logits.gather(1, targets[:, None])[:, 0]
             total_nll.add_(losses.sum())
             row_nll.index_add_(0, rows, losses)
@@ -508,6 +541,7 @@ class CUDAPrefillRunner:
                     return_dict=True,
                 )
                 cache = output.past_key_values
+                self.controller._trim_recorded_upper_cache(cache)
                 selected = targets_by_position.get(position)
                 if selected is not None:
                     if dense_targets is not None:
@@ -534,13 +568,13 @@ class CUDAPrefillRunner:
 
 
 class Qwen3DualTokenLayer:
-    """Run replay/current Qwen3 upper-layer projections as paired GEMMs."""
+    """Run accuracy-gated eager Qwen3, Llama, or Gemma 3 replay/current layers."""
 
     @staticmethod
     def supports(model) -> bool:
         config = getattr(model, "config", None)
         return (
-            getattr(config, "model_type", None) == "qwen3"
+            getattr(config, "model_type", None) in {"qwen3", "llama", "gemma3_text"}
             and getattr(config, "_attn_implementation", "eager") == "eager"
         )
 
@@ -554,7 +588,29 @@ class Qwen3DualTokenLayer:
         cache,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if replay.shape != current.shape or replay.ndim != 3 or replay.shape[1] != 1:
-            raise ValueError("paired Qwen3 layer inputs must have shape [batch, 1, hidden_size]")
+            raise ValueError("paired eager layer inputs must have shape [batch, 1, hidden_size]")
+        is_gemma3 = getattr(getattr(layer, "config", None), "model_type", None) == "gemma3_text"
+        if is_gemma3:
+            # Gemma 3 1B is natively BF16. Concatenating replay/current before
+            # its large projections changes GEMM tiling enough to exceed the
+            # repository's 2e-3 accumulated-forward gate on the real model.
+            # Keep candidate rows batched, but preserve the checkpoint's exact
+            # decoder-layer call boundaries for the two token positions.
+            replay = layer(
+                replay,
+                attention_mask=None,
+                past_key_values=cache,
+                use_cache=True,
+                position_embeddings=replay_position_embeddings,
+            )
+            current = layer(
+                current,
+                attention_mask=None,
+                past_key_values=cache,
+                use_cache=True,
+                position_embeddings=current_position_embeddings,
+            )
+            return replay, current
         batch_size = replay.shape[0]
         attention = layer.self_attn
         paired_norm = torch.cat((layer.input_layernorm(replay), layer.input_layernorm(current)), dim=0)
@@ -570,8 +626,14 @@ class Qwen3DualTokenLayer:
         hidden_shape = (*input_shape, -1, attention.head_dim)
 
         def prepare(q, k, v, position_embeddings):
-            q = attention.q_norm(q.view(hidden_shape)).transpose(1, 2)
-            k = attention.k_norm(k.view(hidden_shape)).transpose(1, 2)
+            q = q.view(hidden_shape)
+            k = k.view(hidden_shape)
+            if hasattr(attention, "q_norm"):
+                q = attention.q_norm(q)
+            if hasattr(attention, "k_norm"):
+                k = attention.k_norm(k)
+            q = q.transpose(1, 2)
+            k = k.transpose(1, 2)
             v = v.view(hidden_shape).transpose(1, 2)
             return (*apply_rotary_pos_emb(q, k, *position_embeddings), v)
 
@@ -582,14 +644,19 @@ class Qwen3DualTokenLayer:
             current_q, current_k, current_v, current_position_embeddings
         )
         replay_keys, replay_values = cache.update(replay_k, replay_v, attention.layer_idx)
+        attention_kwargs = {
+            "scaling": attention.scaling,
+            "dropout": 0.0,
+        }
+        if getattr(attention, "attn_logit_softcapping", None) is not None:
+            attention_kwargs["softcap"] = attention.attn_logit_softcapping
         replay_attention, _ = eager_attention_forward(
             attention,
             replay_q,
             replay_keys,
             replay_values,
             None,
-            scaling=attention.scaling,
-            dropout=0.0,
+            **attention_kwargs,
         )
         current_keys, current_values = cache.update(current_k, current_v, attention.layer_idx)
         current_attention, _ = eager_attention_forward(
@@ -598,8 +665,7 @@ class Qwen3DualTokenLayer:
             current_keys,
             current_values,
             None,
-            scaling=attention.scaling,
-            dropout=0.0,
+            **attention_kwargs,
         )
         paired_attention = torch.cat(
             (
@@ -659,7 +725,7 @@ class CUDAConcurrentRunner:
         self.stream_priority = stream_priority
         self.use_python_threads = use_python_threads
         if dual_gemm and not Qwen3DualTokenLayer.supports(model):
-            raise ValueError("dual-GEMM upper stacks currently require eager Qwen3")
+            raise ValueError("dual-GEMM upper stacks require eager Qwen3, Llama, or Gemma 3")
         self.dual_token_layer = Qwen3DualTokenLayer() if dual_gemm else None
         self.lower_stream = torch.cuda.Stream(device=device, priority=stream_priority)
         self.replay_stream = torch.cuda.Stream(device=device, priority=stream_priority)
@@ -698,19 +764,21 @@ class CUDAConcurrentRunner:
         position_ids = torch.full(
             (hidden.shape[0], 1), token_position, dtype=torch.long, device=self.device
         )
-        return position_ids, self.decoder.rotary_emb(hidden, position_ids=position_ids)
+        return position_ids, _decoder_position_embeddings(self.decoder, hidden, position_ids)
 
     def _run_lower(self, token: torch.Tensor, cache, token_position: int):
         hidden = self.decoder.embed_tokens(token)
         position_ids, position_embeddings = self._position(hidden, token_position)
-        for layer in self.decoder.layers[: self.config.destination_layer + 1]:
+        for index, layer in enumerate(self.decoder.layers[: self.config.destination_layer + 1]):
             hidden = layer(
                 hidden,
                 attention_mask=None,
                 position_ids=position_ids,
                 past_key_values=cache,
                 use_cache=True,
-                position_embeddings=position_embeddings,
+                position_embeddings=_layer_position_embeddings(
+                    self.decoder, position_embeddings, index
+                ),
             )
         return hidden, position_ids, position_embeddings
 
@@ -724,7 +792,9 @@ class CUDAConcurrentRunner:
                 position_ids=position_ids,
                 past_key_values=cache,
                 use_cache=True,
-                position_embeddings=position_embeddings,
+                position_embeddings=_layer_position_embeddings(
+                    self.decoder, position_embeddings, index
+                ),
             )
             if capture_source and index == self.config.source_layer:
                 source = hidden
@@ -747,8 +817,8 @@ class CUDAConcurrentRunner:
                 layer,
                 replay,
                 current,
-                replay_position_embeddings,
-                current_position_embeddings,
+                _layer_position_embeddings(self.decoder, replay_position_embeddings, index),
+                _layer_position_embeddings(self.decoder, current_position_embeddings, index),
                 cache,
             )
             if index == self.config.source_layer:
@@ -795,7 +865,9 @@ class CUDAConcurrentRunner:
             token = token.unsqueeze(0)
         if token.ndim != 2 or token.shape[1] != 1 or token.shape[0] < 1:
             raise ValueError("step requires tokens with shape [batch, 1]")
-        cache = DynamicCache(config=self.model.config) if cache is None else cache
+        cache = _new_recirculation_cache(self.model) if cache is None else cache
+        first_upper_layer = self.config.destination_layer + 1
+        _activate_upper_cache_recording(cache, first_upper_layer)
         token_position = cache.get_seq_length()
         main_stream = torch.cuda.current_stream(self.device)
 
@@ -849,11 +921,12 @@ class CUDAConcurrentRunner:
                 capture_source=True,
             )
         next_pending = CUDARecirculationState(destination.detach(), source.detach(), token_position)
+        _trim_recorded_upper_cache(cache, first_upper_layer)
         if return_hidden:
             return self.decoder.norm(hidden), cache, next_pending
         if not project_logits:
             return None, cache, next_pending
-        logits = self.output_embeddings(self.decoder.norm(hidden))
+        logits = project_causal_lm_logits(self.model, self.decoder.norm(hidden))
         return logits, cache, next_pending
 
     @torch.inference_mode()
@@ -906,7 +979,7 @@ class CUDAConcurrentRunner:
             hidden = torch.cat(projection_hidden, dim=0)
             rows = torch.cat(projection_rows, dim=0)
             targets = torch.cat(projection_targets, dim=0)
-            logits = self.output_embeddings(hidden).float()
+            logits = project_causal_lm_logits(self.model, hidden).float()
             losses = torch.logsumexp(logits, dim=-1) - logits.gather(1, targets[:, None])[:, 0]
             total_nll.add_(losses.sum())
             row_nll.index_add_(0, rows, losses)
@@ -983,7 +1056,7 @@ class CUDAConcurrentRunner:
         return _snapshot_cuda_state(cache, pending)
 
     def restore(self, snapshot: CUDAPrefillSnapshot):
-        cache = DynamicCache(snapshot.cache_data, config=self.model.config)
+        cache = _new_recirculation_cache(self.model, snapshot.cache_data)
         return cache, snapshot.pending
 
     def prefill_from_snapshot(
@@ -1021,14 +1094,297 @@ class CUDAConcurrentRunner:
         generated[:, :prompt_length] = prompt
         if max_new_tokens == 0:
             return generated[:, :prompt_length]
+        finished = torch.zeros(batch_size, dtype=torch.bool, device=self.device)
         for offset in range(max_new_tokens):
             token = logits[:, -1, :].argmax(dim=-1, keepdim=True)
+            if eos_token_id is not None:
+                # Keep completed rows inert while the remaining rows continue. Repeating EOS is
+                # removed by special-token decoding and preserves each row's single-item output.
+                token = torch.where(finished[:, None], eos_token_id, token)
+                finished |= token[:, 0] == eos_token_id
             generated[:, prompt_length + offset : prompt_length + offset + 1] = token
-            if eos_token_id is not None and bool((token == eos_token_id).all()):
+            if eos_token_id is not None and bool(finished.all()):
                 break
             logits, cache, pending = self.step(token, cache, pending)
         return generated[:, : prompt_length + offset + 1]
 
+
+class CUDABatchedPathRunner:
+    """Score several same-destination recirculation paths in one CUDA batch.
+
+    Candidate paths occupy contiguous slices of the model batch.  Requiring a
+    shared destination gives every candidate the same lower/upper stack split,
+    so weights are dispatched once per layer while source residuals and KV
+    cache rows remain independent.  This is mathematically the same operation
+    as running one :class:`CUDAConcurrentRunner` per candidate with dual GEMMs.
+    """
+
+    def __init__(self, model, configs: Sequence[RecirculationConfig]):
+        configs = tuple(configs)
+        if not configs:
+            raise ValueError("candidate batching requires at least one configuration")
+        destination = configs[0].destination_layer
+        mixing = (
+            configs[0].alpha,
+            configs[0].beta,
+            configs[0].normalize_source,
+            configs[0].ramp_tokens,
+        )
+        if any(config.destination_layer != destination for config in configs):
+            raise ValueError("batched candidates must share a destination layer")
+        if any(
+            (config.alpha, config.beta, config.normalize_source, config.ramp_tokens) != mixing
+            for config in configs
+        ):
+            raise ValueError("batched candidates must share alpha, beta, normalization, and ramp")
+        if configs[0].ramp_tokens:
+            raise ValueError("candidate batching does not yet support alpha ramping")
+        if not Qwen3DualTokenLayer.supports(model):
+            raise ValueError("candidate batching requires eager Qwen3, Llama, or Gemma 3")
+        self.model = model
+        self.decoder = model.get_decoder()
+        self.output_embeddings = model.get_output_embeddings()
+        self.configs = configs
+        self.destination_layer = destination
+        self.device = next(model.parameters()).device
+        self.mixer = FusedNormMix()
+        self.dual_token_layer = Qwen3DualTokenLayer()
+
+    def _position(self, hidden: torch.Tensor, token_position: int):
+        position_ids = torch.full(
+            (hidden.shape[0], 1), token_position, dtype=torch.long, device=self.device
+        )
+        return position_ids, _decoder_position_embeddings(self.decoder, hidden, position_ids)
+
+    def _run_lower(self, token: torch.Tensor, cache, token_position: int):
+        hidden = self.decoder.embed_tokens(token)
+        position_ids, position_embeddings = self._position(hidden, token_position)
+        for index, layer in enumerate(self.decoder.layers[: self.destination_layer + 1]):
+            hidden = layer(
+                hidden,
+                attention_mask=None,
+                position_ids=position_ids,
+                past_key_values=cache,
+                use_cache=True,
+                position_embeddings=_layer_position_embeddings(
+                    self.decoder, position_embeddings, index
+                ),
+            )
+        return hidden, position_ids, position_embeddings
+
+    def _capture_sources(self, hidden, layer_index: int, row_batch_size: int, sources):
+        for candidate_index, config in enumerate(self.configs):
+            if config.source_layer == layer_index:
+                start = candidate_index * row_batch_size
+                sources[candidate_index] = hidden[start : start + row_batch_size]
+
+    def _run_upper(
+        self,
+        hidden,
+        cache,
+        position_ids,
+        position_embeddings,
+        row_batch_size: int,
+    ):
+        sources = [None] * len(self.configs)
+        first_upper_layer = self.destination_layer + 1
+        for index, layer in enumerate(self.decoder.layers[first_upper_layer:], start=first_upper_layer):
+            hidden = layer(
+                hidden,
+                attention_mask=None,
+                position_ids=position_ids,
+                past_key_values=cache,
+                use_cache=True,
+                position_embeddings=_layer_position_embeddings(
+                    self.decoder, position_embeddings, index
+                ),
+            )
+            self._capture_sources(hidden, index, row_batch_size, sources)
+        if any(source is None for source in sources):
+            raise RuntimeError("one or more batched source activations were not captured")
+        return hidden, torch.cat(sources, dim=0)
+
+    def _run_paired_upper(
+        self,
+        replay,
+        current,
+        cache,
+        replay_position_embeddings,
+        current_position_embeddings,
+        row_batch_size: int,
+    ):
+        sources = [None] * len(self.configs)
+        first_upper_layer = self.destination_layer + 1
+        for index, layer in enumerate(self.decoder.layers[first_upper_layer:], start=first_upper_layer):
+            replay, current = self.dual_token_layer(
+                layer,
+                replay,
+                current,
+                _layer_position_embeddings(self.decoder, replay_position_embeddings, index),
+                _layer_position_embeddings(self.decoder, current_position_embeddings, index),
+                cache,
+            )
+            self._capture_sources(current, index, row_batch_size, sources)
+        if any(source is None for source in sources):
+            raise RuntimeError("one or more batched source activations were not captured")
+        return current, torch.cat(sources, dim=0)
+
+    @torch.inference_mode()
+    def step(self, token, cache=None, pending: CUDARecirculationState | None = None):
+        token = token.to(device=self.device, dtype=torch.long)
+        if token.ndim != 2 or token.shape[1] != 1:
+            raise ValueError("batched path step requires tokens with shape [candidate*row, 1]")
+        if token.shape[0] % len(self.configs):
+            raise ValueError("token batch must be divisible by the candidate count")
+        row_batch_size = token.shape[0] // len(self.configs)
+        cache = _new_recirculation_cache(self.model) if cache is None else cache
+        first_upper_layer = self.destination_layer + 1
+        _activate_upper_cache_recording(cache, first_upper_layer)
+        token_position = cache.get_seq_length()
+        destination, position_ids, position_embeddings = self._run_lower(token, cache, token_position)
+        if pending is None:
+            if token_position != 0:
+                raise ValueError("a non-empty cache requires pending recirculation state")
+            hidden, source = self._run_upper(
+                destination,
+                cache,
+                position_ids,
+                position_embeddings,
+                row_batch_size,
+            )
+        else:
+            if pending.input_step != token_position - 1:
+                raise ValueError("pending input step does not precede the current cache position")
+            for layer_cache in cache.layers[self.destination_layer + 1 :]:
+                layer_cache.crop(-1)
+            config = self.configs[0]
+            replay = self.mixer(
+                pending.destination_residual,
+                pending.source_residual,
+                config.alpha,
+                config.beta,
+                config.normalize_source,
+            )
+            _, replay_position_embeddings = self._position(replay, pending.input_step)
+            hidden, source = self._run_paired_upper(
+                replay,
+                destination,
+                cache,
+                replay_position_embeddings,
+                position_embeddings,
+                row_batch_size,
+            )
+        next_pending = CUDARecirculationState(destination.detach(), source.detach(), token_position)
+        _trim_recorded_upper_cache(cache, first_upper_layer)
+        return self.decoder.norm(hidden), cache, next_pending
+
+    @torch.inference_mode()
+    def score(
+        self,
+        tokens: torch.Tensor,
+        targets_by_position: dict[int, tuple[list[int], list[int]]],
+        *,
+        attention_mask: torch.Tensor,
+        projection_chunk_tokens: int = 1,
+    ) -> tuple[list[list[float]], list[list[int]]]:
+        """Return per-candidate, per-row NLL totals and target counts."""
+
+        tokens = tokens.to(device=self.device, dtype=torch.long)
+        attention_mask = attention_mask.to(device=self.device)
+        if tokens.ndim != 2 or tokens.shape[0] == 0 or tokens.shape[1] == 0:
+            raise ValueError("batched scoring requires tokens with shape [row, sequence]")
+        if attention_mask.shape != tokens.shape or not bool(attention_mask.all()):
+            raise ValueError("candidate-batched scoring requires a fully unpadded attention mask")
+        if projection_chunk_tokens < 1:
+            raise ValueError("projection_chunk_tokens must be positive")
+
+        if (
+            getattr(self.model.config, "model_type", None) == "gemma3_text"
+            and len(self.configs) > 1
+        ):
+            # Expanding candidate paths in Gemma 3's BF16 batch dimension
+            # changes cuBLAS tiling enough to fail the real-checkpoint 2e-3
+            # accumulated-forward gate. Preserve the batched API and exact
+            # search results until a shape-stable Gemma kernel is available.
+            LOG.info.once(
+                "Gemma 3 candidate width >1 uses the accuracy-gated serial fallback; "
+                "Llama and Qwen3 retain fused in-process candidate batching."
+            )
+            candidate_nll = []
+            candidate_counts = []
+            for config in self.configs:
+                runner = CUDAPrefillRunner(
+                    self.model,
+                    config,
+                    fused=True,
+                    allow_terminal_padding=False,
+                    projection_chunk_tokens=projection_chunk_tokens,
+                    mask_free_unpadded=True,
+                )
+                nll, counts = runner.score(
+                    tokens,
+                    targets_by_position,
+                    attention_mask=attention_mask,
+                    return_per_row=True,
+                )
+                candidate_nll.append(nll)
+                candidate_counts.append(counts)
+            return candidate_nll, candidate_counts
+
+        candidate_count = len(self.configs)
+        row_batch_size, sequence_length = tokens.shape
+        expanded_tokens = tokens.repeat(candidate_count, 1)
+        expanded_rows = candidate_count * row_batch_size
+        row_nll = torch.zeros(expanded_rows, dtype=torch.float32, device=self.device)
+        row_counts = [0] * expanded_rows
+        projection_hidden = []
+        projection_rows = []
+        projection_targets = []
+
+        def flush_projection():
+            if not projection_hidden:
+                return
+            hidden = torch.cat(projection_hidden, dim=0)
+            rows = torch.cat(projection_rows, dim=0)
+            targets = torch.cat(projection_targets, dim=0)
+            logits = project_causal_lm_logits(self.model, hidden).float()
+            losses = torch.logsumexp(logits, dim=-1) - logits.gather(1, targets[:, None])[:, 0]
+            row_nll.index_add_(0, rows, losses)
+            projection_hidden.clear()
+            projection_rows.clear()
+            projection_targets.clear()
+
+        cache = pending = None
+        for position in range(sequence_length):
+            hidden, cache, pending = self.step(
+                expanded_tokens[:, position : position + 1], cache, pending
+            )
+            selected = targets_by_position.get(position)
+            if selected is None:
+                continue
+            row_values, target_values = selected
+            base_rows = torch.tensor(row_values, dtype=torch.long, device=self.device)
+            base_targets = torch.tensor(target_values, dtype=torch.long, device=self.device)
+            rows = torch.cat(
+                [base_rows + candidate_index * row_batch_size for candidate_index in range(candidate_count)]
+            )
+            targets = base_targets.repeat(candidate_count)
+            projection_hidden.append(hidden[rows, -1])
+            projection_rows.append(rows)
+            projection_targets.append(targets)
+            for candidate_index in range(candidate_count):
+                offset = candidate_index * row_batch_size
+                for row in row_values:
+                    row_counts[offset + row] += 1
+            if len(projection_hidden) == projection_chunk_tokens:
+                flush_projection()
+        flush_projection()
+        nll_values = row_nll.view(candidate_count, row_batch_size).tolist()
+        count_values = [
+            row_counts[start : start + row_batch_size]
+            for start in range(0, expanded_rows, row_batch_size)
+        ]
+        return nll_values, count_values
 
 class CUDAGraphedConcurrentPrefill:
     """Capture the two-stream concurrent prefill as one fixed-shape CUDA Graph.
@@ -1188,6 +1544,7 @@ class CUDAGraphedPrefill:
 
 __all__ = [
     "MAX_FORWARD_ERROR",
+    "CUDABatchedPathRunner",
     "CUDAConcurrentRunner",
     "CUDAGraphedConcurrentPrefill",
     "CUDAGraphedPrefill",

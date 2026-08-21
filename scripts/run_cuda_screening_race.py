@@ -24,6 +24,18 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 LOG = LogBar.shared()
 
 
+def _model_path_count(model: str) -> int | None:
+    """Return the unrestricted source > destination path count for a local model."""
+    config_path = Path(model) / "config.json"
+    if not config_path.is_file():
+        return None
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    layers = config.get("num_hidden_layers")
+    if not isinstance(layers, int) or layers < 2:
+        return None
+    return layers * (layers - 1) // 2
+
+
 def _atomic_json(path: Path, value: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
@@ -148,6 +160,7 @@ def _history_entry(stage: int, rows: int, promoted: list[dict]) -> dict:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default="/local-models/Qwen3-8B")
+    parser.add_argument("--dtype", choices=("float16", "bfloat16"), default="float16")
     parser.add_argument("--corpus-artifact", type=Path, required=True)
     parser.add_argument("--native-baseline", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
@@ -157,6 +170,7 @@ def main() -> int:
     parser.add_argument("--stage-keep", type=int, nargs=2, default=(64, 16))
     parser.add_argument("--row-batch-size", type=int, default=128)
     parser.add_argument("--projection-chunk-tokens", type=int, default=16)
+    parser.add_argument("--candidate-batch-size", type=int, default=8)
     parser.add_argument("--scan-seed", type=int, default=20260821)
     args = parser.parse_args()
     if not (0 < args.stage_rows_per_corpus[0] < args.stage_rows_per_corpus[1] < args.stage_rows_per_corpus[2]):
@@ -176,6 +190,7 @@ def main() -> int:
     history = []
     selected = None
     stage_outputs = []
+    unrestricted_path_count = _model_path_count(args.model)
     for stage_index, (rows_per_corpus, window_tokens) in enumerate(
         zip(args.stage_rows_per_corpus, args.stage_window_tokens), start=1
     ):
@@ -191,15 +206,13 @@ def main() -> int:
         stage_outputs.append(str(output))
         command = [
             sys.executable,
+            "-X",
+            "gil=0",
             str(REPO_ROOT / "scripts/screen_cuda_recirculation.py"),
             "--model",
             args.model,
             "--dtype",
-            "float16",
-            "--corpus",
-            "c4",
-            "--corpus",
-            "pg19",
+            args.dtype,
             "--windows-per-corpus",
             str(rows_per_corpus),
             "--window-tokens",
@@ -218,6 +231,8 @@ def main() -> int:
             str(min(args.row_batch_size, rows_per_corpus * len(corpus["corpora"]))),
             "--candidate-workers",
             "1",
+            "--candidate-batch-size",
+            str(args.candidate_batch_size),
             "--projection-chunk-tokens",
             str(args.projection_chunk_tokens),
             "--mask-free-unpadded",
@@ -231,6 +246,8 @@ def main() -> int:
             "--output",
             str(output),
         ]
+        for corpus_name in corpus["corpora"]:
+            command.extend(["--corpus", corpus_name])
         if selected is not None:
             for item in selected:
                 command.extend(["--path", f"{item['source_layer']}:{item['destination_layer']}"])
@@ -247,9 +264,10 @@ def main() -> int:
                 "command": command,
             },
         )
+        path_count = unrestricted_path_count if selected is None else len(selected)
         LOG.info(
             f"Starting screening race stage {stage_index}/3: {rows_per_corpus * len(corpus['corpora'])} "
-            f"windows x {window_tokens} tokens, {630 if selected is None else len(selected)} paths"
+            f"windows x {window_tokens} tokens, {path_count if path_count is not None else 'all'} paths"
         )
         if not stage_baseline.exists():
             baseline_command = command + [

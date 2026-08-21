@@ -19,11 +19,31 @@ from recirculation.screening import (
 from scripts.run_cuda_screening_race import _derive_stage_artifacts, _promote
 from scripts.screen_cuda_recirculation import (
     MODEL_DTYPES,
+    _candidate_batches,
     _candidate_schedule,
     _candidate_work,
+    _effective_candidate_batch_size,
+    _effective_row_batch_size,
+    _local_corpus_documents,
     _ordered_candidates,
     _PathTelemetry,
 )
+
+
+def test_local_corpus_documents_read_json_gzip_and_parquet_without_hf(tmp_path):
+    import gzip
+    import json
+
+    pq = pytest.importorskip("pyarrow.parquet")
+    pa = pytest.importorskip("pyarrow")
+    json_path = tmp_path / "c4.json.gz"
+    with gzip.open(json_path, mode="wt", encoding="utf-8") as stream:
+        stream.write(json.dumps({"text": "c4 row"}) + "\n")
+    parquet_path = tmp_path / "pg19.parquet"
+    pq.write_table(pa.table({"text": ["pg row"]}), parquet_path)
+
+    assert list(_local_corpus_documents("json", [json_path])) == [{"text": "c4 row"}]
+    assert list(_local_corpus_documents("parquet", [parquet_path])) == [{"text": "pg row"}]
 
 
 def test_path_search_starts_at_conservative_alpha():
@@ -47,6 +67,29 @@ def test_cuda_screening_randomizes_and_persists_a_reproducible_candidate_schedul
     assert [
         (item["source_layer"], item["destination_layer"], item["alpha"]) for item in schedule
     ] == randomized
+
+
+def test_cuda_candidate_batches_preserve_candidates_and_share_replay_boundary():
+    candidates = [(8, 2, 0.05), (7, 1, 0.05), (6, 2, 0.05), (5, 2, 0.1), (4, 2, 0.05)]
+    batches = list(_candidate_batches(candidates, 2))
+
+    assert [candidate for batch in batches for candidate in batch] == [
+        (8, 2, 0.05),
+        (6, 2, 0.05),
+        (7, 1, 0.05),
+        (5, 2, 0.1),
+        (4, 2, 0.05),
+    ]
+    assert all(len(batch) <= 2 for batch in batches)
+    assert all(len({candidate[1:] for candidate in batch}) == 1 for batch in batches)
+
+
+def test_cuda_candidate_batch_width_respects_row_token_memory_budget():
+    assert _effective_candidate_batch_size(8, 32, 256, 65536) == 8
+    assert _effective_candidate_batch_size(8, 128, 512, 65536) == 1
+    assert _effective_candidate_batch_size(8, 128, 1024, 65536) == 1
+    assert _effective_row_batch_size(128, 1, 512, 65536) == 128
+    assert _effective_row_batch_size(128, 1, 1024, 65536) == 64
 
 
 def test_cuda_path_telemetry_counts_existing_batches_without_cuda_queries(tmp_path):

@@ -13,7 +13,7 @@ import time
 from pathlib import Path
 
 import torch
-from datasets import load_dataset
+from datasets import Dataset, load_dataset
 from evalution.scorers.gsm8k import numbers_equal
 from tokenicer import Tokenicer
 from transformers import AutoModelForCausalLM
@@ -27,6 +27,7 @@ from recirculation import (
 )
 from recirculation.screening import paired_selection_entry, proxy_shortlist
 from scripts.eval_gsm8k_platinum import (
+    _extract_answer,
     _generate,
     _generation_result,
     _gold_answer,
@@ -34,6 +35,32 @@ from scripts.eval_gsm8k_platinum import (
     _summary,
     _task_contract,
 )
+
+
+def _load_evalution_baseline(path: Path, samples: list[dict]) -> None:
+    """Attach a completed Evalution dense run without repeating its inference."""
+
+    report = json.loads(path.read_text(encoding="utf-8"))
+    tests = report.get("tests", [])
+    if len(tests) != 1:
+        raise ValueError("Evalution baseline must contain exactly one test suite")
+    baseline_by_index = {int(item["index"]): item for item in tests[0].get("samples", [])}
+    for sample in samples:
+        index = int(sample["index"])
+        if index not in baseline_by_index:
+            raise ValueError(f"Evalution baseline is missing dataset row {index}")
+        item = baseline_by_index[index]
+        if not numbers_equal(str(item["target"]), sample["gold_answer"]):
+            raise ValueError(f"Evalution baseline target disagrees at dataset row {index}")
+        text = str(item["prediction"])
+        strict, flexible = _extract_answer(text)
+        sample["baseline"] = {
+            "text": text,
+            "numeric_answer": str(item["extracted"]["numeric-extract"]),
+            "strict_answer": strict,
+            "flexible_answer": flexible,
+            "token_count": None,
+        }
 
 
 def _parse_candidate(value: str) -> tuple[int, int, float]:
@@ -201,6 +228,12 @@ def main() -> int:
     parser.add_argument("--max-new-tokens", type=int, default=128)
     parser.add_argument("--skip-baseline", action="store_true")
     parser.add_argument(
+        "--baseline-results",
+        type=Path,
+        default=None,
+        help="Reuse a completed Evalution dense-baseline JSON for paired flip metrics.",
+    )
+    parser.add_argument(
         "--screen-results",
         type=Path,
         default=None,
@@ -325,7 +358,12 @@ def main() -> int:
         torch.backends.cuda.enable_mem_efficient_sdp(True)
         torch.backends.cuda.enable_math_sdp(False)
     fewshots, until = _task_contract(args.task_config)
-    dataset = load_dataset(args.dataset, name=args.dataset_config, split="test")
+    dataset_path = Path(args.dataset).expanduser()
+    dataset = (
+        Dataset.from_file(str(dataset_path.resolve()))
+        if dataset_path.is_file() and dataset_path.suffix == ".arrow"
+        else load_dataset(args.dataset, name=args.dataset_config, split="test")
+    )
     stop = min(args.row_start + args.rows, len(dataset))
     documents = [dataset[index] for index in range(args.row_start, stop)]
     if len(documents) != args.rows:
@@ -384,6 +422,9 @@ def main() -> int:
             }
         )
 
+    if args.baseline_results is not None:
+        _load_evalution_baseline(args.baseline_results.expanduser().resolve(), samples)
+
     started = time.perf_counter()
     status_path = args.output.expanduser().resolve().with_suffix(".status.json")
     last_status = 0.0
@@ -407,7 +448,7 @@ def main() -> int:
         print(table, flush=True)
 
     maybe_status("baseline", force=True)
-    if not args.skip_baseline:
+    if not args.skip_baseline and args.baseline_results is None:
         for sample_index, sample in enumerate(samples):
             try:
                 sample["baseline"] = _generate(
@@ -429,6 +470,8 @@ def main() -> int:
             maybe_status("baseline")
             if (sample_index + 1) % 4 == 0:
                 print(f"baseline rows {sample_index + 1}/{len(samples)}", flush=True)
+        maybe_status("candidates", force=True)
+    elif args.baseline_results is not None:
         maybe_status("candidates", force=True)
     for candidate_index, (source, destination, alpha) in enumerate(args.candidate):
         config = RecirculationConfig(source_layer=source, destination_layer=destination, alpha=alpha)
@@ -563,7 +606,7 @@ def main() -> int:
         maybe_status(f"candidate-{candidate_index + 1}", force=True)
 
     summaries = {}
-    baseline_summary = None if args.skip_baseline else _summary(samples, "baseline")
+    baseline_summary = _summary(samples, "baseline") if all("baseline" in sample for sample in samples) else None
     for source, destination, alpha in args.candidate:
         arm = f"source{source}_destination{destination}_alpha{alpha:g}"
         summaries[arm] = _summary(samples, arm)
@@ -655,6 +698,7 @@ def main() -> int:
             "fewshot_count": len(fewshots),
             "candidates": [list(candidate) for candidate in args.candidate],
             "baseline_skipped": args.skip_baseline,
+            "baseline_results": str(args.baseline_results) if args.baseline_results is not None else None,
             "screen_results": str(args.screen_results) if args.screen_results is not None else None,
             "top_k": args.top_k,
             "harm_weight": args.harm_weight,
