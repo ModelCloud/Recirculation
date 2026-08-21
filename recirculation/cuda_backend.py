@@ -1094,10 +1094,16 @@ class CUDAConcurrentRunner:
         generated[:, :prompt_length] = prompt
         if max_new_tokens == 0:
             return generated[:, :prompt_length]
+        finished = torch.zeros(batch_size, dtype=torch.bool, device=self.device)
         for offset in range(max_new_tokens):
             token = logits[:, -1, :].argmax(dim=-1, keepdim=True)
+            if eos_token_id is not None:
+                # Keep completed rows inert while the remaining rows continue. Repeating EOS is
+                # removed by special-token decoding and preserves each row's single-item output.
+                token = torch.where(finished[:, None], eos_token_id, token)
+                finished |= token[:, 0] == eos_token_id
             generated[:, prompt_length + offset : prompt_length + offset + 1] = token
-            if eos_token_id is not None and bool((token == eos_token_id).all()):
+            if eos_token_id is not None and bool(finished.all()):
                 break
             logits, cache, pending = self.step(token, cache, pending)
         return generated[:, : prompt_length + offset + 1]
