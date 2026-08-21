@@ -15,7 +15,14 @@ from recirculation.screening import (
     screen_result_key,
     summarize_paired_losses,
 )
-from scripts.screen_cuda_recirculation import MODEL_DTYPES, _candidate_schedule, _ordered_candidates
+from scripts.screen_cuda_recirculation import (
+    MODEL_DTYPES,
+    _PathTelemetry,
+    _candidate_schedule,
+    _candidate_work,
+    _ordered_candidates,
+)
+from scripts.run_cuda_screening_race import _derive_stage_artifacts, _promote
 
 
 def test_path_search_starts_at_conservative_alpha():
@@ -39,6 +46,102 @@ def test_cuda_screening_randomizes_and_persists_a_reproducible_candidate_schedul
     assert [
         (item["source_layer"], item["destination_layer"], item["alpha"]) for item in schedule
     ] == randomized
+
+
+def test_cuda_path_telemetry_counts_existing_batches_without_cuda_queries(tmp_path):
+    contexts = [
+        {"language_modeling": ([1], [2, 3, 4])},
+        {"language_modeling": ([5], [6, 7])},
+        {"language_modeling": ([8], [9, 10, 11, 12])},
+    ]
+    work = _candidate_work(contexts, row_batch_size=2)
+    assert work == {"batches": 2, "scoring_rows": 3, "padded_token_positions": 10}
+
+    schedule = _candidate_schedule([(3, 1, 0.05), (2, 0, 0.05)])
+    telemetry = _PathTelemetry(tmp_path / "screen.json", schedule, work, [], interval=60)
+    telemetry.candidate_started((3, 1, 0.05), 0)
+    telemetry.batch_completed((3, 1, 0.05), 0, rows=2, padded_token_positions=6)
+    snapshot = telemetry.snapshot()
+
+    assert {key: snapshot["aggregate"][key] for key in ("complete", "active", "pending", "total")} == {
+        "complete": 0,
+        "active": 1,
+        "pending": 1,
+        "total": 2,
+    }
+    assert snapshot["active_paths"][0]["batches_completed"] == 1
+    assert snapshot["active_paths"][0]["progress"] == pytest.approx(0.6)
+    assert snapshot["telemetry"]["cuda_synchronizations_added"] == 0
+    assert snapshot["telemetry"]["cuda_queries_added"] == 0
+
+
+def test_screening_race_slices_shared_baseline_and_unions_both_rankings(tmp_path):
+    corpus_path = tmp_path / "windows.json"
+    baseline_path = tmp_path / "baseline.json"
+    corpus_path.write_text(
+        __import__("json").dumps(
+            {
+                "corpora": ["c4", "pg19"],
+                "windows_per_corpus": 2,
+                "window_tokens": 4,
+                "windows": [
+                    {"corpus": "c4", "token_ids": [1, 2, 3, 4]},
+                    {"corpus": "c4", "token_ids": [5, 6, 7, 8]},
+                    {"corpus": "pg19", "token_ids": [9, 10, 11, 12]},
+                    {"corpus": "pg19", "token_ids": [13, 14, 15, 16]},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    baseline_path.write_text(
+        __import__("json").dumps(
+            {
+                "implementation_commit": "abc",
+                "contract": {"rows": 4},
+                "seconds": 10.0,
+                "objectives": {
+                    "language_modeling": {
+                        "row_nll_totals": [1.0, 2.0, 3.0, 4.0],
+                        "row_target_counts": [2, 2, 2, 2],
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    stage_corpus_path, stage_baseline_path = _derive_stage_artifacts(
+        corpus_path, baseline_path, tmp_path / "stage", 1
+    )
+    stage_corpus = __import__("json").loads(stage_corpus_path.read_text())
+    stage_baseline = __import__("json").loads(stage_baseline_path.read_text())
+    assert len(stage_corpus["source_indices"]) == 2
+    assert sum(index < 2 for index in stage_corpus["source_indices"]) == 1
+    assert sum(index >= 2 for index in stage_corpus["source_indices"]) == 1
+    expected_nll = [
+        [1.0, 2.0, 3.0, 4.0][index] for index in stage_corpus["source_indices"]
+    ]
+    assert stage_baseline["objectives"]["language_modeling"]["row_nll_totals"] == expected_nll
+    assert stage_baseline["contract"]["rows"] == 2
+
+    def candidate(source, perplexity, robust):
+        return {
+            "source_layer": source,
+            "destination_layer": 0,
+            "alpha": 0.05,
+            "scan_index": source,
+            "objectives": {
+                "language_modeling": {
+                    "target_perplexity": perplexity,
+                    "screen_score": robust,
+                }
+            },
+        }
+
+    plain = candidate(1, 1.0, 9.0)
+    robust = candidate(2, 9.0, 1.0)
+    promoted = _promote([plain, robust, candidate(3, 3.0, 3.0)], 2)
+    assert promoted == [plain, robust]
 
 
 def test_gsm8k_solution_target_keeps_reasoning_and_removes_calculator_annotations():

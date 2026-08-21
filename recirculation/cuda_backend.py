@@ -12,8 +12,10 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
 import torch
+import torch.nn.functional as F
 from logbar import LogBar
 from transformers import DynamicCache
+from transformers.models.qwen3.modeling_qwen3 import apply_rotary_pos_emb, eager_attention_forward
 
 try:
     import triton
@@ -235,6 +237,8 @@ class CUDAPrefillRunner:
         fused: bool = True,
         skip_intermediate_logits: bool = True,
         allow_terminal_padding: bool = False,
+        projection_chunk_tokens: int = 1,
+        mask_free_unpadded: bool = False,
     ):
         if not hasattr(model, "get_decoder") or model.get_output_embeddings() is None:
             raise TypeError("CUDA prefill requires a Hugging Face causal language model")
@@ -250,6 +254,10 @@ class CUDAPrefillRunner:
         )
         self.skip_intermediate_logits = skip_intermediate_logits
         self.allow_terminal_padding = allow_terminal_padding
+        if projection_chunk_tokens < 1:
+            raise ValueError("projection_chunk_tokens must be positive")
+        self.projection_chunk_tokens = projection_chunk_tokens
+        self.mask_free_unpadded = mask_free_unpadded
 
     def _attach_controller_state(
         self,
@@ -340,6 +348,7 @@ class CUDAPrefillRunner:
             return logits, cache, state, torch.cat(collected, dim=1)
         finally:
             self.controller.detach()
+
 
     def snapshot(self, cache, pending: CUDARecirculationState) -> CUDAPrefillSnapshot:
         return _snapshot_cuda_state(cache, pending)
@@ -447,11 +456,44 @@ class CUDAPrefillRunner:
             raise ValueError("scoring attention mask must cover the cached prefix and continuation")
         if bool((attention_mask[:, 1:] > attention_mask[:, :-1]).any()):
             raise ValueError("scoring masks cannot contain a real token after terminal padding begins")
+        use_mask_free_attention = self.mask_free_unpadded and bool(attention_mask.all())
 
         total_nll = torch.zeros((), dtype=torch.float32, device=device)
         target_count = 0
         row_nll = torch.zeros(tokens.shape[0], dtype=torch.float32, device=device)
         row_counts = [0] * tokens.shape[0]
+        dense_rows = list(range(tokens.shape[0]))
+        dense_targets = None
+        if len(targets_by_position) == tokens.shape[1] and all(
+            position in targets_by_position and targets_by_position[position][0] == dense_rows
+            for position in range(tokens.shape[1])
+        ):
+            dense_targets = torch.tensor(
+                [targets_by_position[position][1] for position in range(tokens.shape[1])],
+                dtype=torch.long,
+                device=device,
+            )
+            dense_row_indices = torch.arange(tokens.shape[0], dtype=torch.long, device=device)
+        projection_hidden = []
+        projection_rows = []
+        projection_targets = []
+
+        def flush_projection():
+            nonlocal target_count
+            if not projection_hidden:
+                return
+            hidden = torch.cat(projection_hidden, dim=0)
+            rows = torch.cat(projection_rows, dim=0)
+            targets = torch.cat(projection_targets, dim=0)
+            logits = self.output_embeddings(hidden).float()
+            losses = torch.logsumexp(logits, dim=-1) - logits.gather(1, targets[:, None])[:, 0]
+            total_nll.add_(losses.sum())
+            row_nll.index_add_(0, rows, losses)
+            target_count += targets.numel()
+            projection_hidden.clear()
+            projection_rows.clear()
+            projection_targets.clear()
+
         self._attach_controller_state(pending, prefix_length)
         try:
             for position in range(tokens.shape[1]):
@@ -460,7 +502,7 @@ class CUDAPrefillRunner:
                     self.controller._run_pending_top_stack_iteration(cache, prefix_mask)
                 output = self.decoder(
                     input_ids=tokens[:, position : position + 1],
-                    attention_mask=prefix_mask,
+                    attention_mask=None if use_mask_free_attention else prefix_mask,
                     past_key_values=cache,
                     use_cache=True,
                     return_dict=True,
@@ -468,21 +510,118 @@ class CUDAPrefillRunner:
                 cache = output.past_key_values
                 selected = targets_by_position.get(position)
                 if selected is not None:
-                    row_values, target_values = selected
-                    rows = torch.tensor(row_values, dtype=torch.long, device=device)
-                    targets = torch.tensor(target_values, dtype=torch.long, device=device)
-                    logits = self.output_embeddings(output.last_hidden_state[rows, -1]).float()
-                    losses = torch.logsumexp(logits, dim=-1) - logits.gather(1, targets[:, None])[:, 0]
-                    total_nll += losses.sum()
-                    row_nll.index_add_(0, rows, losses)
-                    target_count += len(target_values)
+                    if dense_targets is not None:
+                        rows = dense_row_indices
+                        targets = dense_targets[position]
+                        row_values = dense_rows
+                    else:
+                        row_values, target_values = selected
+                        rows = torch.tensor(row_values, dtype=torch.long, device=device)
+                        targets = torch.tensor(target_values, dtype=torch.long, device=device)
+                    projection_hidden.append(output.last_hidden_state[rows, -1])
+                    projection_rows.append(rows)
+                    projection_targets.append(targets)
                     for row in row_values:
                         row_counts[row] += 1
+                    if len(projection_hidden) == self.projection_chunk_tokens:
+                        flush_projection()
+            flush_projection()
             if return_per_row:
                 return row_nll.tolist(), row_counts
             return float(total_nll), target_count
         finally:
             self.controller.detach()
+
+
+class Qwen3DualTokenLayer:
+    """Run replay/current Qwen3 upper-layer projections as paired GEMMs."""
+
+    @staticmethod
+    def supports(model) -> bool:
+        config = getattr(model, "config", None)
+        return (
+            getattr(config, "model_type", None) == "qwen3"
+            and getattr(config, "_attn_implementation", "eager") == "eager"
+        )
+
+    def __call__(
+        self,
+        layer,
+        replay: torch.Tensor,
+        current: torch.Tensor,
+        replay_position_embeddings,
+        current_position_embeddings,
+        cache,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if replay.shape != current.shape or replay.ndim != 3 or replay.shape[1] != 1:
+            raise ValueError("paired Qwen3 layer inputs must have shape [batch, 1, hidden_size]")
+        batch_size = replay.shape[0]
+        attention = layer.self_attn
+        paired_norm = torch.cat((layer.input_layernorm(replay), layer.input_layernorm(current)), dim=0)
+
+        def paired_projection(projection):
+            values = projection(paired_norm)
+            return values[:batch_size], values[batch_size:]
+
+        replay_q, current_q = paired_projection(attention.q_proj)
+        replay_k, current_k = paired_projection(attention.k_proj)
+        replay_v, current_v = paired_projection(attention.v_proj)
+        input_shape = replay.shape[:-1]
+        hidden_shape = (*input_shape, -1, attention.head_dim)
+
+        def prepare(q, k, v, position_embeddings):
+            q = attention.q_norm(q.view(hidden_shape)).transpose(1, 2)
+            k = attention.k_norm(k.view(hidden_shape)).transpose(1, 2)
+            v = v.view(hidden_shape).transpose(1, 2)
+            return (*apply_rotary_pos_emb(q, k, *position_embeddings), v)
+
+        replay_q, replay_k, replay_v = prepare(
+            replay_q, replay_k, replay_v, replay_position_embeddings
+        )
+        current_q, current_k, current_v = prepare(
+            current_q, current_k, current_v, current_position_embeddings
+        )
+        replay_keys, replay_values = cache.update(replay_k, replay_v, attention.layer_idx)
+        replay_attention, _ = eager_attention_forward(
+            attention,
+            replay_q,
+            replay_keys,
+            replay_values,
+            None,
+            scaling=attention.scaling,
+            dropout=0.0,
+        )
+        current_keys, current_values = cache.update(current_k, current_v, attention.layer_idx)
+        current_attention, _ = eager_attention_forward(
+            attention,
+            current_q,
+            current_keys,
+            current_values,
+            None,
+            scaling=attention.scaling,
+            dropout=0.0,
+        )
+        paired_attention = torch.cat(
+            (
+                replay_attention.reshape(*input_shape, -1),
+                current_attention.reshape(*input_shape, -1),
+            ),
+            dim=0,
+        )
+        paired_attention = attention.o_proj(paired_attention)
+        replay_residual = replay + paired_attention[:batch_size]
+        current_residual = current + paired_attention[batch_size:]
+        paired_mlp_norm = torch.cat(
+            (
+                layer.post_attention_layernorm(replay_residual),
+                layer.post_attention_layernorm(current_residual),
+            ),
+            dim=0,
+        )
+        paired_mlp = layer.mlp.down_proj(
+            F.silu(layer.mlp.gate_proj(paired_mlp_norm)) * layer.mlp.up_proj(paired_mlp_norm)
+        )
+        return replay_residual + paired_mlp[:batch_size], current_residual + paired_mlp[batch_size:]
 
 
 class CUDAConcurrentRunner:
@@ -502,6 +641,7 @@ class CUDAConcurrentRunner:
         fused: bool = True,
         stream_priority: int = -3,
         use_python_threads: bool = True,
+        dual_gemm: bool = False,
     ):
         if not hasattr(model, "get_decoder") or model.get_output_embeddings() is None:
             raise TypeError("concurrent CUDA inference requires a Hugging Face causal language model")
@@ -518,6 +658,9 @@ class CUDAConcurrentRunner:
         self.device = device
         self.stream_priority = stream_priority
         self.use_python_threads = use_python_threads
+        if dual_gemm and not Qwen3DualTokenLayer.supports(model):
+            raise ValueError("dual-GEMM upper stacks currently require eager Qwen3")
+        self.dual_token_layer = Qwen3DualTokenLayer() if dual_gemm else None
         self.lower_stream = torch.cuda.Stream(device=device, priority=stream_priority)
         self.replay_stream = torch.cuda.Stream(device=device, priority=stream_priority)
         self.dependency_event = torch.cuda.Event()
@@ -589,6 +732,31 @@ class CUDAConcurrentRunner:
             raise RuntimeError("source activation was not captured in the current upper stack")
         return hidden, source
 
+    def _run_paired_upper(
+        self,
+        replay,
+        current,
+        cache,
+        replay_position_embeddings,
+        current_position_embeddings,
+    ):
+        source = None
+        first_upper_layer = self.config.destination_layer + 1
+        for index, layer in enumerate(self.decoder.layers[first_upper_layer:], start=first_upper_layer):
+            replay, current = self.dual_token_layer(
+                layer,
+                replay,
+                current,
+                replay_position_embeddings,
+                current_position_embeddings,
+                cache,
+            )
+            if index == self.config.source_layer:
+                source = current
+        if source is None:
+            raise RuntimeError("source activation was not captured in the paired upper stack")
+        return current, source
+
     def _replay_branch(self, pending, cache, dependency):
         with torch.inference_mode(), torch.cuda.device(self.device), torch.cuda.stream(self.replay_stream):
             self.replay_stream.wait_event(dependency)
@@ -618,6 +786,7 @@ class CUDAConcurrentRunner:
         pending: CUDARecirculationState | None = None,
         *,
         project_logits: bool = True,
+        return_hidden: bool = False,
     ):
         """Process one token, overlapping its lower stack with the pending upper replay."""
 
@@ -634,6 +803,22 @@ class CUDAConcurrentRunner:
             if token_position != 0:
                 raise ValueError("a non-empty cache requires pending recirculation state")
             destination, position_ids, position_embeddings = self._run_lower(token, cache, token_position)
+        elif self.dual_token_layer is not None:
+            if pending.input_step != token_position - 1:
+                raise ValueError("pending input step does not precede the current cache position")
+            destination, position_ids, position_embeddings = self._run_lower(token, cache, token_position)
+            first_upper_layer = self.config.destination_layer + 1
+            for layer_cache in cache.layers[first_upper_layer:]:
+                layer_cache.crop(-1)
+            replay = self._mix(pending)
+            _, replay_position_embeddings = self._position(replay, pending.input_step)
+            hidden, source = self._run_paired_upper(
+                replay,
+                destination,
+                cache,
+                replay_position_embeddings,
+                position_embeddings,
+            )
         else:
             if pending.input_step != token_position - 1:
                 raise ValueError("pending input step does not precede the current cache position")
@@ -655,18 +840,112 @@ class CUDAConcurrentRunner:
             main_stream.wait_event(self.lower_done_event)
             main_stream.wait_event(self.replay_done_event)
 
-        hidden, source = self._run_upper(
-            destination,
-            cache,
-            position_ids,
-            position_embeddings,
-            capture_source=True,
-        )
+        if pending is None or self.dual_token_layer is None:
+            hidden, source = self._run_upper(
+                destination,
+                cache,
+                position_ids,
+                position_embeddings,
+                capture_source=True,
+            )
         next_pending = CUDARecirculationState(destination.detach(), source.detach(), token_position)
+        if return_hidden:
+            return self.decoder.norm(hidden), cache, next_pending
         if not project_logits:
             return None, cache, next_pending
         logits = self.output_embeddings(self.decoder.norm(hidden))
         return logits, cache, next_pending
+
+    @torch.inference_mode()
+    def score(
+        self,
+        tokens: torch.Tensor,
+        targets_by_position: dict[int, tuple[list[int], list[int]]],
+        *,
+        attention_mask: torch.Tensor,
+        return_per_row: bool = False,
+        projection_chunk_tokens: int = 1,
+    ) -> tuple[float, int] | tuple[list[float], list[int]]:
+        """Score an unpadded batch through the explicit two-stream scheduler."""
+
+        tokens = tokens.to(device=self.device, dtype=torch.long)
+        attention_mask = attention_mask.to(device=self.device)
+        if tokens.ndim != 2 or tokens.shape[0] == 0 or tokens.shape[1] == 0:
+            raise ValueError("batched scoring requires tokens with shape [batch, sequence]")
+        if attention_mask.shape != tokens.shape or not bool(attention_mask.all()):
+            raise ValueError("concurrent batched scoring requires a fully unpadded attention mask")
+        if projection_chunk_tokens < 1:
+            raise ValueError("projection_chunk_tokens must be positive")
+
+        batch_size = tokens.shape[0]
+        dense_rows = list(range(batch_size))
+        dense_targets = None
+        if len(targets_by_position) == tokens.shape[1] and all(
+            position in targets_by_position and targets_by_position[position][0] == dense_rows
+            for position in range(tokens.shape[1])
+        ):
+            dense_targets = torch.tensor(
+                [targets_by_position[position][1] for position in range(tokens.shape[1])],
+                dtype=torch.long,
+                device=self.device,
+            )
+            dense_row_indices = torch.arange(batch_size, dtype=torch.long, device=self.device)
+
+        total_nll = torch.zeros((), dtype=torch.float32, device=self.device)
+        target_count = 0
+        row_nll = torch.zeros(batch_size, dtype=torch.float32, device=self.device)
+        row_counts = [0] * batch_size
+        projection_hidden = []
+        projection_rows = []
+        projection_targets = []
+
+        def flush_projection():
+            nonlocal target_count
+            if not projection_hidden:
+                return
+            hidden = torch.cat(projection_hidden, dim=0)
+            rows = torch.cat(projection_rows, dim=0)
+            targets = torch.cat(projection_targets, dim=0)
+            logits = self.output_embeddings(hidden).float()
+            losses = torch.logsumexp(logits, dim=-1) - logits.gather(1, targets[:, None])[:, 0]
+            total_nll.add_(losses.sum())
+            row_nll.index_add_(0, rows, losses)
+            target_count += targets.numel()
+            projection_hidden.clear()
+            projection_rows.clear()
+            projection_targets.clear()
+
+        cache = pending = None
+        for position in range(tokens.shape[1]):
+            hidden, cache, pending = self.step(
+                tokens[:, position : position + 1],
+                cache,
+                pending,
+                project_logits=False,
+                return_hidden=True,
+            )
+            selected = targets_by_position.get(position)
+            if selected is None:
+                continue
+            if dense_targets is not None:
+                rows = dense_row_indices
+                targets = dense_targets[position]
+                row_values = dense_rows
+            else:
+                row_values, target_values = selected
+                rows = torch.tensor(row_values, dtype=torch.long, device=self.device)
+                targets = torch.tensor(target_values, dtype=torch.long, device=self.device)
+            projection_hidden.append(hidden[rows, -1])
+            projection_rows.append(rows)
+            projection_targets.append(targets)
+            for row in row_values:
+                row_counts[row] += 1
+            if len(projection_hidden) == projection_chunk_tokens:
+                flush_projection()
+        flush_projection()
+        if return_per_row:
+            return row_nll.tolist(), row_counts
+        return float(total_nll), target_count
 
     @torch.inference_mode()
     def prefill(
@@ -917,6 +1196,7 @@ __all__ = [
     "CUDARecirculationState",
     "ForwardError",
     "FusedNormMix",
+    "Qwen3DualTokenLayer",
     "log_concurrency_mode",
     "measure_forward_error",
     "mix_reference",

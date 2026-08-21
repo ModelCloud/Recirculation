@@ -16,8 +16,10 @@ import platform
 import random
 import subprocess
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
 from pathlib import Path
 
 for _thread_variable in (
@@ -105,6 +107,218 @@ def _candidate_schedule(candidates):
         }
         for scan_index, (source, destination, alpha) in enumerate(candidates)
     ]
+
+
+def _candidate_work(contexts, row_batch_size):
+    """Describe host-visible work without touching or synchronizing CUDA."""
+
+    batches = 0
+    scoring_rows = 0
+    padded_token_positions = 0
+    for batch_start in range(0, len(contexts), row_batch_size):
+        batch = contexts[batch_start : batch_start + row_batch_size]
+        for objective in contexts[0]:
+            sequence_lengths = [
+                len(context) + max(len(answer_ids) - 1, 0)
+                for context, answer_ids in (row[objective] for row in batch)
+            ]
+            batches += 1
+            scoring_rows += len(batch)
+            padded_token_positions += len(batch) * max(sequence_lengths)
+    return {
+        "batches": batches,
+        "scoring_rows": scoring_rows,
+        "padded_token_positions": padded_token_positions,
+    }
+
+
+def _format_duration(seconds):
+    if seconds is None:
+        return "—"
+    seconds = max(int(seconds), 0)
+    hours, remainder = divmod(seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours:d}:{minutes:02d}:{seconds:02d}" if hours else f"{minutes:d}:{seconds:02d}"
+
+
+class _PathTelemetry:
+    """Publish coarse CPU-side progress without adding CUDA work or synchronization."""
+
+    def __init__(self, output, schedule, work, completed, interval):
+        self.output = output.with_suffix(".status.json")
+        self.schedule = schedule
+        self.work = work
+        self.interval = float(interval)
+        self.started = time.perf_counter()
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._active = {}
+        self._completed = {
+            int(item["scan_index"]): {
+                "scan_index": int(item["scan_index"]),
+                "source_layer": int(item["source_layer"]),
+                "destination_layer": int(item["destination_layer"]),
+                "alpha": float(item["alpha"]),
+                "seconds": float(item.get("seconds", 0.0)),
+            }
+            for item in completed
+        }
+        self._thread = None
+
+    def start(self):
+        if self.interval <= 0:
+            return
+        self._thread = threading.Thread(target=self._run, name="screen-telemetry", daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        if self._thread is None:
+            return
+        self._stop.set()
+        self._thread.join(timeout=min(self.interval, 2.0))
+        self.emit()
+
+    def candidate_started(self, candidate, scan_index):
+        if self.interval <= 0:
+            return
+        source, destination, alpha = candidate
+        now = time.perf_counter()
+        with self._lock:
+            self._active[scan_index] = {
+                "scan_index": scan_index,
+                "source_layer": source,
+                "destination_layer": destination,
+                "alpha": alpha,
+                "started": now,
+                "last_progress": now,
+                "batches_completed": 0,
+                "scoring_rows_completed": 0,
+                "padded_token_positions_completed": 0,
+            }
+
+    def batch_completed(self, candidate, scan_index, *, rows, padded_token_positions):
+        if self.interval <= 0:
+            return
+        with self._lock:
+            active = self._active.get(scan_index)
+            if active is None:
+                return
+            active["batches_completed"] += 1
+            active["scoring_rows_completed"] += rows
+            active["padded_token_positions_completed"] += padded_token_positions
+            active["last_progress"] = time.perf_counter()
+
+    def candidate_completed(self, result):
+        if self.interval <= 0:
+            return
+        scan_index = int(result["scan_index"])
+        with self._lock:
+            self._active.pop(scan_index, None)
+            self._completed[scan_index] = {
+                "scan_index": scan_index,
+                "source_layer": int(result["source_layer"]),
+                "destination_layer": int(result["destination_layer"]),
+                "alpha": float(result["alpha"]),
+                "seconds": float(result["seconds"]),
+            }
+
+    def snapshot(self):
+        now = time.perf_counter()
+        with self._lock:
+            active_rows = [dict(value) for value in self._active.values()]
+            completed_rows = [dict(value) for value in self._completed.values()]
+        active = []
+        for item in sorted(active_rows, key=lambda value: value["scan_index"]):
+            started = item.pop("started")
+            last_progress = item.pop("last_progress")
+            elapsed = now - started
+            done = item["padded_token_positions_completed"]
+            total = self.work["padded_token_positions"]
+            fraction = min(done / total, 1.0) if total else 0.0
+            measured_seconds = last_progress - started
+            estimated_total = measured_seconds / fraction if fraction else None
+            eta = max(estimated_total - elapsed, 0.0) if estimated_total is not None else None
+            item.update(
+                {
+                    "state": "active",
+                    "batches_total": self.work["batches"],
+                    "scoring_rows_total": self.work["scoring_rows"],
+                    "padded_token_positions_total": total,
+                    "progress": fraction,
+                    "elapsed_seconds": elapsed,
+                    "progress_updated_seconds_ago": now - last_progress,
+                    "estimated_total_seconds": estimated_total,
+                    "path_eta_seconds": eta,
+                }
+            )
+            active.append(item)
+        total_candidates = len(self.schedule)
+        complete = len(completed_rows)
+        pending = max(total_candidates - complete - len(active), 0)
+        durations = [item["seconds"] for item in completed_rows if item["seconds"] > 0]
+        estimated_path_seconds = sum(durations) / len(durations) if durations else None
+        if estimated_path_seconds is None and active:
+            estimates = [
+                item["estimated_total_seconds"]
+                for item in active
+                if item["estimated_total_seconds"] is not None
+            ]
+            estimated_path_seconds = sum(estimates) / len(estimates) if estimates else None
+        sweep_eta = None
+        if estimated_path_seconds is not None:
+            sweep_eta = pending * estimated_path_seconds + sum(
+                item["path_eta_seconds"] or estimated_path_seconds for item in active
+            )
+        return {
+            "status": "complete" if complete == total_candidates else "running",
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "telemetry": {
+                "interval_seconds": self.interval,
+                "method": "host-side counters updated only after existing scoring batches",
+                "cuda_synchronizations_added": 0,
+                "cuda_queries_added": 0,
+            },
+            "aggregate": {
+                "complete": complete,
+                "active": len(active),
+                "pending": pending,
+                "total": total_candidates,
+                "elapsed_seconds": now - self.started,
+                "mean_completed_path_seconds": sum(durations) / len(durations) if durations else None,
+                "estimated_path_seconds": estimated_path_seconds,
+                "sweep_eta_seconds": sweep_eta,
+            },
+            "active_paths": active,
+            "completed_paths": sorted(completed_rows, key=lambda value: value["scan_index"]),
+        }
+
+    def emit(self):
+        report = self.snapshot()
+        self.output.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self.output.with_name(f".{self.output.name}.{os.getpid()}.tmp")
+        temporary.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        temporary.replace(self.output)
+        aggregate = report["aggregate"]
+        if report["active_paths"]:
+            paths = "; ".join(
+                f"scan={item['scan_index']} {item['source_layer']}->{item['destination_layer']}@{item['alpha']:g} "
+                f"batches={item['batches_completed']}/{item['batches_total']} "
+                f"rows={item['scoring_rows_completed']}/{item['scoring_rows_total']} "
+                f"progress={item['progress']:.1%} elapsed={_format_duration(item['elapsed_seconds'])} "
+                f"path_eta={_format_duration(item['path_eta_seconds'])}"
+                for item in report["active_paths"]
+            )
+        else:
+            paths = "no active path"
+        LOG.info(
+            f"telemetry candidates={aggregate['complete']}/{aggregate['total']} active={aggregate['active']} "
+            f"pending={aggregate['pending']} sweep_eta={_format_duration(aggregate['sweep_eta_seconds'])}; {paths}"
+        )
+
+    def _run(self):
+        self.emit()
+        while not self._stop.wait(self.interval):
+            self.emit()
 
 
 def _overlaps(left, right):
@@ -235,9 +449,15 @@ def _score_candidate(
     row_batch_size,
     pad_token_id,
     graph_prefix,
+    projection_chunk_tokens=1,
+    mask_free_unpadded=False,
+    dual_gemm=False,
+    progress_callback=None,
 ):
     candidate_started = time.perf_counter()
     source, destination, alpha = candidate
+    if progress_callback is not None:
+        progress_callback("candidate_started")
     config = RecirculationConfig(source_layer=source, destination_layer=destination, alpha=alpha)
     device = next(model.parameters()).device
     candidate_stream = torch.cuda.Stream(device=device)
@@ -266,7 +486,7 @@ def _score_candidate(
             if prefix_graph is not None:
                 torch.cuda.synchronize(prefix.device)
             if row_batch_size > 1:
-                batch_runner = CUDAPrefillRunner(model, config, allow_terminal_padding=True)
+                batch_runner = None
                 objective_nll = {objective: [] for objective in contexts[0]}
                 objective_counts = {objective: [] for objective in contexts[0]}
                 prefix_length = 0 if snapshot is None else snapshot.pending.token_position + 1
@@ -297,6 +517,26 @@ def _score_candidate(
                                 rows, targets = targets_by_position.setdefault(position, ([], []))
                                 rows.append(row)
                                 targets.append(int(target))
+                        unpadded = bool(attention_mask.all())
+                        use_concurrent_batch = scheduler == "concurrent" and snapshot is None and unpadded
+                        if batch_runner is None or use_concurrent_batch != isinstance(batch_runner, CUDAConcurrentRunner):
+                            if isinstance(batch_runner, CUDAConcurrentRunner):
+                                batch_runner.close()
+                            if use_concurrent_batch:
+                                batch_runner = CUDAConcurrentRunner(
+                                    model,
+                                    config,
+                                    use_python_threads=use_python_threads,
+                                    dual_gemm=dual_gemm,
+                                )
+                            else:
+                                batch_runner = CUDAPrefillRunner(
+                                    model,
+                                    config,
+                                    allow_terminal_padding=True,
+                                    projection_chunk_tokens=projection_chunk_tokens,
+                                    mask_free_unpadded=mask_free_unpadded,
+                                )
                         score = batch_runner.score if snapshot is None else batch_runner.score_from_snapshot
                         score_args = (batch_tokens, targets_by_position)
                         if snapshot is not None:
@@ -305,9 +545,20 @@ def _score_candidate(
                             *score_args,
                             attention_mask=attention_mask,
                             return_per_row=True,
+                            **(
+                                {"projection_chunk_tokens": projection_chunk_tokens}
+                                if isinstance(batch_runner, CUDAConcurrentRunner)
+                                else {}
+                            ),
                         )
                         objective_nll[objective].extend(batch_nll)
                         objective_counts[objective].extend(batch_targets)
+                        if progress_callback is not None:
+                            progress_callback(
+                                "batch_completed",
+                                rows=len(scoring_rows),
+                                padded_token_positions=len(scoring_rows) * maximum_length,
+                            )
                 return {
                     "source_layer": source,
                     "destination_layer": destination,
@@ -352,6 +603,80 @@ def _score_candidate(
         finally:
             if isinstance(runner, CUDAConcurrentRunner):
                 runner.close()
+            if "batch_runner" in locals() and isinstance(batch_runner, CUDAConcurrentRunner):
+                batch_runner.close()
+
+
+def _score_native_dense(model, contexts, row_batch_size, pad_token_id, projection_chunk_tokens):
+    """Score alpha=0 with ordinary parallel causal prefill and chunked LM projection."""
+
+    started = time.perf_counter()
+    device = next(model.parameters()).device
+    decoder = model.get_decoder()
+    output_embeddings = model.get_output_embeddings()
+    objective_nll = {objective: [] for objective in contexts[0]}
+    objective_counts = {objective: [] for objective in contexts[0]}
+    with torch.inference_mode():
+        for batch_start in range(0, len(contexts), row_batch_size):
+            batch = contexts[batch_start : batch_start + row_batch_size]
+            for objective in contexts[0]:
+                scoring_rows = [row[objective] for row in batch]
+                sequences = [context + answer_ids[:-1] for context, answer_ids in scoring_rows]
+                maximum_length = max(map(len, sequences))
+                tokens = torch.full(
+                    (len(batch), maximum_length),
+                    pad_token_id,
+                    dtype=torch.long,
+                    device=device,
+                )
+                attention_mask = torch.zeros_like(tokens)
+                targets_by_position = {}
+                for row, ((context, answer_ids), sequence) in enumerate(zip(scoring_rows, sequences)):
+                    tokens[row, : len(sequence)] = torch.tensor(sequence, dtype=torch.long, device=device)
+                    attention_mask[row, : len(sequence)] = 1
+                    for target_index, target in enumerate(answer_ids):
+                        position = len(context) - 1 + target_index
+                        rows, targets = targets_by_position.setdefault(position, ([], []))
+                        rows.append(row)
+                        targets.append(int(target))
+                hidden = decoder(
+                    input_ids=tokens,
+                    attention_mask=attention_mask,
+                    use_cache=False,
+                    return_dict=True,
+                ).last_hidden_state
+                row_nll = torch.zeros(len(batch), dtype=torch.float32, device=device)
+                row_counts = [0] * len(batch)
+                positions = sorted(targets_by_position)
+                for chunk_start in range(0, len(positions), projection_chunk_tokens):
+                    chunk_positions = positions[chunk_start : chunk_start + projection_chunk_tokens]
+                    selected_hidden = []
+                    selected_rows = []
+                    selected_targets = []
+                    for position in chunk_positions:
+                        row_values, target_values = targets_by_position[position]
+                        rows = torch.tensor(row_values, dtype=torch.long, device=device)
+                        selected_hidden.append(hidden[rows, position])
+                        selected_rows.append(rows)
+                        selected_targets.append(torch.tensor(target_values, dtype=torch.long, device=device))
+                        for row in row_values:
+                            row_counts[row] += 1
+                    rows = torch.cat(selected_rows)
+                    targets = torch.cat(selected_targets)
+                    logits = output_embeddings(torch.cat(selected_hidden)).float()
+                    losses = torch.logsumexp(logits, dim=-1) - logits.gather(1, targets[:, None])[:, 0]
+                    row_nll.index_add_(0, rows, losses)
+                objective_nll[objective].extend(row_nll.tolist())
+                objective_counts[objective].extend(row_counts)
+    return {
+        "source_layer": None,
+        "destination_layer": None,
+        "alpha": 0.0,
+        "row_nll_totals": objective_nll,
+        "row_target_counts": objective_counts,
+        "seconds": time.perf_counter() - started,
+        "implementation": "dense_parallel_causal_prefill",
+    }
 
 
 def main() -> int:
@@ -403,6 +728,30 @@ def main() -> int:
     parser.add_argument("--candidate-workers", type=int, default=1)
     parser.add_argument("--row-batch-size", type=int, default=32)
     parser.add_argument(
+        "--projection-chunk-tokens",
+        type=int,
+        default=16,
+        help="Fuse LM-head projection across scored token steps; set one for legacy dispatch.",
+    )
+    parser.add_argument(
+        "--mask-free-unpadded",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Skip redundant all-ones decoder masks while retaining causal attention.",
+    )
+    parser.add_argument(
+        "--attention-backend",
+        choices=("eager", "sdpa"),
+        default="eager",
+        help="Transformers attention implementation used during screening.",
+    )
+    parser.add_argument(
+        "--dual-gemm",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Pair Qwen3 replay/current upper-stack projections into shared GEMMs.",
+    )
+    parser.add_argument(
         "--target-mode",
         choices=("final_answer", "full_solution", "dual"),
         default="full_solution",
@@ -441,6 +790,12 @@ def main() -> int:
     )
     parser.add_argument("--allow-download", action="store_true")
     parser.add_argument("--report-every", type=int, default=10)
+    parser.add_argument(
+        "--telemetry-interval",
+        type=float,
+        default=60.0,
+        help="Emit lightweight per-path progress every N seconds; zero disables telemetry.",
+    )
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     if args.corpus and args.target_mode != "full_solution":
@@ -457,6 +812,7 @@ def main() -> int:
         args.report_every,
         args.candidate_workers,
         args.row_batch_size,
+        args.projection_chunk_tokens,
         args.windows_per_corpus,
         args.window_tokens,
     ) < 1:
@@ -477,6 +833,8 @@ def main() -> int:
         parser.error("tail-weight and harm-tolerance must be non-negative")
     if args.empty_cache_every < 0:
         parser.error("empty-cache-every must be non-negative")
+    if args.telemetry_interval < 0:
+        parser.error("telemetry-interval must be non-negative")
     if args.baseline_only and args.native_baseline is None:
         parser.error("--baseline-only requires --native-baseline")
 
@@ -488,7 +846,7 @@ def main() -> int:
             args.model,
             local_files_only=local_files_only,
             dtype=MODEL_DTYPES[args.dtype],
-            attn_implementation="eager",
+            attn_implementation=args.attention_backend,
         )
         .eval()
         .to("cuda")
@@ -719,21 +1077,29 @@ def main() -> int:
         else:
             native_candidate = (paths[0][0], paths[0][1], 0.0)
             LOG.info(f"Scoring paired native alpha=0 baseline with path {paths[0][0]}->{paths[0][1]}")
-            native = _score_candidate(
-                model,
-                prefix,
-                contexts,
-                native_candidate,
-                args.scheduler,
-                args.python_threads,
-                args.row_batch_size,
-                int(
-                    tokenizer.pad_token_id
-                    if tokenizer.pad_token_id is not None
-                    else tokenizer.eos_token_id
-                ),
-                args.graph_prefix,
+            pad_token_id = int(
+                tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
             )
+            if args.corpus:
+                native = _score_native_dense(
+                    model,
+                    contexts,
+                    args.row_batch_size,
+                    pad_token_id,
+                    args.projection_chunk_tokens,
+                )
+            else:
+                native = _score_candidate(
+                    model,
+                    prefix,
+                    contexts,
+                    native_candidate,
+                    args.scheduler,
+                    args.python_threads,
+                    args.row_batch_size,
+                    pad_token_id,
+                    args.graph_prefix,
+                )
             native_nll = native.pop("row_nll_totals")
             native_counts = native.pop("row_target_counts")
             if baseline_path is not None:
@@ -779,6 +1145,11 @@ def main() -> int:
         "candidate_workers": args.candidate_workers,
         "python_threads": args.python_threads,
         "row_batch_size": args.row_batch_size,
+        "projection_chunk_tokens": args.projection_chunk_tokens,
+        "mask_free_unpadded": args.mask_free_unpadded,
+        "attention_backend": args.attention_backend,
+        "dual_gemm": args.dual_gemm,
+        "telemetry_interval": args.telemetry_interval,
         "graph_prefix": args.graph_prefix,
         "target_mode": args.target_mode,
         "objective_batching": "separate shape-stable batches from one candidate prefix snapshot",
@@ -834,6 +1205,26 @@ def main() -> int:
     )
     completed_keys = {(item["source_layer"], item["destination_layer"], item["alpha"]) for item in results}
     remaining_candidates = [candidate for candidate in candidates if candidate not in completed_keys]
+    telemetry = _PathTelemetry(
+        args.output,
+        candidate_schedule,
+        _candidate_work(contexts, args.row_batch_size),
+        results,
+        args.telemetry_interval,
+    )
+    telemetry.start()
+
+    def progress_callback(candidate):
+        scan_index = scan_indices[candidate]
+
+        def update(event, **values):
+            if event == "candidate_started":
+                telemetry.candidate_started(candidate, scan_index)
+            elif event == "batch_completed":
+                telemetry.batch_completed(candidate, scan_index, **values)
+
+        return update
+
     torch.cuda.synchronize()
     with ThreadPoolExecutor(max_workers=args.candidate_workers, thread_name_prefix="recirculation-screen") as executor:
         futures = {
@@ -852,6 +1243,10 @@ def main() -> int:
                     else tokenizer.eos_token_id
                 ),
                 args.graph_prefix,
+                args.projection_chunk_tokens,
+                args.mask_free_unpadded,
+                args.dual_gemm,
+                progress_callback(candidate),
             ): candidate
             for candidate in remaining_candidates
         }
@@ -874,6 +1269,7 @@ def main() -> int:
                 for objective in candidate_nll
             }
             results.append(result)
+            telemetry.candidate_completed(result)
             _write_report(
                 args.output,
                 status="running",
@@ -913,6 +1309,7 @@ def main() -> int:
                         f"penalized={robust}"
                     )
 
+    telemetry.stop()
     _write_report(
         args.output,
         status="complete",
