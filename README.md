@@ -228,6 +228,10 @@ MLX also provides contiguous batched recirculation through `MLXBatchedRecirculat
 through `MLXContinuousBatch`. Torch/MPS supports synchronized equal-length dense batches. These paths use contiguous
 KV storage; the experimental paged-attention path currently targets CUDA.
 
+Batch accuracy is covered by the unit suite. Warmed speed comparisons are available with
+`scripts/benchmark_mlx_batch_recirculation.py` and `scripts/benchmark_torch_batch_recirculation.py`; both report
+scalar-versus-batched latency, throughput, speedup, and the forward-error gate.
+
 ## Run Evalution benchmarks
 
 One benchmark-agnostic entrypoint runs every suite exposed by Evalution. Repeat `--benchmark` to evaluate several
