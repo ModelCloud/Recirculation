@@ -8,6 +8,7 @@ from recirculation.screening import (
     gsm8k_solution_target,
     objective_result_key,
     paired_selection_entry,
+    path_cost_telemetry,
     perplexity_result_key,
     proxy_shortlist,
     render_screen_report_markdown,
@@ -15,14 +16,14 @@ from recirculation.screening import (
     screen_result_key,
     summarize_paired_losses,
 )
+from scripts.run_cuda_screening_race import _derive_stage_artifacts, _promote
 from scripts.screen_cuda_recirculation import (
     MODEL_DTYPES,
-    _PathTelemetry,
     _candidate_schedule,
     _candidate_work,
     _ordered_candidates,
+    _PathTelemetry,
 )
-from scripts.run_cuda_screening_race import _derive_stage_artifacts, _promote
 
 
 def test_path_search_starts_at_conservative_alpha():
@@ -73,6 +74,48 @@ def test_cuda_path_telemetry_counts_existing_batches_without_cuda_queries(tmp_pa
     assert snapshot["active_paths"][0]["progress"] == pytest.approx(0.6)
     assert snapshot["telemetry"]["cuda_synchronizations_added"] == 0
     assert snapshot["telemetry"]["cuda_queries_added"] == 0
+
+
+def test_path_cost_telemetry_reports_exact_and_amortized_wall_time():
+    exact = path_cost_telemetry(
+        runner_setup_seconds=1.0,
+        prefix_seconds=3.0,
+        scoring_seconds=6.0,
+        rows=5,
+        answer_tokens=20,
+        input_steps=100,
+        candidate_batch_size=1,
+    )
+    assert exact["timing_attribution"] == "exact"
+    assert exact["batch_wall_seconds"] == pytest.approx(10.0)
+    assert exact["amortized_path_seconds"] == pytest.approx(10.0)
+    assert exact["seconds_per_row"] == pytest.approx(2.0)
+    assert exact["seconds_per_answer_token"] == pytest.approx(0.5)
+    assert exact["input_steps_per_second"] == pytest.approx(10.0)
+
+    grouped = path_cost_telemetry(
+        runner_setup_seconds=1.0,
+        prefix_seconds=3.0,
+        scoring_seconds=6.0,
+        rows=5,
+        answer_tokens=20,
+        input_steps=100,
+        candidate_batch_size=2,
+    )
+    assert grouped["timing_attribution"] == "evenly_amortized_shared_batch"
+    assert grouped["amortized_path_seconds"] == pytest.approx(5.0)
+    assert grouped["input_steps_per_second"] == pytest.approx(20.0)
+
+    with pytest.raises(ValueError, match="must be positive"):
+        path_cost_telemetry(
+            runner_setup_seconds=0.0,
+            prefix_seconds=0.0,
+            scoring_seconds=0.0,
+            rows=0,
+            answer_tokens=1,
+            input_steps=1,
+            candidate_batch_size=1,
+        )
 
 
 def test_screening_race_slices_shared_baseline_and_unions_both_rankings(tmp_path):

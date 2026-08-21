@@ -19,6 +19,44 @@ PROXY_RANKINGS = (
 )
 
 
+def path_cost_telemetry(
+    *,
+    runner_setup_seconds: float,
+    prefix_seconds: float,
+    scoring_seconds: float,
+    rows: int,
+    answer_tokens: int,
+    input_steps: int,
+    candidate_batch_size: int,
+) -> dict:
+    """Summarize wall-clock cost for one independently synchronized path batch."""
+
+    phases = (runner_setup_seconds, prefix_seconds, scoring_seconds)
+    if not all(math.isfinite(value) and value >= 0.0 for value in phases):
+        raise ValueError("path timing phases must be finite and non-negative")
+    if rows < 1 or answer_tokens < 1 or input_steps < 1 or candidate_batch_size < 1:
+        raise ValueError("path cost counts and candidate_batch_size must be positive")
+    batch_wall_seconds = sum(phases)
+    amortized_path_seconds = batch_wall_seconds / candidate_batch_size
+    return {
+        "timing_attribution": "exact" if candidate_batch_size == 1 else "evenly_amortized_shared_batch",
+        "candidate_batch_size": candidate_batch_size,
+        "runner_setup_seconds": runner_setup_seconds,
+        "prefix_seconds": prefix_seconds,
+        "scoring_seconds": scoring_seconds,
+        "batch_wall_seconds": batch_wall_seconds,
+        "amortized_path_seconds": amortized_path_seconds,
+        "seconds_per_row": amortized_path_seconds / rows,
+        "seconds_per_answer_token": amortized_path_seconds / answer_tokens,
+        "rows": rows,
+        "answer_tokens": answer_tokens,
+        "input_steps": input_steps,
+        "input_steps_per_second": candidate_batch_size * input_steps / batch_wall_seconds
+        if batch_wall_seconds > 0.0
+        else None,
+    }
+
+
 def gsm8k_solution_target(answer: str, final_answer: str) -> str:
     """Convert a GSM8K rationale into the response format used by the prompt."""
 

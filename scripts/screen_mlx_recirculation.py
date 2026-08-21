@@ -19,6 +19,7 @@ sys.path.insert(0, str(REPO_ROOT))
 
 from recirculation import RecirculationConfig
 from recirculation.mlx_backend import CompiledNormMix, MLXCandidateGroupRecirculator
+from recirculation.screening import path_cost_telemetry
 from scripts.eval_gsm8k_platinum import _gold_answer, _prompt_ids, _task_contract
 
 
@@ -62,6 +63,7 @@ def _candidate_batches(candidates, batch_size):
 
 
 def main() -> int:
+    process_started = time.perf_counter()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True)
     parser.add_argument("--row-start", type=int, default=272)
@@ -116,16 +118,73 @@ def main() -> int:
     candidates = [(source, destination, alpha) for source, destination in paths for alpha in alphas]
     candidate_batches = _candidate_batches(candidates, args.candidate_batch_size)
     results = []
-    started = time.perf_counter()
+    batch_telemetry = []
+    search_started = time.perf_counter()
+    initialization_seconds = search_started - process_started
     completed = 0
-    for candidate_batch in candidate_batches:
+    output = args.output.expanduser().resolve()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    answer_token_count = sum(len(answer_ids) for _, answer_ids in contexts)
+    input_steps = common_length + sum(
+        len(context) + max(len(answer_ids) - 1, 0) for context, answer_ids in contexts
+    )
+
+    def write_report(status):
+        now = time.perf_counter()
+        completed_paths = len(results)
+        mean_path_seconds = (
+            sum(item["batch_wall_seconds"] for item in batch_telemetry) / completed_paths
+            if completed_paths
+            else None
+        )
+        pending_paths = len(candidates) - completed_paths
+        telemetry = {
+            "cost_unit": "wall_clock_seconds_on_local_hardware",
+            "initialization_seconds": initialization_seconds,
+            "search_seconds": now - search_started,
+            "total_wall_seconds": now - process_started,
+            "completed_paths": completed_paths,
+            "pending_paths": pending_paths,
+            "mean_amortized_path_seconds": mean_path_seconds,
+            "estimated_remaining_seconds": None
+            if mean_path_seconds is None
+            else mean_path_seconds * pending_paths,
+            "batches": batch_telemetry,
+        }
+        report = {
+            "status": status,
+            "settings": {
+                "model": args.model,
+                "split_role": "tuning",
+                "row_start": args.row_start,
+                "rows": args.rows,
+                "row_stop_exclusive": args.row_start + args.rows,
+                "forbidden_ranges": forbidden_ranges,
+                "common_prefix_tokens": common_length,
+                "alphas": alphas,
+                "max_distance": args.max_distance,
+                "candidate_batch_size": args.candidate_batch_size,
+                "candidate_batches": len(candidate_batches),
+                "candidate_count": len(candidates),
+            },
+            "seconds": now - search_started,
+            "telemetry": telemetry,
+            "results": sorted(results, key=lambda item: item["answer_nll"]),
+        }
+        output.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    write_report("running")
+    for batch_index, candidate_batch in enumerate(candidate_batches):
+        batch_started = time.perf_counter()
         configs = [
             RecirculationConfig(source_layer=source, destination_layer=destination, alpha=alpha)
             for source, destination, alpha in candidate_batch
         ]
         runner = MLXCandidateGroupRecirculator(model, configs, [CompiledNormMix(config) for config in configs])
+        runner_ready = time.perf_counter()
         _, caches, pendings, _ = runner.prefill(prefix)
         snapshot = runner.snapshot(caches, pendings)
+        prefix_ready = time.perf_counter()
         total_nll = [0.0] * len(candidate_batch)
         answer_tokens = [0] * len(candidate_batch)
         for context, answer_ids in contexts:
@@ -143,6 +202,22 @@ def main() -> int:
                     logits, pendings = runner.step_shared(
                         mx.array([[int(token)]], dtype=mx.int32), caches, pendings
                     )
+        scoring_finished = time.perf_counter()
+        telemetry = path_cost_telemetry(
+            runner_setup_seconds=runner_ready - batch_started,
+            prefix_seconds=prefix_ready - runner_ready,
+            scoring_seconds=scoring_finished - prefix_ready,
+            rows=args.rows,
+            answer_tokens=answer_token_count,
+            input_steps=input_steps,
+            candidate_batch_size=len(candidate_batch),
+        )
+        telemetry["batch_index"] = batch_index
+        telemetry["paths"] = [
+            {"source_layer": source, "destination_layer": destination, "alpha": alpha}
+            for source, destination, alpha in candidate_batch
+        ]
+        batch_telemetry.append(telemetry)
         for candidate_index, (source, destination, alpha) in enumerate(candidate_batch):
             results.append(
                 {
@@ -151,30 +226,23 @@ def main() -> int:
                     "alpha": alpha,
                     "answer_nll": total_nll[candidate_index] / answer_tokens[candidate_index],
                     "answer_tokens": answer_tokens[candidate_index],
+                    "telemetry": telemetry,
                 }
             )
         completed += len(candidate_batch)
         best = min(results, key=lambda item: item["answer_nll"])
-        print(f"candidates={completed}/{len(candidates)} best={best}", flush=True)
-    report = {
-        "settings": {
-            "split_role": "tuning",
-            "row_start": args.row_start,
-            "rows": args.rows,
-            "row_stop_exclusive": args.row_start + args.rows,
-            "forbidden_ranges": forbidden_ranges,
-            "common_prefix_tokens": common_length,
-            "alphas": alphas,
-            "max_distance": args.max_distance,
-            "candidate_batch_size": args.candidate_batch_size,
-            "candidate_batches": len(candidate_batches),
-        },
-        "seconds": time.perf_counter() - started,
-        "results": sorted(results, key=lambda item: item["answer_nll"]),
-    }
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    print(f"Wrote {args.output}")
+        write_report("running" if completed < len(candidates) else "complete")
+        print(
+            f"candidates={completed}/{len(candidates)} "
+            f"batch_seconds={telemetry['batch_wall_seconds']:.3f} "
+            f"path_seconds={telemetry['amortized_path_seconds']:.3f} "
+            f"best={best['source_layer']}->{best['destination_layer']} "
+            f"alpha={best['alpha']:.6g} answer_nll={best['answer_nll']:.9g}",
+            flush=True,
+        )
+        del caches, pendings, snapshot, runner
+        mx.clear_cache()
+    print(f"Wrote {output}")
     return 0
 
 
