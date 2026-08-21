@@ -85,14 +85,24 @@ This is a **13.56% relative accuracy increase**. The search rows and evaluation 
 
 The path search, alpha search, and locked evaluation ranges are pairwise disjoint.
 
-For a paper-style language-modeling shortlist, corpus mode streams fixed windows from C4 and PG-19 train. The example
-below uses 256 qualifying documents per corpus and scores one 1024-token window from each. It does not add an answer
-cue; GSM8K natural generation remains the downstream promotion gate.
+For a paper-style language-modeling shortlist, corpus mode reads fixed windows from local arXiv, C4, and PG-19
+training shards. By default it takes at most two complete 1024-token windows from each document, matching the paper's
+sampling policy. The paper reports 484 arXiv, 488 C4, and 500 PG-19 windows (roughly 1.5 million predicted tokens).
+It does not add an answer cue; GSM8K natural generation remains the downstream promotion gate.
 
-The Torch and CUDA paths support Hugging Face Llama and Qwen3 causal-LM checkpoints. Tokenicer preserves each model's
-special-token contract: Llama corpus windows begin after the checkpoint BOS, while Qwen3—which intentionally has no
-BOS—starts from an empty KV cache and scores the second text token from the first. Recirculation does not substitute
-EOS or PAD as a synthetic Qwen3 BOS. Chat evaluation uses the checkpoint's own chat template.
+The Torch and CUDA paths support Hugging Face Llama, Qwen3, and Gemma 3 text causal-LM checkpoints. This includes
+Gemma 3's alternating local/global RoPE, four decoder normalization sites, GELU-gated MLP, sliding-window KV rollback,
+and the same candidate-batch search API. Gemma keeps separate replay/current BF16 layer calls because merging their
+large projections exceeded the repository's 2e-3 real-checkpoint accuracy gate. Widths above one currently use an
+accuracy-preserving serial fallback for Gemma for the same reason; Llama and Qwen3 retain true fused candidate batches.
+Tokenicer preserves each model's
+special-token contract: Llama and Gemma corpus windows begin after the checkpoint BOS, while Qwen3—which intentionally
+has no BOS—starts from an empty KV cache and scores the second text token from the first. Recirculation does not
+substitute EOS or PAD as a synthetic Qwen3 BOS. Chat evaluation uses the checkpoint's own chat template.
+
+Raw corpus shards are resolved locally from `/local-models/datasets/recirculation-paper` unless
+`--corpus-data-root` overrides it. Network streaming is disabled unless `--allow-download` is explicit. The local
+arXiv source is a documented best-effort reproduction choice because the paper does not publish its exact dataset ID.
 
 ```bash
 python scripts/screen_cuda_recirculation.py \
@@ -106,6 +116,27 @@ python scripts/screen_cuda_recirculation.py \
   --alpha 0.10 \
   --output results/cuda_c4_pg19_paths.json
 ```
+
+Gemma 3 1B supports the same fused, candidate-batched CUDA search. A paper-shaped path/alpha sweep can be launched as:
+
+```bash
+python -X gil=0 scripts/screen_cuda_recirculation.py \
+  --model /local-models/gemma-3-1b-it \
+  --dtype bfloat16 \
+  --corpus arxiv --corpus c4 --corpus pg19 \
+  --windows-per-corpus 500 \
+  --windows-per-document 2 \
+  --window-tokens 1024 \
+  --max-distance 12 \
+  --alpha 0.04 --alpha 0.07 --alpha 0.10 --alpha 0.16 \
+  --scheduler concurrent --dual-gemm \
+  --candidate-batch-size 8 \
+  --corpus-artifact results/gemma3_paper_corpora_windows.json \
+  --output results/gemma3_cuda_paths.json
+```
+
+The paper's final cross-corpus path comparison fixes `alpha=0.10`; its four-alpha arXiv heatmap uses the values shown
+above. Use a separate fixed-`0.10` run when reproducing that exact path-selection step.
 
 For the locally downloaded Qwen3-8B checkpoint, the same search is selected with:
 

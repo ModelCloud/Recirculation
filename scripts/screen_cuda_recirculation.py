@@ -10,6 +10,7 @@ to ``sweep_gsm8k.py``, which lets each model arm generate autoregressively.
 from __future__ import annotations
 
 import argparse
+import gzip
 import json
 import os
 import platform
@@ -42,6 +43,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 from recirculation import RecirculationConfig
+from recirculation.controller import project_causal_lm_logits
 from recirculation.cuda_backend import (
     CUDABatchedPathRunner,
     CUDAConcurrentRunner,
@@ -74,6 +76,27 @@ def _common_prefix_length(prompts):
             break
         length += 1
     return length
+
+
+def _local_corpus_documents(storage_format: str, paths: list[Path]):
+    """Yield local corpus rows without consulting Hugging Face or its cache."""
+
+    if storage_format == "json":
+        for path in paths:
+            with gzip.open(path, mode="rt", encoding="utf-8") as stream:
+                for line in stream:
+                    yield json.loads(line)
+        return
+    if storage_format == "parquet":
+        import pyarrow.parquet as pq
+
+        for path in paths:
+            parquet = pq.ParquetFile(path)
+            for batch in parquet.iter_batches(columns=["text"], batch_size=64):
+                for text in batch.column(0).to_pylist():
+                    yield {"text": text}
+        return
+    raise ValueError(f"unsupported local corpus format: {storage_format}")
 
 
 def _parse_path(value):
@@ -738,7 +761,6 @@ def _score_native_dense(model, contexts, row_batch_size, pad_token_id, projectio
     started = time.perf_counter()
     device = next(model.parameters()).device
     decoder = model.get_decoder()
-    output_embeddings = model.get_output_embeddings()
     objective_nll = {objective: [] for objective in contexts[0]}
     objective_counts = {objective: [] for objective in contexts[0]}
     with torch.inference_mode():
@@ -788,7 +810,7 @@ def _score_native_dense(model, contexts, row_batch_size, pad_token_id, projectio
                             row_counts[row] += 1
                     rows = torch.cat(selected_rows)
                     targets = torch.cat(selected_targets)
-                    logits = output_embeddings(torch.cat(selected_hidden)).float()
+                    logits = project_causal_lm_logits(model, torch.cat(selected_hidden)).float()
                     losses = torch.logsumexp(logits, dim=-1) - logits.gather(1, targets[:, None])[:, 0]
                     row_nll.index_add_(0, rows, losses)
                 objective_nll[objective].extend(row_nll.tolist())
@@ -818,12 +840,24 @@ def main() -> int:
     parser.add_argument(
         "--corpus",
         action="append",
-        choices=("c4", "pg19"),
+        choices=("arxiv", "c4", "pg19"),
         default=None,
-        help="Use repeated language-modeling corpora instead of GSM8K (C4 train and/or PG-19 train).",
+        help="Use language-modeling corpora instead of GSM8K (arXiv, C4 train, and/or PG-19 train).",
     )
     parser.add_argument("--windows-per-corpus", type=int, default=256)
+    parser.add_argument(
+        "--windows-per-document",
+        type=int,
+        default=2,
+        help="Maximum full windows selected from one corpus document; the paper uses two.",
+    )
     parser.add_argument("--window-tokens", type=int, default=1024)
+    parser.add_argument(
+        "--corpus-data-root",
+        type=Path,
+        default=Path("/local-models/datasets/recirculation-paper"),
+        help="Persistent local raw-corpus root; local shards are preferred over Hugging Face streaming.",
+    )
     parser.add_argument(
         "--corpus-artifact",
         type=Path,
@@ -855,7 +889,7 @@ def main() -> int:
         "--candidate-batch-size",
         type=int,
         default=1,
-        help="Batch same-destination Qwen3 paths in one process; widths above one require corpus scoring and dual GEMM.",
+        help="Batch same-destination Llama, Qwen3, or Gemma 3 paths in one process; widths above one require corpus scoring and dual GEMM.",
     )
     parser.add_argument(
         "--candidate-token-budget",
@@ -886,7 +920,7 @@ def main() -> int:
         "--dual-gemm",
         action=argparse.BooleanOptionalAction,
         default=False,
-        help="Pair Qwen3 replay/current upper-stack projections into shared GEMMs.",
+        help="Pair supported replay/current upper-stack projections into shared GEMMs.",
     )
     parser.add_argument(
         "--target-mode",
@@ -953,6 +987,7 @@ def main() -> int:
         args.row_batch_size,
         args.projection_chunk_tokens,
         args.windows_per_corpus,
+        args.windows_per_document,
         args.window_tokens,
     ) < 1:
         parser.error("rows, reporting intervals, and worker/batch sizes must be positive")
@@ -1009,9 +1044,16 @@ def main() -> int:
     corpus_counts = {}
     if args.corpus:
         specs = {
+            "arxiv": ("emozilla/dolma-v1_7-arxiv", None),
             "c4": ("allenai/c4", "en"),
             "pg19": ("emozilla/pg19", None),
         }
+        local_specs = {
+            "arxiv": ("parquet", "arxiv/*.parquet"),
+            "c4": ("json", "c4/*.json.gz"),
+            "pg19": ("parquet", "pg19/*.parquet"),
+        }
+        corpus_data_root = args.corpus_data_root.expanduser().resolve()
         corpus_artifact = args.corpus_artifact.expanduser().resolve() if args.corpus_artifact else None
         artifact = None
         if corpus_artifact is not None and corpus_artifact.exists():
@@ -1030,7 +1072,22 @@ def main() -> int:
             windows = []
             for corpus in args.corpus:
                 dataset_name, dataset_config = specs[corpus]
-                stream = load_dataset(dataset_name, name=dataset_config, split="train", streaming=True)
+                local_format, local_pattern = local_specs[corpus]
+                local_files = sorted(corpus_data_root.glob(local_pattern))
+                if local_files:
+                    stream = _local_corpus_documents(local_format, local_files)
+                    LOG.info(
+                        f"Using {len(local_files)} local {corpus} shard(s) from {corpus_data_root}"
+                    )
+                elif args.allow_download:
+                    stream = load_dataset(
+                        dataset_name, name=dataset_config, split="train", streaming=True
+                    )
+                else:
+                    parser.error(
+                        f"no local {corpus} shards match {corpus_data_root / local_pattern}; "
+                        "materialize the corpus or pass --allow-download"
+                    )
                 accepted = 0
                 examined = 0
                 for document in stream:
@@ -1039,12 +1096,18 @@ def main() -> int:
                         str(document["text"]),
                         add_special_tokens=False,
                         truncation=True,
-                        max_length=args.window_tokens,
+                        max_length=args.window_tokens * args.windows_per_document,
                     ).input_ids
                     if len(token_ids) < args.window_tokens:
                         continue
-                    windows.append({"corpus": corpus, "token_ids": list(map(int, token_ids))})
-                    accepted += 1
+                    for start in range(0, len(token_ids), args.window_tokens):
+                        window = token_ids[start : start + args.window_tokens]
+                        if len(window) != args.window_tokens:
+                            break
+                        windows.append({"corpus": corpus, "token_ids": list(map(int, window))})
+                        accepted += 1
+                        if accepted == args.windows_per_corpus:
+                            break
                     if accepted == args.windows_per_corpus:
                         break
                 if accepted != args.windows_per_corpus:
@@ -1053,6 +1116,7 @@ def main() -> int:
             artifact = {
                 "corpora": args.corpus,
                 "windows_per_corpus": args.windows_per_corpus,
+                "windows_per_document": args.windows_per_document,
                 "window_tokens": args.window_tokens,
                 "tokenizer": args.model,
                 "corpus_counts": corpus_counts,
@@ -1306,6 +1370,8 @@ def main() -> int:
         "dataset": args.dataset,
         "corpora": args.corpus,
         "corpus_counts": corpus_counts,
+        "corpus_data_root": str(args.corpus_data_root.resolve()) if args.corpus else None,
+        "windows_per_document": args.windows_per_document if args.corpus else None,
         "window_tokens": args.window_tokens if args.corpus else None,
         "corpus_artifact": str(args.corpus_artifact.resolve()) if args.corpus_artifact else None,
         "row_start": args.row_start,

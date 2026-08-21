@@ -160,6 +160,7 @@ def _history_entry(stage: int, rows: int, promoted: list[dict]) -> dict:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default="/local-models/Qwen3-8B")
+    parser.add_argument("--dtype", choices=("float16", "bfloat16"), default="float16")
     parser.add_argument("--corpus-artifact", type=Path, required=True)
     parser.add_argument("--native-baseline", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
@@ -211,11 +212,7 @@ def main() -> int:
             "--model",
             args.model,
             "--dtype",
-            "float16",
-            "--corpus",
-            "c4",
-            "--corpus",
-            "pg19",
+            args.dtype,
             "--windows-per-corpus",
             str(rows_per_corpus),
             "--window-tokens",
@@ -249,6 +246,8 @@ def main() -> int:
             "--output",
             str(output),
         ]
+        for corpus_name in corpus["corpora"]:
+            command.extend(["--corpus", corpus_name])
         if selected is not None:
             for item in selected:
                 command.extend(["--path", f"{item['source_layer']}:{item['destination_layer']}"])

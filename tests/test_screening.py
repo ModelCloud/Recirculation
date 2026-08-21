@@ -19,14 +19,31 @@ from recirculation.screening import (
 from scripts.run_cuda_screening_race import _derive_stage_artifacts, _promote
 from scripts.screen_cuda_recirculation import (
     MODEL_DTYPES,
-    _PathTelemetry,
     _candidate_batches,
-    _effective_candidate_batch_size,
-    _effective_row_batch_size,
     _candidate_schedule,
     _candidate_work,
+    _effective_candidate_batch_size,
+    _effective_row_batch_size,
+    _local_corpus_documents,
     _ordered_candidates,
+    _PathTelemetry,
 )
+
+
+def test_local_corpus_documents_read_json_gzip_and_parquet_without_hf(tmp_path):
+    import gzip
+    import json
+
+    pq = pytest.importorskip("pyarrow.parquet")
+    pa = pytest.importorskip("pyarrow")
+    json_path = tmp_path / "c4.json.gz"
+    with gzip.open(json_path, mode="wt", encoding="utf-8") as stream:
+        stream.write(json.dumps({"text": "c4 row"}) + "\n")
+    parquet_path = tmp_path / "pg19.parquet"
+    pq.write_table(pa.table({"text": ["pg row"]}), parquet_path)
+
+    assert list(_local_corpus_documents("json", [json_path])) == [{"text": "c4 row"}]
+    assert list(_local_corpus_documents("parquet", [parquet_path])) == [{"text": "pg row"}]
 
 
 def test_path_search_starts_at_conservative_alpha():

@@ -162,6 +162,50 @@ def _hidden_states_from_output(output: Any) -> torch.Tensor:
     raise TypeError("Recirculation source layer returned no tensor hidden states.")
 
 
+def _decoder_position_embeddings(
+    decoder: nn.Module,
+    hidden_states: torch.Tensor,
+    position_ids: torch.Tensor,
+) -> Any:
+    """Build the decoder family's rotary embeddings for one token position.
+
+    Gemma 3 alternates local and global attention layers and assigns a distinct
+    RoPE configuration to each layer type. Llama and Qwen3 expose one shared
+    rotary embedding tuple instead.
+    """
+
+    config = getattr(decoder, "config", None)
+    layer_types = getattr(config, "layer_types", None)
+    if getattr(config, "model_type", None) == "gemma3_text" and layer_types:
+        return {
+            layer_type: decoder.rotary_emb(hidden_states, position_ids, layer_type)
+            for layer_type in set(layer_types)
+        }
+    return decoder.rotary_emb(hidden_states, position_ids=position_ids)
+
+
+def _layer_position_embeddings(decoder: nn.Module, embeddings: Any, layer_index: int) -> Any:
+    """Select layer-specific RoPE, or return the shared Llama/Qwen tuple."""
+
+    if isinstance(embeddings, dict):
+        return embeddings[decoder.config.layer_types[layer_index]]
+    return embeddings
+
+
+def project_causal_lm_logits(model: nn.Module, hidden_states: torch.Tensor) -> torch.Tensor:
+    """Apply the checkpoint's LM head and any architecture-level logit transform."""
+
+    get_output_embeddings = getattr(model, "get_output_embeddings", None)
+    output_embeddings = get_output_embeddings() if callable(get_output_embeddings) else None
+    if output_embeddings is None:
+        raise TypeError("Recirculation requires a causal LM with output embeddings.")
+    logits = output_embeddings(hidden_states)
+    softcap = getattr(getattr(model, "config", None), "final_logit_softcapping", None)
+    if softcap is not None:
+        logits = torch.tanh(logits / softcap) * softcap
+    return logits
+
+
 class RecirculationController:
     """Attach and detach one same-token, one-additional-iteration path.
 
@@ -266,11 +310,7 @@ class RecirculationController:
     def _project_first_iteration_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Project only a consumed first-iteration readout through the LM head."""
 
-        get_output_embeddings = getattr(self.model, "get_output_embeddings", None)
-        output_embeddings = get_output_embeddings() if callable(get_output_embeddings) else None
-        if output_embeddings is None:
-            raise TypeError("Recirculation generation requires a causal LM with output embeddings.")
-        return output_embeddings(hidden_states[:, -1:, :])[:, -1, :]
+        return project_causal_lm_logits(self.model, hidden_states[:, -1:, :])[:, -1, :]
 
     def _run_pending_top_stack_iteration(
         self,
@@ -298,7 +338,12 @@ class RecirculationController:
             first_iteration_state.input_step,
         )
         # Construct on-device so the additional iteration remains CUDA Graph capture-safe.
-        position_ids = torch.full((1, 1), sequence_length - 1, dtype=torch.long, device=hidden_states.device)
+        position_ids = torch.full(
+            (hidden_states.shape[0], 1),
+            sequence_length - 1,
+            dtype=torch.long,
+            device=hidden_states.device,
+        )
         capturing = hidden_states.is_cuda and torch.cuda.is_current_stream_capturing()
         if attention_mask is None:
             if self._allow_terminal_padding:
@@ -321,25 +366,44 @@ class RecirculationController:
                         raise ValueError("terminal padding masks cannot contain a real token after padding begins")
                 elif not bool(replay_attention_mask.all()):
                     raise ValueError("paper-faithful additional iteration currently requires an unpadded batch")
-        position_embeddings = decoder.rotary_emb(hidden_states, position_ids=position_ids)
+        position_embeddings = _decoder_position_embeddings(decoder, hidden_states, position_ids)
         # All validation must complete before the cache is shortened.
+        for cache_layer in past_key_values.layers[top_stack_start:]:
+            activate_past_recording = getattr(cache_layer, "activate_past_recording", None)
+            if callable(activate_past_recording):
+                # Gemma 3's sliding-window cache normally discards states
+                # outside the active window. Upper layers must retain enough
+                # state to replace the newest KV entry during replay.
+                activate_past_recording()
         for layer in past_key_values.layers[top_stack_start:]:
             layer.crop(-1)
         self._in_additional_iteration = True
         try:
-            for layer in decoder.layers[top_stack_start:]:
+            for layer_index, layer in enumerate(
+                decoder.layers[top_stack_start:], start=top_stack_start
+            ):
                 hidden_states = layer(
                     hidden_states,
                     attention_mask=None,
                     position_ids=position_ids,
                     past_key_values=past_key_values,
                     use_cache=True,
-                    position_embeddings=position_embeddings,
+                    position_embeddings=_layer_position_embeddings(
+                        decoder, position_embeddings, layer_index
+                    ),
                 )
         finally:
             self._in_additional_iteration = False
         # Figure 3: the additional iteration updates state but has no readout.
         self._pending_first_iteration = None
+
+    def _trim_recorded_upper_cache(self, past_key_values) -> None:
+        """Return recorded sliding caches to their next-token working size."""
+
+        top_stack_start = self.config.destination_layer + 1
+        for cache_layer in past_key_values.layers[top_stack_start:]:
+            if getattr(cache_layer, "record_past", False):
+                cache_layer.crop(0)
 
     def attach(self) -> RecirculationController:
         if self._active:
@@ -411,6 +475,7 @@ class RecirculationController:
                     return_dict=True,
                 )
                 past_key_values = first_iteration_outputs.past_key_values
+                self._trim_recorded_upper_cache(past_key_values)
                 # Figure 3: readout follows the current input's first iteration.
                 if input_step + 1 == prompt_length:
                     first_iteration_logits = self._project_first_iteration_logits(
@@ -434,6 +499,7 @@ class RecirculationController:
                     return_dict=True,
                 )
                 past_key_values = first_iteration_outputs.past_key_values
+                self._trim_recorded_upper_cache(past_key_values)
                 first_iteration_logits = self._project_first_iteration_logits(
                     first_iteration_outputs.last_hidden_state
                 )
@@ -450,4 +516,9 @@ class RecirculationController:
         self.detach()
 
 
-__all__ = ["RecirculationConfig", "RecirculationController", "torch_mix_reference"]
+__all__ = [
+    "RecirculationConfig",
+    "RecirculationController",
+    "project_causal_lm_logits",
+    "torch_mix_reference",
+]

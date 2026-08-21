@@ -489,6 +489,126 @@ def test_llama_candidate_batch_matches_individual_dual_gemm():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_gemma3_oracle_concurrent_dual_and_candidate_batch_agree():
+    """Gemma 3's typed RoPE and four-norm decoder contract stay exact on CUDA."""
+
+    transformers = pytest.importorskip("transformers")
+    from recirculation.cuda_backend import (
+        CUDABatchedPathRunner,
+        CUDAConcurrentRunner,
+        CUDAPrefillRunner,
+        measure_forward_error,
+    )
+
+    torch.manual_seed(31)
+    model = (
+        transformers.Gemma3ForCausalLM(
+            transformers.Gemma3TextConfig(
+                vocab_size=64,
+                hidden_size=64,
+                intermediate_size=128,
+                num_hidden_layers=4,
+                num_attention_heads=4,
+                num_key_value_heads=2,
+                head_dim=16,
+                max_position_embeddings=64,
+                sliding_window=4,
+                layer_types=[
+                    "sliding_attention",
+                    "full_attention",
+                    "sliding_attention",
+                    "full_attention",
+                ],
+                final_logit_softcapping=10.0,
+            )
+        )
+        .half()
+        .eval()
+        .cuda()
+    )
+    model.set_attn_implementation("eager")
+    tokens = torch.tensor([[2, 7, 11, 13, 17], [2, 4, 8, 16, 32]], device="cuda")
+    mask = torch.ones_like(tokens)
+    targets = {
+        position: ([0, 1], [int(tokens[0, position] + 1), int(tokens[1, position] + 1)])
+        for position in range(tokens.shape[1])
+    }
+    configs = (
+        RecirculationConfig(source_layer=1, destination_layer=0, alpha=0.05),
+        RecirculationConfig(source_layer=2, destination_layer=0, alpha=0.05),
+        RecirculationConfig(source_layer=3, destination_layer=0, alpha=0.05),
+    )
+
+    expected = []
+    for config in configs:
+        oracle = CUDAPrefillRunner(
+            model,
+            config,
+            fused=False,
+            allow_terminal_padding=True,
+            projection_chunk_tokens=5,
+            mask_free_unpadded=True,
+        )
+        oracle_nll, counts = oracle.score(
+            tokens, targets, attention_mask=mask, return_per_row=True
+        )
+        expected.append(oracle_nll)
+        assert counts == [5, 5]
+
+        dual = CUDAConcurrentRunner(
+            model, config, use_python_threads=False, dual_gemm=True
+        )
+        try:
+            dual_nll, dual_counts = dual.score(
+                tokens,
+                targets,
+                attention_mask=mask,
+                return_per_row=True,
+                projection_chunk_tokens=5,
+            )
+        finally:
+            dual.close()
+        measure_forward_error(
+            torch.tensor(oracle_nll, device="cuda"),
+            torch.tensor(dual_nll, device="cuda"),
+        ).require()
+        assert dual_counts == counts
+
+    candidate, candidate_counts = CUDABatchedPathRunner(model, configs).score(
+        tokens,
+        targets,
+        attention_mask=mask,
+        projection_chunk_tokens=5,
+    )
+    measure_forward_error(
+        torch.tensor(expected, device="cuda"), torch.tensor(candidate, device="cuda")
+    ).require()
+    assert candidate_counts == [[[5, 5][row] for row in range(2)] for _ in configs]
+
+
+def test_gemma3_final_logit_softcap_matches_model_forward():
+    transformers = pytest.importorskip("transformers")
+    from recirculation.controller import project_causal_lm_logits
+
+    model = transformers.Gemma3ForCausalLM(
+        transformers.Gemma3TextConfig(
+            vocab_size=32,
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=8,
+            final_logit_softcapping=3.0,
+        )
+    ).eval()
+    tokens = torch.tensor([[2, 3, 4]])
+    decoder_output = model.get_decoder()(input_ids=tokens, return_dict=True).last_hidden_state
+    expected = model(input_ids=tokens, return_dict=True).logits
+    torch.testing.assert_close(project_causal_lm_logits(model, decoder_output), expected)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
 def test_cuda_generation_matches_updated_torch_controller(monkeypatch):
     transformers = pytest.importorskip("transformers")
     from recirculation.cuda_backend import CUDAConcurrentRunner
