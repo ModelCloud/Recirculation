@@ -2182,6 +2182,36 @@
         "max_new_tokens": 512,
         "split": "test"
       }
+    },
+    {
+      "benchmark": "MMLU-Stem",
+      "checkpoints": [
+        {
+          "accuracy": 0.7545,
+          "correct": 2379,
+          "rows": 3153
+        }
+      ],
+      "elapsed_seconds": null,
+      "model": "Qwen3-8B-Instruct",
+      "model_path": "/Users/diego/.cache/huggingface/hub/models--unsloth--Qwen3-8B/snapshots/946bc9ac74a6c1f8cf012497c503a119b2fcf2eb",
+      "rows": 3153,
+      "settings": {
+        "backend": "Evalution Transformers/MPS",
+        "batch_size": 1,
+        "dataset_name": "all",
+        "dataset_path": "cais/mmlu",
+        "fewshot_split": "dev",
+        "metric": "acc,ll",
+        "num_fewshot": 5,
+        "scoring_mode": "multiple_choice_loglikelihood",
+        "selection_mode": "single",
+        "split": "test",
+        "stream": true,
+        "subset_kinds": ["node"],
+        "subset_paths": [["stem"]],
+        "subsets": ["stem"]
+      }
     }
   ]
 }

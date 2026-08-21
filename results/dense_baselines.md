@@ -465,3 +465,9 @@ Backend: `MLX/Metal`
 | 1175 | 1117 | 95.0638% |
 | 1200 | 1142 | 95.1667% |
 | 1209 | 1150 | 95.1199% |
+
+### Qwen3-8B-Instruct — MMLU-Stem
+
+Rows: **3153**  
+Backend: `Evalution Transformers/MPS`  
+Final `acc,ll`: **75.45%** (**2379 / 3153**)
