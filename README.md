@@ -17,22 +17,17 @@ independently verified.
 
 ## Progress
 
-- 2026-08-21 — Qwen3-8B MLX evaluation reached 1.82x faster prompt processing by reusing fixed prompt prefixes.
-- 2026-08-21 — Qwen3-8B MLX recirculation reached 1.57x faster prefill with matching outputs.
-- 2026-08-21 — Qwen3-8B recirculation now runs faster on Torch/MPS and MLX, with MLX preferred on Apple Silicon.
-- 2026-08-21 — Torch/CUDA inference and path/alpha screening now support Qwen3, including its intentional no-BOS
-  tokenizer contract.
-- 2026-08-20 — MLX ran the matched short Apple M4 evaluation 2.86x faster than Torch/MPS.
-- 2026-08-20 — Evaluation now auto-selects CUDA or MLX and can compare same-destination candidates together.
-- 2026-08-20 — Torch is now the single reference for MLX and CUDA accuracy checks.
-- 2026-08-20 — Locked disjoint evaluation completed at 59/128 baseline and 67/128 with recirculation.
-- 2026-08-20 — CUDA screening jointly evaluates historical final-answer and full-solution perplexity, then applies
-  the real correct-to-wrong penalty during paired generation.
-- 2026-08-20 — Two-stack CUDA execution supports both GIL-enabled and free-threaded Python.
-- 2026-08-20 — The paper's zero-based ten-step ramp is now available with `ramp_tokens=10`.
-- 2026-08-20 — Corrected CUDA same-token replay reached **4.533x prefill speedup** while meeting accuracy standards.
-- 2026-08-20 — Corrected recirculation to replay each token's own upper stack and replace its upper-layer KV state.
-- 2026-08-20 — With zero feedback, replay now matches ordinary serial inference exactly in Torch and MLX.
+- 2026-08-21 — Added Qwen3-8B support across Torch/CUDA inference and path/alpha screening, including its no-BOS
+  tokenizer contract. Qwen3-8B recirculation runs faster on Torch/MPS and MLX (MLX preferred on Apple Silicon), with
+  1.57x prefill speedup at matching outputs and 1.82x faster prompt processing from fixed-prefix reuse.
+- 2026-08-20 — Corrected same-token replay so each token replays its own upper stack and replaces upper-layer KV
+  state; with zero feedback, replay matches ordinary serial inference in Torch and MLX. CUDA same-token replay reaches
+  **4.533x prefill speedup** while meeting accuracy. Added the paper's zero-based ten-step ramp (`ramp_tokens=10`)
+  and two-stack CUDA execution for both GIL-enabled and free-threaded Python. CUDA screening now jointly evaluates
+  final-answer and full-solution perplexity, then applies the correct-to-wrong penalty during paired generation.
+  Locked disjoint evaluation finished at 59/128 baseline and 67/128 recirculation. Torch is the single reference for
+  MLX and CUDA accuracy, evaluation auto-selects CUDA or MLX, and can compare same-destination candidates together.
+  MLX ran the matched short Apple M4 evaluation 2.86x faster than Torch/MPS.
 
 The Torch path is the absolute reference for the published mathematical and state behavior. MLX and CUDA may use
 hardware-specific execution, but their outputs are checked against Torch and need to meet accuracy standards.
