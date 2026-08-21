@@ -1018,6 +1018,116 @@ def test_mlx_candidate_group_is_exact_for_shared_and_divergent_tokens():
         measure_forward_error(reference_pending.source, grouped_pending.source).require(limit=0)
 
 
+def test_mlx_contiguous_batch_matches_independent_recirculation_rows():
+    mx = pytest.importorskip("mlx.core")
+    pytest.importorskip("mlx_lm")
+    from mlx_lm.models.llama import Model, ModelArgs
+
+    from recirculation.mlx_backend import (
+        CompiledNormMix,
+        MLXBatchedRecirculator,
+        MLXRecirculator,
+        measure_forward_error,
+    )
+
+    mx.random.seed(41)
+    model = Model(
+        ModelArgs(
+            model_type="llama",
+            hidden_size=16,
+            num_hidden_layers=4,
+            intermediate_size=32,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            rms_norm_eps=1e-5,
+            vocab_size=32,
+            max_position_embeddings=64,
+        )
+    )
+    mx.eval(model.parameters())
+    config = RecirculationConfig(source_layer=3, destination_layer=0, alpha=0.1)
+    sequences = ((1, 2, 3, 4), (4, 3, 2, 1))
+    references = [
+        MLXRecirculator(model, config, CompiledNormMix(config)).prefill(
+            sequence, collect_logits=True
+        )
+        for sequence in sequences
+    ]
+    batched = MLXBatchedRecirculator(model, config)
+    candidate = batched.prefill(mx.array(sequences, dtype=mx.int32), collect_logits=True)
+
+    for row, reference in enumerate(references):
+        measure_forward_error(reference[3], candidate[3][row : row + 1]).require()
+        measure_forward_error(reference[2].destination, candidate[2].destination[row : row + 1]).require()
+        measure_forward_error(reference[2].source, candidate[2].source[row : row + 1]).require()
+        for reference_cache, candidate_cache in zip(reference[1], candidate[1]):
+            for reference_value, candidate_value in zip(
+                reference_cache.state,
+                candidate_cache.extract(row).state,
+            ):
+                measure_forward_error(reference_value, candidate_value).require()
+
+    candidate_logits, candidate_pending = batched.step(
+        mx.array([[5], [6]], dtype=mx.int32),
+        candidate[1],
+        candidate[2],
+    )
+    for row, reference in enumerate(references):
+        reference_logits, reference_pending = MLXRecirculator(
+            model, config, CompiledNormMix(config)
+        ).step(
+            mx.array([[5 + row]], dtype=mx.int32),
+            reference[1],
+            reference[2],
+        )
+        measure_forward_error(reference_logits, candidate_logits[row : row + 1]).require()
+        measure_forward_error(
+            reference_pending.destination,
+            candidate_pending.destination[row : row + 1],
+        ).require()
+
+
+def test_mlx_continuous_batch_accepts_and_retires_requests():
+    mx = pytest.importorskip("mlx.core")
+    pytest.importorskip("mlx_lm")
+    from mlx_lm.models.llama import Model, ModelArgs
+
+    from recirculation.mlx_backend import MLXBatchedRecirculator, MLXContinuousBatch
+
+    mx.random.seed(43)
+    model = Model(
+        ModelArgs(
+            model_type="llama",
+            hidden_size=16,
+            num_hidden_layers=4,
+            intermediate_size=32,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            rms_norm_eps=1e-5,
+            vocab_size=32,
+            max_position_embeddings=64,
+        )
+    )
+    mx.eval(model.parameters())
+    runner = MLXBatchedRecirculator(
+        model,
+        RecirculationConfig(source_layer=3, destination_layer=0, alpha=0.1),
+    )
+    batch = MLXContinuousBatch(runner)
+    batch.add("short", [1, 2], max_new_tokens=1)
+    batch.add("long", [3, 4, 5], max_new_tokens=3)
+    assert batch.request_ids == ("short", "long")
+    assert set(batch.step()) == {"short", "long"}
+
+    batch.add("late", [6, 7, 8, 9], max_new_tokens=1)
+    assert batch.request_ids == ("long", "late")
+    assert set(batch.step()) == {"long", "late"}
+    assert batch.request_ids == ("long",)
+    assert len(batch.tokens("late")) == 5
+    assert set(batch.step()) == {"long"}
+    assert batch.request_ids == ()
+
+
 def test_mlx_candidate_group_snapshot_generation_matches_full_prompt():
     mx = pytest.importorskip("mlx.core")
     pytest.importorskip("mlx_lm")
@@ -1506,3 +1616,39 @@ def test_torch_controller_zero_feedback_matches_serial_generation_and_skips_unus
 
     torch.testing.assert_close(candidate, expected, rtol=0, atol=0)
     assert projection_calls == 3
+
+
+def test_torch_controller_dense_batch_matches_independent_zero_feedback_rows():
+    transformers = pytest.importorskip("transformers")
+
+    torch.manual_seed(20260822)
+    model = transformers.Qwen3ForCausalLM(
+        transformers.Qwen3Config(
+            vocab_size=64,
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=4,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=8,
+            max_position_embeddings=64,
+        )
+    ).eval()
+    tokens = torch.tensor([[1, 7, 11, 13], [4, 8, 12, 16]])
+    config = RecirculationConfig(source_layer=2, destination_layer=0, alpha=0.0)
+    expected = torch.cat(
+        [
+            RecirculationController(model, config).generate(
+                row[None, :], max_new_tokens=3
+            )
+            for row in tokens
+        ],
+        dim=0,
+    )
+    candidate = RecirculationController(model, config).generate(
+        tokens,
+        attention_mask=torch.ones_like(tokens),
+        max_new_tokens=3,
+    )
+
+    torch.testing.assert_close(candidate, expected, rtol=0, atol=0)

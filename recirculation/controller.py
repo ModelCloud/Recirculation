@@ -437,11 +437,14 @@ class RecirculationController:
 
         Before input step ``t`` begins its first iteration, this serial reference
         completes input step ``t-1``'s additional top-stack iteration. Readout
-        follows the first iteration only, as specified by Figure 3.
+        follows the first iteration only, as specified by Figure 3. Multiple
+        equal-length, unpadded rows share each decoder invocation; request
+        admission/removal remains the responsibility of a higher-level dense
+        batch scheduler.
         """
 
-        if input_ids.ndim != 2 or input_ids.shape[0] != 1:
-            raise ValueError("Recirculation generation currently requires input_ids with shape [1, sequence].")
+        if input_ids.ndim != 2 or input_ids.shape[0] < 1:
+            raise ValueError("Recirculation generation requires input_ids with shape [batch, sequence].")
         if max_new_tokens < 0:
             raise ValueError("max_new_tokens must be non-negative.")
         if attention_mask is None:
@@ -451,7 +454,7 @@ class RecirculationController:
         if attention_mask.device != input_ids.device:
             raise ValueError("attention_mask must be on the same device as input_ids.")
         if not bool((attention_mask == 1).all()):
-            raise ValueError("Recirculation generation requires an unpadded attention mask.")
+            raise ValueError("Dense batched recirculation requires an unpadded attention mask.")
         was_active = self._active
         if not was_active:
             self.attach()

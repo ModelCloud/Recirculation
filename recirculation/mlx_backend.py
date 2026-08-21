@@ -10,7 +10,13 @@ from dataclasses import dataclass
 
 import mlx.core as mx
 from mlx_lm.models.base import create_attention_mask
-from mlx_lm.models.cache import make_prompt_cache
+from mlx_lm.models.cache import (
+    BatchKVCache,
+    BatchRotatingKVCache,
+    KVCache,
+    RotatingKVCache,
+    make_prompt_cache,
+)
 
 from .controller import RecirculationConfig, _mixing_coefficients
 from .mlx_kernels import DualGemvMetal, Qwen3DualTokenLayer
@@ -47,6 +53,46 @@ class PendingRecirculation:
     destination: mx.array
     source: mx.array
     token_position: int
+
+
+@dataclass(frozen=True)
+class BatchedPendingRecirculation:
+    """Per-request pending state for a synchronized MLX decode batch."""
+
+    destination: mx.array
+    source: mx.array
+    token_positions: tuple[int, ...]
+
+    def select(self, indices: Sequence[int]) -> BatchedPendingRecirculation:
+        """Keep pending state for the rows retained by a continuous batch."""
+
+        selected = tuple(int(index) for index in indices)
+        row_indices = mx.array(selected, dtype=mx.uint32)
+        return BatchedPendingRecirculation(
+            mx.take(self.destination, row_indices, axis=0),
+            mx.take(self.source, row_indices, axis=0),
+            tuple(self.token_positions[index] for index in selected),
+        )
+
+    @classmethod
+    def from_scalar(cls, pending: PendingRecirculation) -> BatchedPendingRecirculation:
+        return cls(
+            pending.destination,
+            pending.source,
+            (pending.token_position,),
+        )
+
+    @classmethod
+    def concatenate(
+        cls,
+        first: BatchedPendingRecirculation,
+        second: BatchedPendingRecirculation,
+    ) -> BatchedPendingRecirculation:
+        return cls(
+            mx.concatenate([first.destination, second.destination], axis=0),
+            mx.concatenate([first.source, second.source], axis=0),
+            first.token_positions + second.token_positions,
+        )
 
 
 @dataclass(frozen=True)
@@ -300,6 +346,358 @@ class MLXRecirculator:
         return self.prefill(
             tokens, cache=cache, pending=pending, collect_logits=collect_logits
         )
+
+
+def _batch_cache_from_single(cache, left_padding: Sequence[int]):
+    """Construct the MLX-LM contiguous batch cache matching a scalar cache type."""
+
+    if type(cache) is KVCache:
+        return BatchKVCache(list(left_padding))
+    if isinstance(cache, RotatingKVCache):
+        if cache.keep > 0:
+            raise ValueError("batched recirculation does not support rotating caches with kept tokens")
+        return BatchRotatingKVCache(cache.max_size, list(left_padding))
+    raise TypeError(
+        "batched MLX recirculation requires KVCache or RotatingKVCache layers; "
+        f"got {type(cache).__name__}"
+    )
+
+
+class MLXBatchedRecirculator:
+    """Run paper-faithful recirculation over a contiguous MLX-LM decode batch.
+
+    Each active request occupies one row of :class:`BatchKVCache`. The upper
+    replay is still performed before the current first pass, but all rows share
+    the layer invocation. This is the correctness-first dense batching stage;
+    it deliberately does not claim paged-attention semantics.
+    """
+
+    def __init__(
+        self,
+        model,
+        config: RecirculationConfig,
+        mixer: Callable[[mx.array, mx.array, RecirculationConfig, int], mx.array] = mix_reference,
+    ):
+        if not hasattr(model, "model") or not hasattr(model.model, "layers"):
+            raise TypeError("MLX batched recirculation requires an MLX-LM decoder model")
+        if not 0 <= config.destination_layer < config.source_layer < len(model.model.layers):
+            raise ValueError("recirculation layers are outside the decoder or are not ordered destination < source")
+        self.model = model
+        self.config = config
+        self.mixer = mixer
+
+    def make_cache(
+        self,
+        batch_size: int,
+        *,
+        left_padding: Sequence[int] | None = None,
+    ):
+        """Create contiguous MLX-LM batch caches for ``batch_size`` requests."""
+
+        if batch_size < 1:
+            raise ValueError("batched recirculation requires a positive batch size")
+        padding = [0] * batch_size if left_padding is None else [int(value) for value in left_padding]
+        if len(padding) != batch_size or any(value < 0 for value in padding):
+            raise ValueError("left_padding must contain one non-negative value per batch row")
+        scalar_caches = make_prompt_cache(self.model)
+        return [
+            _batch_cache_from_single(cache, padding)
+            for cache in scalar_caches
+        ]
+
+    @staticmethod
+    def _batch_size(cache) -> int:
+        first = cache[0]
+        padding = getattr(first, "left_padding", None)
+        if padding is None:
+            raise TypeError("batched MLX recirculation requires a batch-aware cache")
+        return int(padding.size)
+
+    @staticmethod
+    def _positions(cache, cache_index: int, batch_size: int) -> tuple[int, ...]:
+        offsets = getattr(cache[cache_index], "offset", None)
+        if offsets is None:
+            raise TypeError("batched MLX recirculation cache has no per-row offsets")
+        values = offsets.tolist()
+        if not isinstance(values, list):
+            values = [values]
+        if len(values) != batch_size:
+            raise ValueError("cache offset count does not match the token batch")
+        return tuple(int(value) for value in values)
+
+    @staticmethod
+    def _masks(decoder, hidden, cache, default_cache_index: int):
+        full_cache_index = getattr(decoder, "fa_idx", default_cache_index)
+        full_mask = create_attention_mask(hidden, cache[full_cache_index])
+        sliding_cache_index = getattr(decoder, "swa_idx", None)
+        if sliding_cache_index is None:
+            return full_mask, None
+        sliding_mask = create_attention_mask(
+            hidden,
+            cache[sliding_cache_index],
+            window_size=decoder.sliding_window,
+        )
+        return full_mask, sliding_mask
+
+    def _mix_pending(self, pending: BatchedPendingRecirculation) -> mx.array:
+        if pending.destination.shape[0] != len(pending.token_positions):
+            raise ValueError("pending activation rows and token positions must match")
+        mixed = [
+            self.mixer(
+                pending.destination[index : index + 1],
+                pending.source[index : index + 1],
+                self.config,
+                pending.token_positions[index],
+            )
+            for index in range(len(pending.token_positions))
+        ]
+        return mx.concatenate(mixed, axis=0)
+
+    def _replay_pending(self, cache, pending: BatchedPendingRecirculation | None) -> None:
+        if pending is None:
+            return
+        batch_size = self._batch_size(cache)
+        if len(pending.token_positions) != batch_size:
+            raise ValueError("pending state and cache batch sizes must match")
+        decoder = self.model.model
+        first_upper_layer = self.config.destination_layer + 1
+        for layer_cache in cache[first_upper_layer:]:
+            if layer_cache.trim(1) != 1:
+                raise RuntimeError("cannot rewind the preceding token for batched recirculation")
+        hidden = self._mix_pending(pending)
+        # During replay the lower stack still contains the preceding token,
+        # while the upper stack has been rewound. Build the mask from the
+        # rewound upper cache; using decoder.fa_idx here would describe the
+        # lower cache and overstate the replay key length for BatchKVCache.
+        full_mask = create_attention_mask(hidden, cache[first_upper_layer])
+        sliding_cache_index = getattr(decoder, "swa_idx", None)
+        if sliding_cache_index is None:
+            sliding_mask = None
+        else:
+            sliding_mask = create_attention_mask(
+                hidden,
+                cache[sliding_cache_index],
+                window_size=decoder.sliding_window,
+            )
+        for layer, layer_cache in zip(
+            decoder.layers[first_upper_layer:], cache[first_upper_layer:]
+        ):
+            mask = sliding_mask if getattr(layer, "use_sliding", False) else full_mask
+            hidden = layer(hidden, mask, cache=layer_cache)
+
+    def step(
+        self,
+        token: mx.array,
+        cache,
+        pending: BatchedPendingRecirculation | None = None,
+        *,
+        project_logits: bool = True,
+    ):
+        """Run one synchronized current-token step for every active request."""
+
+        if token.ndim == 1:
+            token = token[:, None]
+        if token.ndim != 2 or token.shape[1] != 1:
+            raise ValueError("batched recirculation requires token shape [batch, 1]")
+        batch_size = int(token.shape[0])
+        if self._batch_size(cache) != batch_size:
+            raise ValueError("token and cache batch sizes must match")
+        decoder = self.model.model
+        full_cache_index = getattr(decoder, "fa_idx", 0)
+        token_positions = self._positions(cache, full_cache_index, batch_size)
+        self._replay_pending(cache, pending)
+
+        hidden = decoder.embed_tokens(token)
+        full_mask, sliding_mask = self._masks(decoder, hidden, cache, full_cache_index)
+        destination = source = None
+        for index, (layer, layer_cache) in enumerate(zip(decoder.layers, cache)):
+            mask = sliding_mask if getattr(layer, "use_sliding", False) else full_mask
+            hidden = layer(hidden, mask, cache=layer_cache)
+            if index == self.config.destination_layer:
+                destination = hidden
+            if index == self.config.source_layer:
+                source = hidden
+        if destination is None or source is None:
+            raise RuntimeError("recirculation path activations were not captured")
+        next_pending = BatchedPendingRecirculation(destination, source, token_positions)
+        if not project_logits:
+            return None, next_pending
+        hidden = decoder.norm(hidden)
+        if self.model.args.tie_word_embeddings:
+            logits = decoder.embed_tokens.as_linear(hidden)
+        else:
+            logits = self.model.lm_head(hidden)
+        return logits, next_pending
+
+    def prefill(
+        self,
+        tokens: mx.array,
+        *,
+        cache=None,
+        pending: BatchedPendingRecirculation | None = None,
+        collect_logits: bool = False,
+    ):
+        """Prefill equal-length rows, sharing every decoder-layer invocation."""
+
+        if tokens.ndim == 1:
+            tokens = tokens[None, :]
+        if tokens.ndim != 2 or tokens.shape[1] < 1:
+            raise ValueError("batched prefill requires tokens with shape [batch, sequence]")
+        batch_size = int(tokens.shape[0])
+        cache = self.make_cache(batch_size) if cache is None else cache
+        logits = None
+        collected = []
+        for index in range(int(tokens.shape[1])):
+            project_logits = collect_logits or index == int(tokens.shape[1]) - 1
+            logits, pending = self.step(
+                tokens[:, index : index + 1],
+                cache,
+                pending,
+                project_logits=project_logits,
+            )
+            if logits is not None:
+                collected.append(logits)
+        if logits is None or pending is None:
+            raise ValueError("batched prefill requires at least one token")
+        mx.eval(logits, pending.destination, pending.source)
+        all_logits = mx.concatenate(collected, axis=1) if collected else None
+        return logits, cache, pending, all_logits
+
+
+@dataclass
+class _MLXContinuousRequest:
+    request_id: str
+    tokens: list[int]
+    next_token: int
+    max_new_tokens: int
+    eos_token_id: int | None
+    generated: int = 0
+
+
+class MLXContinuousBatch:
+    """Small request scheduler using MLX-LM contiguous batch caches.
+
+    Requests may be added between decode steps. New prompts are prefetched in
+    isolation, then merged into the active ``BatchKVCache``; finished requests
+    are filtered out without rebuilding the model. This mirrors MLX-LM's
+    continuous-batch lifecycle while keeping recirculation state explicit.
+    """
+
+    def __init__(self, runner: MLXBatchedRecirculator):
+        self.runner = runner
+        self.requests: list[_MLXContinuousRequest] = []
+        self.cache = None
+        self.pending: BatchedPendingRecirculation | None = None
+        self.completed: dict[str, tuple[int, ...]] = {}
+
+    @property
+    def request_ids(self) -> tuple[str, ...]:
+        return tuple(request.request_id for request in self.requests)
+
+    def _scalar_runner(self) -> MLXRecirculator:
+        return MLXRecirculator(self.runner.model, self.runner.config, self.runner.mixer)
+
+    def _merge_caches(self, new_cache) -> None:
+        rows = []
+        if self.cache is not None:
+            for row in range(len(self.requests)):
+                rows.append([layer_cache.extract(row) for layer_cache in self.cache])
+        rows.append(new_cache)
+        merged = []
+        for layer_index in range(len(rows[0])):
+            layer_rows = [row[layer_index] for row in rows]
+            if isinstance(layer_rows[0], RotatingKVCache):
+                merged.append(BatchRotatingKVCache.merge(layer_rows))
+            else:
+                merged.append(BatchKVCache.merge(layer_rows))
+        self.cache = merged
+
+    def add(
+        self,
+        request_id: str,
+        prompt: Sequence[int],
+        *,
+        max_new_tokens: int,
+        eos_token_id: int | None = None,
+    ) -> None:
+        """Prefill and join one request without stopping active requests."""
+
+        if request_id in self.request_ids or request_id in self.completed:
+            raise ValueError(f"request_id already exists: {request_id}")
+        if max_new_tokens < 1:
+            raise ValueError("max_new_tokens must be positive")
+        prompt = [int(token) for token in prompt]
+        if not prompt:
+            raise ValueError("prompt must contain at least one token")
+        scalar = self._scalar_runner()
+        logits, new_cache, new_pending, _ = scalar.prefill(prompt)
+        next_token = int(mx.argmax(logits[0, -1]).item())
+        if self.pending is None:
+            self._merge_caches(new_cache)
+            self.pending = BatchedPendingRecirculation.from_scalar(new_pending)
+        else:
+            self._merge_caches(new_cache)
+            self.pending = BatchedPendingRecirculation.concatenate(
+                self.pending,
+                BatchedPendingRecirculation.from_scalar(new_pending),
+            )
+        self.requests.append(
+            _MLXContinuousRequest(
+                request_id,
+                prompt,
+                next_token,
+                int(max_new_tokens),
+                eos_token_id,
+            )
+        )
+
+    def _filter(self, keep: Sequence[int]) -> None:
+        keep = tuple(int(index) for index in keep)
+        if not keep:
+            self.requests = []
+            self.cache = None
+            self.pending = None
+            return
+        for layer_cache in self.cache:
+            layer_cache.filter(list(keep))
+        self.pending = self.pending.select(keep)
+        self.requests = [self.requests[index] for index in keep]
+
+    def step(self) -> dict[str, int]:
+        """Advance all active requests and return the tokens emitted this step."""
+
+        if not self.requests or self.cache is None or self.pending is None:
+            return {}
+        tokens = mx.array([[request.next_token] for request in self.requests], dtype=mx.int32)
+        logits, next_pending = self.runner.step(tokens, self.cache, self.pending)
+        mx.eval(logits, next_pending.destination, next_pending.source)
+        emitted = {}
+        keep = []
+        for index, request in enumerate(self.requests):
+            token = int(request.next_token)
+            request.tokens.append(token)
+            request.generated += 1
+            emitted[request.request_id] = token
+            request.next_token = int(mx.argmax(logits[index, -1]).item())
+            finished = request.generated >= request.max_new_tokens
+            finished = finished or (
+                request.eos_token_id is not None and token == request.eos_token_id
+            )
+            if not finished:
+                keep.append(index)
+            else:
+                self.completed[request.request_id] = tuple(request.tokens)
+        self.pending = next_pending
+        self._filter(keep)
+        return emitted
+
+    def tokens(self, request_id: str) -> tuple[int, ...]:
+        for request in self.requests:
+            if request.request_id == request_id:
+                return tuple(request.tokens)
+        if request_id in self.completed:
+            return self.completed[request_id]
+        raise KeyError(request_id)
 
 
 class MLXQwen3DualGemvRecirculator(MLXRecirculator):

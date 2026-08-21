@@ -221,9 +221,12 @@ python scripts/sweep_gsm8k.py \
   --output results/screen.json
 ```
 
-The controller currently supports batch size 1 and the one-path, one-iteration variant. The fixed linear ramp is
-supported; the paper's learned adaptive variant, multiple paths, and multiple recirculation iterations are outside
-this reproduction.
+The controller remains a one-path, one-iteration implementation. The fixed linear ramp is supported; the paper's
+learned adaptive variant, multiple paths, and multiple recirculation iterations are outside this reproduction.
+
+MLX also provides contiguous batched recirculation through `MLXBatchedRecirculator` and request admission/retirement
+through `MLXContinuousBatch`. Torch/MPS supports synchronized equal-length dense batches. These paths use contiguous
+KV storage; the experimental paged-attention path currently targets CUDA.
 
 ## Run Evalution benchmarks
 
