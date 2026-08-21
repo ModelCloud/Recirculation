@@ -17,6 +17,7 @@ independently verified.
 
 ## Progress
 
+- 2026-08-21 — Qwen3-8B MLX recirculation reached 1.57x faster prefill with matching outputs.
 - 2026-08-21 — Qwen3-8B recirculation now runs faster on Torch/MPS and MLX, with MLX preferred on Apple Silicon.
 - 2026-08-21 — Torch/CUDA inference and path/alpha screening now support Qwen3, including its intentional no-BOS
   tokenizer contract.

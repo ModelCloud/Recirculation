@@ -512,6 +512,89 @@ def test_mlx_forward_error_gate_accepts_exact_and_rejects_excess_error():
         absolute_only.require()
 
 
+@pytest.mark.parametrize("dtype_name", ("bfloat16", "float16", "float32"))
+@pytest.mark.parametrize(("out_features", "in_features"), ((20, 128), (19, 130)))
+def test_mlx_dual_gemv_matches_two_independent_projections(dtype_name, out_features, in_features):
+    mx = pytest.importorskip("mlx.core")
+    from recirculation.mlx_kernels import DualGemvMetal
+
+    dtype = getattr(mx, dtype_name)
+    mx.random.seed(17)
+    weight = mx.random.normal((out_features, in_features)).astype(dtype)
+    input0 = mx.random.normal((1, 1, in_features)).astype(dtype)
+    input1 = mx.random.normal((1, 1, in_features)).astype(dtype)
+    reference0 = input0 @ weight.T
+    reference1 = input1 @ weight.T
+    candidate0, candidate1 = DualGemvMetal()(weight, input0, input1)
+    mx.eval(reference0, reference1, candidate0, candidate1)
+
+    assert mx.array_equal(reference0, candidate0).item()
+    assert mx.array_equal(reference1, candidate1).item()
+
+
+def test_mlx_dual_gemv_rejects_non_gemv_shapes():
+    mx = pytest.importorskip("mlx.core")
+    from recirculation.mlx_kernels import DualGemvMetal
+
+    kernel = DualGemvMetal()
+    with pytest.raises(ValueError, match="BN=1"):
+        kernel(mx.zeros((8, 64)), mx.zeros((1, 64)), mx.zeros((1, 64)))
+
+
+def test_mlx_qwen3_dual_token_layer_matches_two_serial_layer_calls():
+    mx = pytest.importorskip("mlx.core")
+    pytest.importorskip("mlx_lm")
+    from mlx_lm.models.cache import KVCache
+    from mlx_lm.models.qwen3 import ModelArgs, TransformerBlock
+
+    from recirculation.mlx_kernels import Qwen3DualTokenLayer
+
+    mx.random.seed(23)
+    layer = TransformerBlock(
+        ModelArgs(
+            model_type="qwen3",
+            hidden_size=128,
+            num_hidden_layers=1,
+            intermediate_size=256,
+            num_attention_heads=4,
+            rms_norm_eps=1e-6,
+            vocab_size=32,
+            num_key_value_heads=2,
+            max_position_embeddings=64,
+            rope_theta=1_000_000.0,
+            head_dim=32,
+            tie_word_embeddings=False,
+        )
+    )
+    mx.eval(layer.parameters())
+    prefix = mx.random.normal((1, 1, 128)).astype(mx.float16)
+    replay = mx.random.normal((1, 1, 128)).astype(mx.float16)
+    current = mx.random.normal((1, 1, 128)).astype(mx.float16)
+    prefix_cache = KVCache()
+    mx.eval(layer(prefix, None, prefix_cache))
+    cache_values = tuple(value + mx.zeros_like(value) for value in prefix_cache.state)
+    serial_cache = KVCache()
+    serial_cache.state = cache_values
+    paired_cache = KVCache()
+    paired_cache.state = tuple(value + mx.zeros_like(value) for value in cache_values)
+
+    expected_replay = layer(replay, None, serial_cache)
+    expected_current = layer(current, None, serial_cache)
+    candidate_replay, candidate_current = Qwen3DualTokenLayer()(
+        layer,
+        replay,
+        current,
+        None,
+        paired_cache,
+    )
+    mx.eval(expected_replay, expected_current, candidate_replay, candidate_current)
+
+    assert mx.array_equal(expected_replay, candidate_replay).item()
+    assert mx.array_equal(expected_current, candidate_current).item()
+    for expected, candidate in zip(serial_cache.state, paired_cache.state):
+        assert mx.array_equal(expected, candidate).item()
+
+
 def test_mlx_reference_mixture_matches_published_norm_ratio_equation():
     mx = pytest.importorskip("mlx.core")
     from recirculation.mlx_backend import measure_forward_error, mix_reference
@@ -615,6 +698,62 @@ def test_mlx_candidate_group_is_exact_for_shared_and_divergent_tokens():
         measure_forward_error(reference_logits, grouped_logits).require(limit=0)
         measure_forward_error(reference_pending.destination, grouped_pending.destination).require(limit=0)
         measure_forward_error(reference_pending.source, grouped_pending.source).require(limit=0)
+
+
+def test_mlx_qwen3_candidate_group_auto_uses_exact_dual_gemv():
+    mx = pytest.importorskip("mlx.core")
+    pytest.importorskip("mlx_lm")
+    from mlx_lm.models.qwen3 import Model, ModelArgs
+
+    from recirculation.mlx_backend import (
+        CompiledNormMix,
+        MLXCandidateGroupRecirculator,
+        MLXQwen3DualGemvRecirculator,
+        MLXRecirculator,
+        measure_forward_error,
+    )
+
+    mx.random.seed(29)
+    model = Model(
+        ModelArgs(
+            model_type="qwen3",
+            hidden_size=128,
+            num_hidden_layers=4,
+            intermediate_size=256,
+            num_attention_heads=4,
+            rms_norm_eps=1e-6,
+            vocab_size=32,
+            num_key_value_heads=2,
+            max_position_embeddings=64,
+            rope_theta=1_000_000.0,
+            head_dim=32,
+            tie_word_embeddings=False,
+        )
+    )
+    mx.eval(model.parameters())
+    configs = (
+        RecirculationConfig(source_layer=2, destination_layer=0, alpha=0.1),
+        RecirculationConfig(source_layer=3, destination_layer=0, alpha=0.2),
+    )
+    references = [
+        MLXRecirculator(model, config, CompiledNormMix(config)).prefill([1, 2, 3], collect_logits=True)
+        for config in configs
+    ]
+    grouped = MLXCandidateGroupRecirculator(
+        model,
+        configs,
+        [CompiledNormMix(config) for config in configs],
+    )
+    assert all(isinstance(runner, MLXQwen3DualGemvRecirculator) for runner in grouped.runners)
+    candidate = grouped.prefill([1, 2, 3], collect_logits=True)
+
+    for row, reference in enumerate(references):
+        measure_forward_error(reference[3], candidate[3][row]).require(limit=0)
+        measure_forward_error(reference[2].destination, candidate[2][row].destination).require(limit=0)
+        measure_forward_error(reference[2].source, candidate[2][row].source).require(limit=0)
+        for reference_cache, candidate_cache in zip(reference[1], candidate[1][row]):
+            for reference_value, candidate_value in zip(reference_cache.state, candidate_cache.state):
+                measure_forward_error(reference_value, candidate_value).require(limit=0)
 
 
 def test_mlx_qwen3_recirculation_matches_zero_feedback_serial_inference():

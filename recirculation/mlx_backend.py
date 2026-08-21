@@ -13,6 +13,7 @@ from mlx_lm.models.base import create_attention_mask
 from mlx_lm.models.cache import make_prompt_cache
 
 from .controller import RecirculationConfig, _mixing_coefficients
+from .mlx_kernels import DualGemvMetal, Qwen3DualTokenLayer
 
 MAX_FORWARD_ERROR = 2e-3
 
@@ -301,6 +302,119 @@ class MLXRecirculator:
         )
 
 
+class MLXQwen3DualGemvRecirculator(MLXRecirculator):
+    """Use exact dual-GEMV projections for adjacent Qwen3 upper stacks."""
+
+    @staticmethod
+    def supports_model(model) -> bool:
+        if getattr(model, "model_type", None) != "qwen3":
+            return False
+        projections = (
+            projection.weight
+            for layer in model.model.layers
+            for projection in (
+                layer.self_attn.q_proj,
+                layer.self_attn.k_proj,
+                layer.self_attn.v_proj,
+                layer.self_attn.o_proj,
+                layer.mlp.gate_proj,
+                layer.mlp.up_proj,
+                layer.mlp.down_proj,
+            )
+        )
+        return all(DualGemvMetal.supports(weight) for weight in projections)
+
+    def __init__(
+        self,
+        model,
+        config: RecirculationConfig,
+        mixer: Callable[[mx.array, mx.array, RecirculationConfig, int], mx.array] = mix_reference,
+    ):
+        super().__init__(model, config, mixer)
+        if getattr(model, "model_type", None) != "qwen3":
+            raise TypeError("dual-GEMV recirculation currently supports Qwen3 only")
+        if not self.supports_model(model):
+            raise ValueError("Qwen3 projection shapes do not all use the supported BN=1 GEMV dispatch")
+        self.paired_layer = Qwen3DualTokenLayer()
+
+    def step(
+        self,
+        token: mx.array,
+        cache,
+        pending: PendingRecirculation | None = None,
+        *,
+        project_logits: bool = True,
+    ):
+        """Pair replay and current upper layers while preserving first-pass readout."""
+
+        if pending is None:
+            return super().step(token, cache, pending, project_logits=project_logits)
+        if token.ndim == 1:
+            token = token[None, :]
+        if token.shape != (1, 1):
+            raise ValueError("step requires one token with shape [1, 1]")
+
+        decoder = self.model.model
+        first_upper_layer = self.config.destination_layer + 1
+        full_cache_index = getattr(decoder, "fa_idx", 0)
+        token_position = int(cache[full_cache_index].size())
+        current = decoder.embed_tokens(token)
+        current_full_mask, current_sliding_mask = self._masks(decoder, current, cache, full_cache_index)
+        for layer, layer_cache in zip(decoder.layers[:first_upper_layer], cache[:first_upper_layer]):
+            mask = current_sliding_mask if getattr(layer, "use_sliding", False) else current_full_mask
+            current = layer(current, mask, cache=layer_cache)
+        return self._paired_upper(
+            current,
+            cache,
+            pending,
+            token_position,
+            project_logits=project_logits,
+        )
+
+    def _paired_upper(
+        self,
+        destination: mx.array,
+        cache,
+        pending: PendingRecirculation,
+        token_position: int,
+        *,
+        project_logits: bool,
+    ):
+        decoder = self.model.model
+        first_upper_layer = self.config.destination_layer + 1
+        for layer_cache in cache[first_upper_layer:]:
+            if layer_cache.trim(1) != 1:
+                raise RuntimeError("cannot rewind the preceding token for recirculation")
+        replay = self.mixer(
+            pending.destination,
+            pending.source,
+            self.config,
+            pending.token_position,
+        )
+        replay_full_mask, replay_sliding_mask = self._masks(decoder, replay, cache, first_upper_layer)
+        current = destination
+        source = None
+        for index, (layer, layer_cache) in enumerate(
+            zip(decoder.layers[first_upper_layer:], cache[first_upper_layer:]),
+            start=first_upper_layer,
+        ):
+            mask = replay_sliding_mask if getattr(layer, "use_sliding", False) else replay_full_mask
+            replay, current = self.paired_layer(layer, replay, current, mask, layer_cache)
+            if index == self.config.source_layer:
+                source = current
+        if source is None:
+            raise RuntimeError("recirculation source activation was not captured")
+        next_pending = PendingRecirculation(destination, source, token_position)
+        if not project_logits:
+            return None, next_pending
+        hidden = decoder.norm(current)
+        if self.model.args.tie_word_embeddings:
+            logits = decoder.embed_tokens.as_linear(hidden)
+        else:
+            logits = self.model.lm_head(hidden)
+        return logits, next_pending
+
+
 class MLXCandidateGroupRecirculator:
     """Share an exact lower stack across same-destination MLX candidates.
 
@@ -326,10 +440,10 @@ class MLXCandidateGroupRecirculator:
         selected_mixers = tuple(mixers) if mixers is not None else tuple(mix_reference for _ in self.configs)
         if len(selected_mixers) != len(self.configs):
             raise ValueError("grouped MLX recirculation requires one mixer per candidate")
-        self.runners = tuple(
-            MLXRecirculator(model, config, mixer)
-            for config, mixer in zip(self.configs, selected_mixers)
-        )
+        runner_type = MLXRecirculator
+        if MLXQwen3DualGemvRecirculator.supports_model(model):
+            runner_type = MLXQwen3DualGemvRecirculator
+        self.runners = tuple(runner_type(model, config, mixer) for config, mixer in zip(self.configs, selected_mixers))
         self.model = model
         self.destination_layer = self.configs[0].destination_layer
 
@@ -433,22 +547,39 @@ class MLXCandidateGroupRecirculator:
         if len(set(positions)) != 1:
             raise ValueError("grouped lower-stack sharing requires equal candidate cache lengths")
         token_position = positions[0]
+        use_dual_gemv = all(
+            isinstance(runner, MLXQwen3DualGemvRecirculator) and pending is not None
+            for runner, pending in zip(self.runners, pendings)
+        )
         for runner, cache, pending in zip(self.runners, caches, pendings):
             if pending is not None and pending.token_position != token_position - 1:
                 raise ValueError("pending token position does not precede the current cache position")
-            runner._recirculate_pending(cache, pending)
+            if not use_dual_gemv:
+                runner._recirculate_pending(cache, pending)
         destination = self._run_shared_lower(token.astype(mx.int32), caches[0])
         self._share_lower_cache(caches)
-        outputs = [
-            self._run_candidate_upper(
-                row,
-                destination,
-                cache,
-                token_position,
-                project_logits=project_logits,
-            )
-            for row, cache in enumerate(caches)
-        ]
+        if use_dual_gemv:
+            outputs = [
+                runner._paired_upper(
+                    destination,
+                    cache,
+                    pending,
+                    token_position,
+                    project_logits=project_logits,
+                )
+                for runner, cache, pending in zip(self.runners, caches, pendings)
+            ]
+        else:
+            outputs = [
+                self._run_candidate_upper(
+                    row,
+                    destination,
+                    cache,
+                    token_position,
+                    project_logits=project_logits,
+                )
+                for row, cache in enumerate(caches)
+            ]
         logits = [item[0] for item in outputs]
         next_pendings = [item[1] for item in outputs]
         mx.eval(
@@ -566,6 +697,7 @@ __all__ = [
     "MLXCandidateGroupRecirculator",
     "MLXCandidateGroupSnapshot",
     "MLXPrefillSnapshot",
+    "MLXQwen3DualGemvRecirculator",
     "MLXRecirculator",
     "PendingRecirculation",
     "measure_forward_error",
