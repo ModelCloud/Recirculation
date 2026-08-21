@@ -617,6 +617,46 @@ def test_mlx_candidate_group_is_exact_for_shared_and_divergent_tokens():
         measure_forward_error(reference_pending.source, grouped_pending.source).require(limit=0)
 
 
+def test_mlx_qwen3_recirculation_matches_zero_feedback_serial_inference():
+    mx = pytest.importorskip("mlx.core")
+    pytest.importorskip("mlx_lm")
+    from mlx_lm.models.cache import make_prompt_cache
+    from mlx_lm.models.qwen3 import Model, ModelArgs
+
+    from recirculation.mlx_backend import CompiledNormMix, MLXRecirculator, measure_forward_error
+
+    mx.random.seed(11)
+    model = Model(
+        ModelArgs(
+            model_type="qwen3",
+            hidden_size=16,
+            num_hidden_layers=4,
+            intermediate_size=32,
+            num_attention_heads=4,
+            rms_norm_eps=1e-6,
+            vocab_size=32,
+            num_key_value_heads=2,
+            max_position_embeddings=64,
+            rope_theta=1_000_000.0,
+            head_dim=4,
+            tie_word_embeddings=False,
+        )
+    )
+    mx.eval(model.parameters())
+    tokens = [1, 2, 3, 4]
+    baseline_cache = make_prompt_cache(model)
+    baseline = mx.concatenate(
+        [model(mx.array([[token]], dtype=mx.int32), cache=baseline_cache) for token in tokens],
+        axis=1,
+    )
+    config = RecirculationConfig(source_layer=2, destination_layer=0, alpha=0.0)
+    runner = MLXRecirculator(model, config, CompiledNormMix(config))
+    candidate = runner.prefill(tokens, collect_logits=True)[3]
+
+    mx.eval(baseline, candidate)
+    measure_forward_error(baseline, candidate).require(limit=0)
+
+
 @pytest.mark.parametrize(
     ("destination_values", "source_values"),
     (
@@ -927,3 +967,40 @@ def test_controller_ramp_forwards_zero_based_input_step_to_mixer():
     assert [item[0] for item in observed] == pytest.approx(expected_alpha)
     assert [item[1] for item in observed] == pytest.approx([1.0 - alpha for alpha in expected_alpha])
     assert all(not item[2] for item in observed)
+
+
+def test_torch_controller_zero_feedback_matches_serial_generation_and_skips_unused_readout():
+    transformers = pytest.importorskip("transformers")
+
+    torch.manual_seed(20260821)
+    model = transformers.Qwen3ForCausalLM(
+        transformers.Qwen3Config(
+            vocab_size=64,
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=4,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=8,
+            max_position_embeddings=64,
+        )
+    ).eval()
+    tokens = torch.tensor([[1, 7, 11, 13]])
+    expected = model.generate(tokens, max_new_tokens=3, do_sample=False, use_cache=True)
+    controller = RecirculationController(
+        model,
+        RecirculationConfig(source_layer=2, destination_layer=0, alpha=0.0),
+    )
+    projection_calls = 0
+    original_projection = controller._project_first_iteration_logits
+
+    def count_projection(hidden_states):
+        nonlocal projection_calls
+        projection_calls += 1
+        return original_projection(hidden_states)
+
+    controller._project_first_iteration_logits = count_projection
+    candidate = controller.generate(tokens, max_new_tokens=3)
+
+    torch.testing.assert_close(candidate, expected, rtol=0, atol=0)
+    assert projection_calls == 3

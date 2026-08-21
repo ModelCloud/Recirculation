@@ -263,7 +263,20 @@ class RecirculationController:
         self._next_input_step += input_step_count
         return output
 
-    def _run_pending_top_stack_iteration(self, past_key_values, attention_mask: torch.Tensor) -> None:
+    def _project_first_iteration_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Project only a consumed first-iteration readout through the LM head."""
+
+        get_output_embeddings = getattr(self.model, "get_output_embeddings", None)
+        output_embeddings = get_output_embeddings() if callable(get_output_embeddings) else None
+        if output_embeddings is None:
+            raise TypeError("Recirculation generation requires a causal LM with output embeddings.")
+        return output_embeddings(hidden_states[:, -1:, :])[:, -1, :]
+
+    def _run_pending_top_stack_iteration(
+        self,
+        past_key_values,
+        attention_mask: torch.Tensor | None,
+    ) -> None:
         """Run the preceding input step's additional top-stack iteration.
 
         This is the serial form of Figure 3(c)'s top-stack branch. It begins
@@ -287,23 +300,27 @@ class RecirculationController:
         # Construct on-device so the additional iteration remains CUDA Graph capture-safe.
         position_ids = torch.full((1, 1), sequence_length - 1, dtype=torch.long, device=hidden_states.device)
         capturing = hidden_states.is_cuda and torch.cuda.is_current_stream_capturing()
-        if (
-            attention_mask.ndim != 2
-            or attention_mask.shape[0] != hidden_states.shape[0]
-            or attention_mask.shape[1] < sequence_length
-        ):
-            raise ValueError("attention_mask must cover the replay batch and complete KV cache")
-        if attention_mask.device != hidden_states.device:
-            raise ValueError("attention_mask must be on the same device as the replay residuals")
-        replay_attention_mask = attention_mask[:, :sequence_length]
-        if not capturing:
-            if not bool(((replay_attention_mask == 0) | (replay_attention_mask == 1)).all()):
-                raise ValueError("attention_mask must contain only zeros and ones")
+        if attention_mask is None:
             if self._allow_terminal_padding:
-                if bool((replay_attention_mask[:, 1:] > replay_attention_mask[:, :-1]).any()):
-                    raise ValueError("terminal padding masks cannot contain a real token after padding begins")
-            elif not bool(replay_attention_mask.all()):
-                raise ValueError("paper-faithful additional iteration currently requires an unpadded batch")
+                raise ValueError("terminal-padding replay requires an explicit attention_mask")
+        else:
+            if (
+                attention_mask.ndim != 2
+                or attention_mask.shape[0] != hidden_states.shape[0]
+                or attention_mask.shape[1] < sequence_length
+            ):
+                raise ValueError("attention_mask must cover the replay batch and complete KV cache")
+            if attention_mask.device != hidden_states.device:
+                raise ValueError("attention_mask must be on the same device as the replay residuals")
+            replay_attention_mask = attention_mask[:, :sequence_length]
+            if not capturing:
+                if not bool(((replay_attention_mask == 0) | (replay_attention_mask == 1)).all()):
+                    raise ValueError("attention_mask must contain only zeros and ones")
+                if self._allow_terminal_padding:
+                    if bool((replay_attention_mask[:, 1:] > replay_attention_mask[:, :-1]).any()):
+                        raise ValueError("terminal padding masks cannot contain a real token after padding begins")
+                elif not bool(replay_attention_mask.all()):
+                    raise ValueError("paper-faithful additional iteration currently requires an unpadded batch")
         position_embeddings = decoder.rotary_emb(hidden_states, position_ids=position_ids)
         # All validation must complete before the cache is shortened.
         for layer in past_key_values.layers[top_stack_start:]:
@@ -378,44 +395,49 @@ class RecirculationController:
             self.reset()
         try:
             prompt_length = input_ids.shape[1]
-            generated = input_ids.clone()
+            generated_parts = [input_ids]
             past_key_values = None
             first_iteration_logits = None
             for input_step in range(prompt_length):
                 current_input = input_ids[:, input_step : input_step + 1]
-                prefix_mask = attention_mask[:, : input_step + 1]
                 if past_key_values is not None:
                     # Serial equivalent of Figure 3(c)'s preceding top-stack branch.
-                    self._run_pending_top_stack_iteration(past_key_values, prefix_mask)
-                first_iteration_outputs = self.model(
+                    self._run_pending_top_stack_iteration(past_key_values, None)
+                first_iteration_outputs = self.decoder(
                     input_ids=current_input,
-                    attention_mask=prefix_mask,
+                    attention_mask=None,
                     past_key_values=past_key_values,
                     use_cache=True,
+                    return_dict=True,
                 )
                 past_key_values = first_iteration_outputs.past_key_values
                 # Figure 3: readout follows the current input's first iteration.
-                first_iteration_logits = first_iteration_outputs.logits[:, -1, :]
-            for _ in range(max_new_tokens):
+                if input_step + 1 == prompt_length:
+                    first_iteration_logits = self._project_first_iteration_logits(
+                        first_iteration_outputs.last_hidden_state
+                    )
+            for generation_step in range(max_new_tokens):
                 if first_iteration_logits is None:
                     break
                 next_input = first_iteration_logits.argmax(dim=-1, keepdim=True)
-                generated = torch.cat((generated, next_input), dim=1)
+                generated_parts.append(next_input)
                 if eos_token_id is not None and bool((next_input == eos_token_id).all()):
                     break
-                full_mask = torch.ones(
-                    (1, generated.shape[1]), dtype=attention_mask.dtype, device=generated.device
-                )
-                self._run_pending_top_stack_iteration(past_key_values, full_mask)
-                first_iteration_outputs = self.model(
+                if generation_step + 1 == max_new_tokens:
+                    break
+                self._run_pending_top_stack_iteration(past_key_values, None)
+                first_iteration_outputs = self.decoder(
                     input_ids=next_input,
-                    attention_mask=full_mask,
+                    attention_mask=None,
                     past_key_values=past_key_values,
                     use_cache=True,
+                    return_dict=True,
                 )
                 past_key_values = first_iteration_outputs.past_key_values
-                first_iteration_logits = first_iteration_outputs.logits[:, -1, :]
-            return generated
+                first_iteration_logits = self._project_first_iteration_logits(
+                    first_iteration_outputs.last_hidden_state
+                )
+            return torch.cat(generated_parts, dim=1)
         finally:
             if not was_active:
                 self.detach()

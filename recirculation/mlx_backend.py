@@ -10,6 +10,7 @@ from dataclasses import dataclass
 
 import mlx.core as mx
 from mlx_lm.models.base import create_attention_mask
+from mlx_lm.models.cache import make_prompt_cache
 
 from .controller import RecirculationConfig, _mixing_coefficients
 
@@ -145,7 +146,7 @@ class CompiledNormMix:
 
 
 class MLXRecirculator:
-    """Run a loaded MLX-LM Llama model with delayed deep-to-shallow feedback."""
+    """Run a loaded MLX-LM decoder model with delayed deep-to-shallow feedback."""
 
     def __init__(
         self,
@@ -162,7 +163,23 @@ class MLXRecirculator:
         self.mixer = mixer
 
     def make_cache(self):
-        return self.model.make_cache()
+        return make_prompt_cache(self.model)
+
+    @staticmethod
+    def _masks(decoder, hidden, cache, default_cache_index: int):
+        """Build the full/sliding masks supported by the loaded MLX-LM decoder."""
+
+        full_cache_index = getattr(decoder, "fa_idx", default_cache_index)
+        full_mask = create_attention_mask(hidden, cache[full_cache_index])
+        sliding_cache_index = getattr(decoder, "swa_idx", None)
+        if sliding_cache_index is None:
+            return full_mask, None
+        sliding_mask = create_attention_mask(
+            hidden,
+            cache[sliding_cache_index],
+            window_size=decoder.sliding_window,
+        )
+        return full_mask, sliding_mask
 
     def snapshot(self, cache, pending: PendingRecirculation) -> MLXPrefillSnapshot:
         """Capture KV state and the final token's pending same-token second pass."""
@@ -197,18 +214,12 @@ class MLXRecirculator:
             self.config,
             pending.token_position,
         )
-        full_mask = create_attention_mask(hidden, cache[first_upper_layer])
-        sliding_mask = None
-        if decoder.swa_idx is not None:
-            sliding_mask = create_attention_mask(
-                hidden, cache[first_upper_layer], window_size=decoder.sliding_window
-            )
+        full_mask, sliding_mask = self._masks(decoder, hidden, cache, first_upper_layer)
         for layer, layer_cache in zip(
             decoder.layers[first_upper_layer:], cache[first_upper_layer:]
         ):
-            mask = sliding_mask if layer.use_sliding else full_mask
+            mask = sliding_mask if getattr(layer, "use_sliding", False) else full_mask
             hidden = layer(hidden, mask, cache=layer_cache)
-        mx.eval(hidden)
 
     def step(
         self,
@@ -225,18 +236,14 @@ class MLXRecirculator:
         if token.shape != (1, 1):
             raise ValueError("step requires one token with shape [1, 1]")
         decoder = self.model.model
-        token_position = int(cache[decoder.fa_idx].size())
+        full_cache_index = getattr(decoder, "fa_idx", 0)
+        token_position = int(cache[full_cache_index].size())
         self._recirculate_pending(cache, pending)
         hidden = decoder.embed_tokens(token)
-        full_mask = create_attention_mask(hidden, cache[decoder.fa_idx])
-        sliding_mask = None
-        if decoder.swa_idx is not None:
-            sliding_mask = create_attention_mask(
-                hidden, cache[decoder.swa_idx], window_size=decoder.sliding_window
-            )
+        full_mask, sliding_mask = self._masks(decoder, hidden, cache, full_cache_index)
         destination = source = None
         for index, (layer, layer_cache) in enumerate(zip(decoder.layers, cache)):
-            mask = sliding_mask if layer.use_sliding else full_mask
+            mask = sliding_mask if getattr(layer, "use_sliding", False) else full_mask
             hidden = layer(hidden, mask, cache=layer_cache)
             if index == self.config.destination_layer:
                 destination = hidden
@@ -369,14 +376,12 @@ class MLXCandidateGroupRecirculator:
     def _run_shared_lower(self, token: mx.array, cache):
         decoder = self.model.model
         hidden = decoder.embed_tokens(token)
-        full_mask = create_attention_mask(hidden, cache[decoder.fa_idx])
-        sliding_mask = None
-        if decoder.swa_idx is not None:
-            sliding_mask = create_attention_mask(hidden, cache[decoder.swa_idx], window_size=decoder.sliding_window)
+        full_cache_index = getattr(decoder, "fa_idx", 0)
+        full_mask, sliding_mask = self.runners[0]._masks(decoder, hidden, cache, full_cache_index)
         for layer, layer_cache in zip(
             decoder.layers[: self.destination_layer + 1], cache[: self.destination_layer + 1]
         ):
-            mask = sliding_mask if layer.use_sliding else full_mask
+            mask = sliding_mask if getattr(layer, "use_sliding", False) else full_mask
             hidden = layer(hidden, mask, cache=layer_cache)
         return hidden
 
@@ -393,16 +398,13 @@ class MLXCandidateGroupRecirculator:
         config = self.configs[row]
         first_upper_layer = self.destination_layer + 1
         hidden = destination
-        full_mask = create_attention_mask(hidden, cache[first_upper_layer])
-        sliding_mask = None
-        if decoder.swa_idx is not None:
-            sliding_mask = create_attention_mask(hidden, cache[first_upper_layer], window_size=decoder.sliding_window)
+        full_mask, sliding_mask = self.runners[row]._masks(decoder, hidden, cache, first_upper_layer)
         source = None
         for index, (layer, layer_cache) in enumerate(
             zip(decoder.layers[first_upper_layer:], cache[first_upper_layer:]),
             start=first_upper_layer,
         ):
-            mask = sliding_mask if layer.use_sliding else full_mask
+            mask = sliding_mask if getattr(layer, "use_sliding", False) else full_mask
             hidden = layer(hidden, mask, cache=layer_cache)
             if index == config.source_layer:
                 source = hidden
@@ -426,7 +428,8 @@ class MLXCandidateGroupRecirculator:
         if token.shape != (1, 1):
             raise ValueError("shared grouped step requires one token with shape [1, 1]")
         decoder = self.model.model
-        positions = [int(cache[decoder.fa_idx].size()) for cache in caches]
+        full_cache_index = getattr(decoder, "fa_idx", 0)
+        positions = [int(cache[full_cache_index].size()) for cache in caches]
         if len(set(positions)) != 1:
             raise ValueError("grouped lower-stack sharing requires equal candidate cache lengths")
         token_position = positions[0]
