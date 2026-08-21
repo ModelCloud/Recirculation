@@ -1,0 +1,71 @@
+{
+  "alpha": 0.05,
+  "concurrent_median_ms": 567.8454004228115,
+  "concurrent_ms": [
+    567.8454004228115
+  ],
+  "cuda_streams": 2,
+  "destination_layer": 5,
+  "graphed_logits_error": {
+    "max_absolute": 0.0,
+    "mean_absolute": 0.0,
+    "normalized_max": 0.0,
+    "relative_l2": 0.0
+  },
+  "graphed_logits_error_rate": 0.0,
+  "graphed_median_ms": 379.31099999696016,
+  "graphed_ms": [
+    379.31099999696016
+  ],
+  "graphed_new_input_error": {
+    "max_absolute": 0.0,
+    "mean_absolute": 0.0,
+    "normalized_max": 0.0,
+    "relative_l2": 0.0
+  },
+  "graphed_new_input_error_rate": 0.0,
+  "graphed_new_input_pending_error": {
+    "max_absolute": 0.0,
+    "mean_absolute": 0.0,
+    "normalized_max": 0.0,
+    "relative_l2": 0.0
+  },
+  "graphed_new_input_pending_error_rate": 0.0,
+  "graphed_pending_error": {
+    "max_absolute": 0.0,
+    "mean_absolute": 0.0,
+    "normalized_max": 0.0,
+    "relative_l2": 0.0
+  },
+  "graphed_pending_error_rate": 0.0,
+  "graphed_speedup_vs_eager_concurrent": 1.4970443789591188,
+  "graphed_speedup_vs_sequential": 1.9531594889571438,
+  "implementation_commit": "bd7b668f215d9338ee6e44b4f54eb4b1f02f3c0a",
+  "logits_error": {
+    "max_absolute": 0.0,
+    "mean_absolute": 0.0,
+    "normalized_max": 0.0,
+    "relative_l2": 0.0
+  },
+  "logits_error_rate": 0.0,
+  "model": "/local-models/Llama-3.2-1B-Instruct",
+  "pending_error": {
+    "max_absolute": 0.0,
+    "mean_absolute": 0.0,
+    "normalized_max": 0.0,
+    "relative_l2": 0.0
+  },
+  "pending_error_rate": 0.0,
+  "pending_token_position": 15,
+  "python_gil_enabled": true,
+  "python_worker_threads": 2,
+  "ramp_tokens": 0,
+  "repetitions": 1,
+  "sequential_median_ms": 740.8548789098859,
+  "sequential_ms": [
+    740.8548789098859
+  ],
+  "source_layer": 12,
+  "speedup": 1.3046770799908802,
+  "tokens": 16
+}
