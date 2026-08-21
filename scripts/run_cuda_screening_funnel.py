@@ -209,7 +209,8 @@ def main() -> int:
     holdout = args.output_dir / "stage4_holdout.json"
     holdout_command = [
         sys.executable,
-        "scripts/eval_gsm8k_platinum.py",
+        "scripts/evaluate.py",
+        "paired-gsm8k",
         "--model",
         args.model,
         "--device",

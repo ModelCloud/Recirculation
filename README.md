@@ -176,7 +176,7 @@ MLX on Apple Silicon, then Torch on MPS or CPU. Use `--backend` and `--device` o
 needed.
 
 ```bash
-python scripts/eval_gsm8k_platinum.py \
+python scripts/evaluate.py paired-gsm8k \
   --row-start 144 \
   --rows 128 \
   --forbid-range 272:304 \
@@ -197,7 +197,7 @@ each row. This avoids repeatedly processing fixed few-shot examples without chan
 Multiple same-destination candidates can share one baseline and their common lower-layer work:
 
 ```bash
-python scripts/eval_gsm8k_platinum.py \
+python scripts/evaluate.py paired-gsm8k \
   --row-start 144 \
   --rows 128 \
   --forbid-range 272:304 \
@@ -225,6 +225,30 @@ The controller currently supports batch size 1 and the one-path, one-iteration v
 supported; the paper's learned adaptive variant, multiple paths, and multiple recirculation iterations are outside
 this reproduction.
 
+## Run Evalution benchmarks
+
+One benchmark-agnostic entrypoint runs every suite exposed by Evalution. Repeat `--benchmark` to evaluate several
+suites with one model load, use `--suite-arg KEY=VALUE` for common constructor arguments, and use
+`--benchmark-arg BENCHMARK.KEY=VALUE` for suite-specific settings. Values accept JSON, so lists, numbers, booleans,
+and null can be passed without adding benchmark-specific CLI code.
+
+```bash
+python scripts/evaluate.py run \
+  --model /local-models/Llama-3.2-1B-Instruct \
+  --benchmark gsm8k_platinum \
+  --benchmark mmlu \
+  --max-rows 128 \
+  --benchmark-arg gsm8k_platinum.variant=cot_llama \
+  --benchmark-arg gsm8k_platinum.apply_chat_template=true \
+  --benchmark-arg mmlu.subsets=stem \
+  --output results/llama32_1b_gsm8k_mmlu.json
+```
+
+Use `python scripts/evaluate.py run --list-benchmarks` to print the installed Evalution targets. A local Arrow file
+can be selected with `--suite-arg dataset_path=/absolute/path/data.arrow`; it is loaded directly without a Hub lookup
+or cache copy. The generic runner defaults to local-only model loading, FP16, and the validated CUDA inference
+settings. Pass `--no-local-files-only` only when an intentional Hub download is required.
+
 ## Accelerated backends
 
 The repository includes semi-optimized MLX and CUDA paths that speed up path/alpha screening and recirculation
@@ -242,6 +266,32 @@ never an individual shard.
 
 Install with `python -m pip install -e '.[mlx,dev]'` for MLX or `python -m pip install -e '.[cuda,eval,dev]'` for CUDA.
 Reproduction commands and benchmark details are kept under [`results/`](results/).
+
+CUDA GSM8K evaluation also has an experimental Transformers continuous-batching path for models with one
+full-attention cache group. `--cuda-paged-continuous` uses paged FlashAttention, stores recirculation residuals in
+physical cache pages, copies them with shared-prefix cache blocks, and masks completed rows. A block-aligned recurrent
+snapshot seeds the prompt prefix common to every row. Requests are admitted in coherent cohorts (the CUDA batch width
+by default), because immediate one-row refill makes long few-shot prompts substantially slower; use
+`--cuda-paged-admission-batch` to test another admission width. The path remains accuracy-gated against the Torch CUDA
+runner and does not enable CUDA graphs.
+
+On CUDA, the sweep/evaluation scripts now choose the validated settings automatically: FP16, FlashAttention 2, paged
+continuous batching, request/admission width 32, 256 cache blocks of 256 tokens, a 4,096-token scheduler budget, and
+the expandable-segments allocator. Dense Evalution and recirculation evaluation log the resolved values and save them
+in result provenance. Explicit `--no-cuda-paged-continuous`, `--no-paged-attention`, and `--no-continuous-batching`
+switches remain available for controlled comparisons and systems without the required kernels.
+
+```bash
+python scripts/sweep_gsm8k.py \
+  --model /local-models/Llama-3.2-1B-Instruct \
+  --dataset /local-models/datasets/gsm8k-platinum/test.arrow \
+  --device cuda \
+  --rows 64 \
+  --candidate 10:1:0.05 \
+  --cuda-paged-continuous \
+  --cuda-batch-size 32 \
+  --output results/paged_recirculation.json
+```
 
 ## Citation
 

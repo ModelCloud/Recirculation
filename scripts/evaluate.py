@@ -1,30 +1,43 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 
-"""Paired GSM8K-Platinum evaluation for dense causal LMs with and without recirculation."""
+"""Unified Evalution benchmark runner with optional paired GSM8K recirculation."""
 
 from __future__ import annotations
 
 import argparse
 import importlib.util
 import json
+import os
 import platform
+import subprocess
 import sys
 import time
+from contextlib import nullcontext
 from importlib.metadata import version as package_version
 from pathlib import Path
+from typing import Any
+
+os.environ.setdefault(
+    "PYTORCH_ALLOC_CONF",
+    "expandable_segments:True,garbage_collection_threshold:0.8",
+)
 
 import torch
 import yaml
-from datasets import load_dataset
+from datasets import Dataset, load_dataset
+from evalution import Transformers
+from evalution.logbar import get_logger
 from evalution.scorers.gsm8k import (
     INVALID_ANSWER,
     extract_format_insensitive_numeric_answer,
     gsm8k_platinum_numeric_target,
     numbers_equal,
 )
+from evalution.yaml import _TEST_FACTORIES as EVALUTION_BENCHMARK_FACTORIES
 from tokenicer import Tokenicer
 from transformers import AutoModelForCausalLM
+from transformers.utils import is_flash_attn_2_available
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
@@ -33,6 +46,9 @@ from recirculation import (
     RecirculationConfig,
     RecirculationController,
 )
+from recirculation.inference_defaults import resolve_dense_cuda_defaults
+
+DEFAULT_MODEL = "/local-models/Llama-3.2-1B-Instruct"
 
 
 def _task_contract(path: Path):
@@ -400,7 +416,292 @@ def _paired(samples, arm: str = "recirculated"):
     return result
 
 
-def main() -> int:
+def _git_commit() -> str | None:
+    completed = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    return completed.stdout.strip() or None
+
+
+def _load_local_arrow(path: str, *_args: Any, **_kwargs: Any) -> Dataset:
+    """Load a local Arrow dataset directly, without Hub lookup or cache copying."""
+
+    return Dataset.from_file(path)
+
+
+def _decode_cli_value(value: str) -> Any:
+    """Decode JSON scalars/containers while keeping unquoted values ergonomic."""
+
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError:
+        return value
+
+
+def _parse_suite_assignment(value: str) -> tuple[str, Any]:
+    try:
+        key, raw_value = value.split("=", 1)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("suite arguments must use KEY=VALUE") from error
+    if not key or not key.isidentifier():
+        raise argparse.ArgumentTypeError("suite argument keys must be Python identifiers")
+    return key, _decode_cli_value(raw_value)
+
+
+def _parse_benchmark_assignment(value: str) -> tuple[str, str, Any]:
+    try:
+        benchmark_and_key, raw_value = value.split("=", 1)
+        benchmark, key = benchmark_and_key.rsplit(".", 1)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(
+            "benchmark arguments must use BENCHMARK.KEY=VALUE"
+        ) from error
+    if not benchmark or not key or not key.isidentifier():
+        raise argparse.ArgumentTypeError(
+            "benchmark arguments must use a benchmark name and Python-identifier key"
+        )
+    return benchmark, key, _decode_cli_value(raw_value)
+
+
+def _available_benchmarks() -> list[str]:
+    return sorted(EVALUTION_BENCHMARK_FACTORIES)
+
+
+def _suite_kwargs(args: argparse.Namespace, benchmark: str) -> dict[str, Any]:
+    kwargs = dict(args.suite_arg or [])
+    for scoped_benchmark, key, value in args.benchmark_arg or []:
+        if scoped_benchmark == benchmark:
+            kwargs[key] = value
+    if args.max_rows is not None:
+        kwargs.setdefault("max_rows", args.max_rows)
+    kwargs.setdefault("batch_size", args.batch_size)
+    return kwargs
+
+
+def _build_evalution_suite(benchmark: str, kwargs: dict[str, Any]):
+    factory = EVALUTION_BENCHMARK_FACTORIES.get(benchmark)
+    if factory is None:
+        raise ValueError(
+            f"unknown Evalution benchmark {benchmark!r}; use --list-benchmarks to inspect targets"
+        )
+    try:
+        suite = factory(**kwargs)
+    except TypeError as error:
+        raise ValueError(f"invalid arguments for Evalution benchmark {benchmark!r}: {error}") from error
+
+    dataset_path = kwargs.get("dataset_path")
+    if dataset_path is None or Path(str(dataset_path)).suffix != ".arrow":
+        return suite
+    local_path = Path(str(dataset_path)).expanduser().resolve()
+    if not local_path.is_file():
+        raise FileNotFoundError(f"local Arrow dataset not found: {local_path}")
+    local_suite_type = type(
+        f"Local{type(suite).__name__}",
+        (type(suite),),
+        {"dataset_loader": lambda self: _load_local_arrow},
+    )
+    return local_suite_type(**kwargs)
+
+
+def _dense_evalution_main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog="evaluate.py run",
+        description="Run one model against any number of Evalution benchmark suites.",
+    )
+    parser.add_argument("--model", default=DEFAULT_MODEL)
+    parser.add_argument("--model-label", default=None)
+    parser.add_argument(
+        "--benchmark",
+        action="append",
+        default=None,
+        help="Evalution benchmark factory name; repeat to reuse one loaded model across suites.",
+    )
+    parser.add_argument(
+        "--suite-arg",
+        action="append",
+        type=_parse_suite_assignment,
+        default=None,
+        help="Common Evalution suite constructor argument as KEY=VALUE; VALUE accepts JSON.",
+    )
+    parser.add_argument(
+        "--benchmark-arg",
+        action="append",
+        type=_parse_benchmark_assignment,
+        default=None,
+        help="Per-suite override as BENCHMARK.KEY=VALUE; VALUE accepts JSON.",
+    )
+    parser.add_argument("--list-benchmarks", action="store_true")
+    parser.add_argument("--output", type=Path, required=False)
+    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument("--max-rows", type=int, default=None)
+    parser.add_argument("--max-new-tokens", type=int, default=256)
+    parser.add_argument(
+        "--local-files-only",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Keep model/tokenizer loading offline by default.",
+    )
+    parser.add_argument(
+        "--attention-backend",
+        choices=("eager", "sdpa", "flash_attention_2"),
+        default=None,
+    )
+    parser.add_argument(
+        "--continuous-batching",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    parser.add_argument(
+        "--paged-attention",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    parser.add_argument("--max-batch-tokens", type=int, default=4096)
+    parser.add_argument("--max-blocks-per-request", type=int, default=8)
+    parser.add_argument("--paged-num-blocks", type=int, default=256)
+    parser.add_argument("--paged-block-size", type=int, default=256)
+    args = parser.parse_args(argv)
+
+    if args.list_benchmarks:
+        print("\n".join(_available_benchmarks()))
+        return 0
+    if not args.benchmark:
+        parser.error("at least one --benchmark is required")
+    if args.output is None:
+        parser.error("--output is required")
+    if len(set(args.benchmark)) != len(args.benchmark):
+        parser.error("duplicate --benchmark values are not allowed")
+    unknown_scopes = sorted(
+        {name for name, _key, _value in args.benchmark_arg or []} - set(args.benchmark)
+    )
+    if unknown_scopes:
+        parser.error(f"--benchmark-arg refers to unselected benchmark(s): {unknown_scopes}")
+
+    cuda_device = str(args.device).split(":", 1)[0] == "cuda"
+    try:
+        args.cuda_auto_optimized = resolve_dense_cuda_defaults(
+            args,
+            flash_available=cuda_device and is_flash_attn_2_available(),
+        )
+    except ValueError as error:
+        parser.error(str(error))
+    if args.batch_size < 1 or args.max_new_tokens < 1:
+        parser.error("--batch-size and --max-new-tokens must be positive")
+    if min(
+        args.max_batch_tokens,
+        args.max_blocks_per_request,
+        args.paged_num_blocks,
+        args.paged_block_size,
+    ) < 1:
+        parser.error("paged scheduler sizes must be positive")
+    if args.max_rows is not None and args.max_rows < 1:
+        parser.error("--max-rows must be positive")
+
+    try:
+        suites = [
+            _build_evalution_suite(benchmark, _suite_kwargs(args, benchmark))
+            for benchmark in args.benchmark
+        ]
+    except (FileNotFoundError, ValueError) as error:
+        parser.error(str(error))
+
+    model_path = str(Path(args.model).expanduser().resolve()) if Path(args.model).exists() else args.model
+    if Path(model_path).exists() and not (Path(model_path) / "config.json").is_file():
+        raise FileNotFoundError(f"model config not found: {Path(model_path) / 'config.json'}")
+    output_path = args.output.expanduser().resolve()
+    logger = get_logger()
+    logger.info(
+        "Evalution run: benchmarks=%s dtype=float16 attention=%s continuous=%s "
+        "paged=%s batch_size=%d model=%s",
+        args.benchmark,
+        args.attention_backend,
+        args.continuous_batching,
+        args.paged_attention,
+        args.batch_size,
+        model_path,
+    )
+    attention = (
+        f"paged|{args.attention_backend}" if args.paged_attention else args.attention_backend
+    )
+    engine = Transformers(
+        device=args.device,
+        dtype="float16",
+        batch_size=args.batch_size,
+        max_new_tokens=args.max_new_tokens,
+        attn_implementation=attention,
+        continuous_batching=args.continuous_batching,
+        allow_block_sharing=True,
+        max_batch_tokens=args.max_batch_tokens,
+        max_blocks_per_request=args.max_blocks_per_request,
+        use_async_batching=False,
+        use_cuda_graph=False,
+    )
+    cache_patch = nullcontext()
+    if args.paged_attention:
+        from recirculation.transformers_paged_patch import patch_transformers_paged_cache_defaults
+
+        cache_patch = patch_transformers_paged_cache_defaults(
+            num_blocks=args.paged_num_blocks,
+            block_size=args.paged_block_size,
+        )
+
+    started = time.perf_counter()
+    with cache_patch:
+        evaluation = engine.model(
+            path=model_path,
+            label=args.model_label or Path(model_path).name,
+            model_kwargs={"local_files_only": args.local_files_only},
+            tokenizer_kwargs={"local_files_only": args.local_files_only},
+        )
+        try:
+            for suite in suites:
+                evaluation.run(suite)
+            result = evaluation.result().to_dict()
+        except Exception:
+            evaluation.close()
+            raise
+    elapsed = time.perf_counter() - started
+    row_count = sum(len(test.get("samples", [])) for test in result["tests"])
+    result["provenance"] = {
+        "git_commit": _git_commit(),
+        "elapsed_seconds": elapsed,
+        "rows": row_count,
+        "rows_per_second": row_count / elapsed if elapsed else None,
+        "benchmarks": args.benchmark,
+        "suite_arguments": {
+            benchmark: _suite_kwargs(args, benchmark) for benchmark in args.benchmark
+        },
+        "dtype_policy": "FP16 required for all repository evaluation runs",
+        "model_local_files_only": args.local_files_only,
+        "attention_backend": args.attention_backend,
+        "continuous_batching": args.continuous_batching,
+        "paged_attention_requested": args.paged_attention,
+        "batch_size": args.batch_size,
+        "max_batch_tokens": args.max_batch_tokens,
+        "max_blocks_per_request": args.max_blocks_per_request,
+        "paged_num_blocks": args.paged_num_blocks,
+        "paged_block_size": args.paged_block_size,
+        "cuda_auto_optimized": args.cuda_auto_optimized,
+        "allocator_config": os.environ["PYTORCH_ALLOC_CONF"],
+    }
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    logger.info(
+        "evaluation complete: suites=%d rows=%d elapsed=%.2fs rows_per_second=%.3f output=%s",
+        len(suites),
+        row_count,
+        elapsed,
+        row_count / elapsed if elapsed else 0.0,
+        output_path,
+    )
+    return 0
+
+
+def _paired_gsm8k_main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default="meta-llama/Llama-3.2-1B-Instruct")
     parser.add_argument("--dataset", default="madrylab/gsm8k-platinum")
@@ -451,7 +752,7 @@ def main() -> int:
     )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--report-every", type=int, default=8)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if args.row_start < 0 or args.rows < 1 or args.max_new_tokens < 1 or args.candidate_batch_size < 1:
         raise ValueError("row-start must be non-negative and rows/max-new-tokens must be positive")
     paths = args.path or [(args.source_layer, args.destination_layer)]
@@ -678,6 +979,25 @@ def main() -> int:
     print(json.dumps({"summary": report["summary"], "paired": report["paired"]}, indent=2), flush=True)
     print(f"Wrote {output}", flush=True)
     return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        epilog=(
+            "Use 'run' for any Evalution benchmark, or 'paired-gsm8k' for the "
+            "repository's dense-versus-recirculated GSM8K comparison."
+        ),
+    )
+    parser.add_argument("command", choices=("run", "paired-gsm8k"))
+    if not argv or argv[0] in {"-h", "--help"}:
+        parser.print_help()
+        return 0
+    command = parser.parse_args(argv[:1]).command
+    if command == "run":
+        return _dense_evalution_main(argv[1:])
+    return _paired_gsm8k_main(argv[1:])
 
 
 if __name__ == "__main__":

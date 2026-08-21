@@ -1,0 +1,19 @@
+{
+  "alpha": 0.05,
+  "destination_layer": 1,
+  "dtype": "float16",
+  "error_limit": 0.002,
+  "exact_greedy_token_parity": true,
+  "forward_error": {
+    "max_absolute": 0.0,
+    "mean_absolute": 0.0,
+    "normalized_max": 0.0,
+    "rate": 0.0,
+    "relative_l2": 0.0
+  },
+  "model": "/local-models/Llama-3.2-1B-Instruct",
+  "paged_token": 13,
+  "prompt_tokens": 64,
+  "reference_token": 13,
+  "source_layer": 10
+}

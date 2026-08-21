@@ -7,16 +7,20 @@ import pytest
 from evalution.benchmarks import gsm8k_platinum
 from evalution.scorers.gsm8k import INVALID_ANSWER
 
-import scripts.eval_gsm8k_platinum as evaluation
-from scripts.eval_gsm8k_platinum import (
+import scripts.evaluate as evaluation
+from scripts.evaluate import (
     REPO_ROOT,
+    _build_evalution_suite,
     _candidate_batches,
     _candidate_specs,
     _common_prefix_length,
+    _decode_cli_value,
     _gold_answer,
     _instruction,
     _paired,
+    _parse_benchmark_assignment,
     _parse_candidate,
+    _parse_suite_assignment,
     _summary,
     _task_contract,
 )
@@ -176,7 +180,13 @@ def test_cli_rejects_negative_alpha_before_backend_initialization(monkeypatch, t
     monkeypatch.setattr(
         sys,
         "argv",
-        ["eval_gsm8k_platinum.py", *coefficient_args, "--output", str(tmp_path / "result.json")],
+        [
+            "evaluate.py",
+            "paired-gsm8k",
+            *coefficient_args,
+            "--output",
+            str(tmp_path / "result.json"),
+        ],
     )
     monkeypatch.setattr(
         evaluation,
@@ -213,3 +223,120 @@ def test_local_prompt_contract_matches_evalution_cot_llama():
     assert fewshots == [(sample["question"], sample["target"]) for sample in spec.fewshots]
     assert until == spec.stop_strings
     assert _instruction("What is 2 + 2?") == spec.prompt_builder({"question": "What is 2 + 2?"})
+
+
+def test_generic_suite_arguments_decode_json_and_plain_strings():
+    assert _decode_cli_value("true") is True
+    assert _decode_cli_value('["stem", "humanities"]') == ["stem", "humanities"]
+    assert _decode_cli_value("stem") == "stem"
+    assert _parse_suite_assignment("max_rows=32") == ("max_rows", 32)
+    assert _parse_benchmark_assignment("mmlu.subsets=stem") == (
+        "mmlu",
+        "subsets",
+        "stem",
+    )
+    with pytest.raises(evaluation.argparse.ArgumentTypeError, match="KEY=VALUE"):
+        _parse_suite_assignment("broken")
+    with pytest.raises(evaluation.argparse.ArgumentTypeError, match="BENCHMARK.KEY=VALUE"):
+        _parse_benchmark_assignment("broken")
+
+
+def test_generic_suite_loader_supports_evalution_factories_and_local_arrow(tmp_path):
+    mmlu_suite = _build_evalution_suite("mmlu", {"subsets": "stem", "max_rows": 2})
+    assert mmlu_suite.subsets == "stem"
+    assert mmlu_suite.max_rows == 2
+
+    arrow_path = tmp_path / "gsm8k.arrow"
+    arrow_path.write_bytes(b"test placeholder")
+    local_suite = _build_evalution_suite(
+        "gsm8k_platinum",
+        {"dataset_path": str(arrow_path), "dataset_name": None, "max_rows": 1},
+    )
+    assert local_suite.dataset_loader() is evaluation._load_local_arrow
+    with pytest.raises(ValueError, match="unknown Evalution benchmark"):
+        _build_evalution_suite("not_a_real_benchmark", {})
+
+
+def test_generic_evalution_runner_reuses_one_model_for_multiple_suites(monkeypatch, tmp_path):
+    model_path = tmp_path / "model"
+    model_path.mkdir()
+    (model_path / "config.json").write_text("{}", encoding="utf-8")
+    output_path = tmp_path / "result.json"
+    events = []
+
+    class FakeResult:
+        @staticmethod
+        def to_dict():
+            return {
+                "model": {},
+                "engine": {},
+                "tests": [
+                    {"name": "gsm8k_platinum", "samples": [{"id": 1}]},
+                    {"name": "mmlu_stem", "samples": [{"id": 2}, {"id": 3}]},
+                ],
+            }
+
+    class FakeEvaluation:
+        def run(self, suite):
+            events.append(("run", suite.task_name()))
+            return self
+
+        @staticmethod
+        def result():
+            return FakeResult()
+
+        def close(self):
+            events.append(("close", None))
+
+    class FakeTransformers:
+        def __init__(self, **kwargs):
+            events.append(("engine", kwargs))
+
+        def model(self, **kwargs):
+            events.append(("model", kwargs))
+            return FakeEvaluation()
+
+    monkeypatch.setattr(evaluation, "Transformers", FakeTransformers)
+    monkeypatch.setattr(evaluation, "_git_commit", lambda: "abc123")
+
+    assert (
+        evaluation.main(
+            [
+                "run",
+                "--model",
+                str(model_path),
+                "--device",
+                "cpu",
+                "--benchmark",
+                "gsm8k_platinum",
+                "--benchmark",
+                "mmlu",
+                "--max-rows",
+                "2",
+                "--benchmark-arg",
+                "gsm8k_platinum.variant=cot_llama",
+                "--benchmark-arg",
+                "mmlu.subsets=stem",
+                "--output",
+                str(output_path),
+            ]
+        )
+        == 0
+    )
+
+    report = evaluation.json.loads(output_path.read_text(encoding="utf-8"))
+    assert report["provenance"]["benchmarks"] == ["gsm8k_platinum", "mmlu"]
+    assert report["provenance"]["rows"] == 3
+    assert report["provenance"]["git_commit"] == "abc123"
+    assert [event for event in events if event[0] == "run"] == [
+        ("run", "gsm8k_platinum_cot_llama"),
+        ("run", "mmlu_stem"),
+    ]
+    assert len([event for event in events if event[0] == "model"]) == 1
+
+
+def test_generic_runner_lists_installed_benchmarks_without_loading_model(capsys):
+    assert evaluation.main(["run", "--list-benchmarks"]) == 0
+    listed = capsys.readouterr().out.splitlines()
+    assert "gsm8k_platinum" in listed
+    assert "mmlu" in listed

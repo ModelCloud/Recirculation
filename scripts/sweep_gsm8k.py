@@ -7,16 +7,23 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 import time
 from pathlib import Path
+
+os.environ.setdefault(
+    "PYTORCH_ALLOC_CONF",
+    "expandable_segments:True,garbage_collection_threshold:0.8",
+)
 
 import torch
 from datasets import Dataset, load_dataset
 from evalution.scorers.gsm8k import numbers_equal
 from tokenicer import Tokenicer
 from transformers import AutoModelForCausalLM
+from transformers.utils import is_flash_attn_2_available
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
@@ -25,8 +32,9 @@ from recirculation import (
     RecirculationConfig,
     RecirculationController,
 )
+from recirculation.inference_defaults import resolve_recirculation_cuda_defaults
 from recirculation.screening import paired_selection_entry, proxy_shortlist
-from scripts.eval_gsm8k_platinum import (
+from scripts.evaluate import (
     _extract_answer,
     _generate,
     _generation_result,
@@ -226,6 +234,29 @@ def main() -> int:
     parser.add_argument("--row-start", type=int, default=128)
     parser.add_argument("--rows", type=int, default=16)
     parser.add_argument("--max-new-tokens", type=int, default=128)
+    parser.add_argument(
+        "--attention-backend",
+        choices=("eager", "sdpa", "flash_attention_2"),
+        default=None,
+        help="Attention kernel override; CUDA auto-selects FlashAttention 2 for paged evaluation.",
+    )
+    parser.add_argument(
+        "--cuda-paged-continuous",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Use the recirculation-aware paged scheduler; enabled automatically on CUDA.",
+    )
+    parser.add_argument("--cuda-paged-num-blocks", type=int, default=256)
+    parser.add_argument("--cuda-paged-block-size", type=int, default=256)
+    parser.add_argument(
+        "--cuda-paged-admission-batch",
+        type=int,
+        default=None,
+        help=(
+            "Number of queued requests admitted together. Defaults to --cuda-batch-size; "
+            "cohort admission avoids one-at-a-time long-prompt refills."
+        ),
+    )
     parser.add_argument("--skip-baseline", action="store_true")
     parser.add_argument(
         "--baseline-results",
@@ -303,10 +334,25 @@ def main() -> int:
     parser.add_argument(
         "--cuda-batch-size",
         type=int,
-        default=4,
-        help="Same-length prompt batch size for CUDA candidate generation.",
+        default=None,
+        help="CUDA request width; defaults to 32 on CUDA and 4 elsewhere.",
     )
     args = parser.parse_args()
+    try:
+        cuda_device, cuda_auto_optimized = resolve_recirculation_cuda_defaults(
+            args,
+            flash_available=is_flash_attn_2_available(),
+        )
+    except ValueError as error:
+        parser.error(str(error))
+    if cuda_device:
+        print(
+            "CUDA inference settings: "
+            f"attention={args.attention_backend} paged_continuous={args.cuda_paged_continuous} "
+            f"batch={args.cuda_batch_size} admission={args.cuda_paged_admission_batch or args.cuda_batch_size} "
+            f"blocks={args.cuda_paged_num_blocks} allocator={os.environ['PYTORCH_ALLOC_CONF']}",
+            flush=True,
+        )
     if args.screen_results is not None and args.candidate is not None:
         parser.error("use either --screen-results or --candidate, not both")
     if args.top_k < 1 or args.harm_weight < 1.0:
@@ -319,11 +365,17 @@ def main() -> int:
         parser.error("cuda-batch-size must be positive")
     if args.cuda_graph_max_tokens < 1:
         parser.error("cuda-graph-max-tokens must be positive")
-    cuda_compile_runner = (
-        args.cuda_compile_runner
-        if args.cuda_compile_runner is not None
-        else args.rows * args.max_new_tokens >= 5_000
-    )
+    if min(args.cuda_paged_num_blocks, args.cuda_paged_block_size) < 1:
+        parser.error("paged cache block counts and sizes must be positive")
+    if args.cuda_paged_admission_batch is not None and args.cuda_paged_admission_batch < 1:
+        parser.error("cuda-paged-admission-batch must be positive")
+    cuda_compile_runner = False
+    if not args.cuda_paged_continuous:
+        cuda_compile_runner = (
+            args.cuda_compile_runner
+            if args.cuda_compile_runner is not None
+            else args.rows * args.max_new_tokens >= 5_000
+        )
     selected_screen_items = {}
     if args.screen_results is not None:
         screen = json.loads(args.screen_results.read_text(encoding="utf-8"))
@@ -351,8 +403,14 @@ def main() -> int:
     # CUDA evaluation must use fused SDPA/Flash attention.  Eager attention
     # dispatches every attention operation through Python and was the dominant
     # reason this accuracy sweep was slower than the MLX evaluator.
-    attn_implementation = "sdpa" if device.type == "cuda" else "eager"
-    if device.type == "cuda":
+    attn_implementation = (
+        "flash_attention_2"
+        if args.cuda_paged_continuous
+        else args.attention_backend
+        if device.type == "cuda"
+        else "eager"
+    )
+    if device.type == "cuda" and not args.cuda_paged_continuous:
         torch.set_float32_matmul_precision("high")
         torch.backends.cuda.enable_flash_sdp(True)
         torch.backends.cuda.enable_mem_efficient_sdp(True)
@@ -391,7 +449,7 @@ def main() -> int:
     # Construct each CUDA runner once.  Creating a controller per row defeats
     # the fused replay and two-stream scheduling used by the benchmark path.
     candidate_runners = {}
-    if device.type == "cuda":
+    if device.type == "cuda" and not args.cuda_paged_continuous:
         from recirculation.cuda_backend import CUDAConcurrentRunner
 
         candidate_runners = {
@@ -473,9 +531,154 @@ def main() -> int:
         maybe_status("candidates", force=True)
     elif args.baseline_results is not None:
         maybe_status("candidates", force=True)
+    candidate_timings = {}
     for candidate_index, (source, destination, alpha) in enumerate(args.candidate):
         config = RecirculationConfig(source_layer=source, destination_layer=destination, alpha=alpha)
         arm = _arm_name(source, destination, alpha)
+        if args.cuda_paged_continuous:
+            from transformers import ContinuousBatchingConfig
+            from transformers.generation.continuous_batching.requests import RequestStatus
+
+            from recirculation.cuda_backend import FusedNormMix
+            from recirculation.transformers_paged_patch import (
+                patch_model_paged_recirculation,
+                seed_paged_cache_from_snapshot,
+            )
+
+            model.generation_config.do_sample = False
+            paged_config = ContinuousBatchingConfig(
+                block_size=args.cuda_paged_block_size,
+                num_blocks=args.cuda_paged_num_blocks,
+                max_batch_tokens=max(4096, args.cuda_batch_size),
+                max_requests_per_batch=args.cuda_batch_size,
+                max_blocks_per_request=max(
+                    1,
+                    (max(map(len, (sample["prompt_ids"] for sample in samples)))
+                     + args.max_new_tokens
+                     + args.cuda_paged_block_size - 1)
+                    // args.cuda_paged_block_size,
+                ),
+                allow_block_sharing=True,
+                use_cuda_graph=False,
+                use_async_batching=False,
+            )
+            print(
+                f"candidate {candidate_index + 1}/{len(args.candidate)} {arm} "
+                f"paged_continuous batch={args.cuda_batch_size} blocks={args.cuda_paged_num_blocks}",
+                flush=True,
+            )
+            candidate_started = time.perf_counter()
+            common_prefix_tokens = _common_prefix_length(samples) if args.cuda_shared_prefix else 0
+            shareable_prefix_tokens = (
+                common_prefix_tokens // args.cuda_paged_block_size
+            ) * args.cuda_paged_block_size
+            prefix_snapshot = None
+            prefix_started = time.perf_counter()
+            if shareable_prefix_tokens:
+                from recirculation.cuda_backend import CUDAConcurrentRunner
+
+                prefix_runner = CUDAConcurrentRunner(model, config, use_python_threads=True)
+                try:
+                    prefix = torch.tensor(
+                        [samples[0]["prompt_ids"][:shareable_prefix_tokens]],
+                        dtype=torch.long,
+                        device=device,
+                    )
+                    _, prefix_cache, prefix_pending, _ = prefix_runner.prefill(prefix)
+                    prefix_snapshot = prefix_runner.snapshot(prefix_cache, prefix_pending)
+                finally:
+                    prefix_runner.close()
+            prefix_seconds = time.perf_counter() - prefix_started
+            scheduler_started = time.perf_counter()
+            with patch_model_paged_recirculation(model, config, FusedNormMix()):
+                manager = model.init_continuous_batching(
+                    continuous_batching_config=paged_config,
+                )
+                manager.start()
+                try:
+                    while manager.batch_processor is None:
+                        if not manager.is_running():
+                            raise RuntimeError("paged manager stopped during initialization")
+                        time.sleep(0.001)
+                    if prefix_snapshot is not None:
+                        seeded_blocks = seed_paged_cache_from_snapshot(
+                            manager.batch_processor.cache,
+                            request_id="recirculation_prefix_seed",
+                            prompt_ids=samples[0]["prompt_ids"][:shareable_prefix_tokens],
+                            snapshot=prefix_snapshot,
+                        )
+                        print(
+                            f"seeded {seeded_blocks} shared recurrent prefix blocks "
+                            f"({shareable_prefix_tokens} tokens)",
+                            flush=True,
+                        )
+                    outputs = {}
+                    admission_batch = min(
+                        args.cuda_paged_admission_batch or args.cuda_batch_size,
+                        args.cuda_batch_size,
+                    )
+                    next_to_submit = 0
+                    outstanding = set()
+
+                    def submit_cohort(
+                        manager=manager,
+                        admission_batch=admission_batch,
+                        outstanding=outstanding,
+                    ) -> None:
+                        nonlocal next_to_submit
+                        stop = min(next_to_submit + admission_batch, len(samples))
+                        for index in range(next_to_submit, stop):
+                            manager.add_request(
+                                samples[index]["prompt_ids"],
+                                request_id=f"row_{index}",
+                                max_new_tokens=args.max_new_tokens,
+                                streaming=False,
+                            )
+                            outstanding.add(f"row_{index}")
+                        if stop > next_to_submit:
+                            print(
+                                f"paged admission rows {next_to_submit + 1}-{stop}/{len(samples)}",
+                                flush=True,
+                            )
+                        next_to_submit = stop
+
+                    submit_cohort()
+                    while len(outputs) < len(samples):
+                        output = manager.get_result(timeout=1)
+                        if output is not None and output.is_finished():
+                            outputs[output.request_id] = output
+                            outstanding.discard(output.request_id)
+                            if not outstanding and next_to_submit < len(samples):
+                                submit_cohort()
+                        elif output is not None and output.status == RequestStatus.FAILED:
+                            raise RuntimeError(
+                                f"paged request {output.request_id} failed: {output.error}"
+                            )
+                        elif not manager.is_running():
+                            raise RuntimeError("paged recirculation manager stopped early")
+                finally:
+                    manager.stop(block=True)
+                    manager.destroy()
+            scheduler_seconds = time.perf_counter() - scheduler_started
+            if len(outputs) != len(samples):
+                raise RuntimeError(
+                    f"paged recirculation returned {len(outputs)}/{len(samples)} requests"
+                )
+            ordered_outputs = [outputs[f"row_{index}"] for index in range(len(samples))]
+            generated_tokens = sum(len(output.generated_tokens) for output in ordered_outputs)
+            candidate_seconds = time.perf_counter() - candidate_started
+            candidate_timings[arm] = {
+                "prefix_seconds": prefix_seconds,
+                "scheduler_seconds": scheduler_seconds,
+                "candidate_seconds": candidate_seconds,
+                "generated_tokens": generated_tokens,
+                "scheduler_generated_tokens_per_second": generated_tokens / scheduler_seconds,
+                "candidate_generated_tokens_per_second": generated_tokens / candidate_seconds,
+            }
+            for sample, output in zip(samples, ordered_outputs, strict=True):
+                sample[arm] = _generation_result(tokenizer, output.generated_tokens, until)
+            maybe_status(f"candidate-{candidate_index + 1}", force=True)
+            continue
         if device.type == "cuda":
             common_prefix_length = _common_prefix_length(samples) if args.cuda_shared_prefix else 0
             prefix_snapshot = None
@@ -704,6 +907,13 @@ def main() -> int:
             "harm_weight": args.harm_weight,
             "max_correct_to_wrong": args.max_correct_to_wrong,
             "cuda_batch_size": args.cuda_batch_size,
+            "cuda_paged_continuous": args.cuda_paged_continuous,
+            "cuda_auto_optimized": cuda_auto_optimized,
+            "cuda_paged_num_blocks": args.cuda_paged_num_blocks,
+            "cuda_paged_block_size": args.cuda_paged_block_size,
+            "cuda_paged_admission_batch": (
+                args.cuda_paged_admission_batch or args.cuda_batch_size
+            ),
             "cuda_graph_prefill": args.cuda_graph_prefill,
             "cuda_graph_max_tokens": args.cuda_graph_max_tokens,
             "cuda_compile_requested": args.cuda_compile,
@@ -717,6 +927,7 @@ def main() -> int:
         },
         "seconds": time.perf_counter() - started,
         "summaries": summaries,
+        "candidate_timings": candidate_timings,
         "ranking": ranking,
         "best": best_flip_penalized,
         "best_flip_penalized": best_flip_penalized,

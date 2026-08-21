@@ -20,7 +20,7 @@ sys.path.insert(0, str(REPO_ROOT))
 from recirculation import RecirculationConfig
 from recirculation.mlx_backend import CompiledNormMix, MLXCandidateGroupRecirculator
 from recirculation.screening import path_cost_telemetry
-from scripts.eval_gsm8k_platinum import _gold_answer, _prompt_ids, _task_contract
+from scripts.evaluate import _gold_answer, _prompt_ids, _task_contract
 
 
 def _common_prefix_length(prompts):

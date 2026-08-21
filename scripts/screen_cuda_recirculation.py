@@ -60,7 +60,7 @@ from recirculation.screening import (
     screen_leaders,
     summarize_paired_losses,
 )
-from scripts.eval_gsm8k_platinum import _gold_answer, _prompt_ids, _task_contract
+from scripts.evaluate import _gold_answer, _prompt_ids, _task_contract
 
 LOG = LogBar.shared()
 MODEL_DTYPES = {
@@ -846,6 +846,26 @@ def main() -> int:
     )
     parser.add_argument("--windows-per-corpus", type=int, default=256)
     parser.add_argument(
+        "--corpus-window-count",
+        action="append",
+        default=None,
+        metavar="CORPUS=COUNT",
+        help=(
+            "Override --windows-per-corpus for one selected corpus. Repeat for paper-exact "
+            "budgets, e.g. arxiv=484, c4=488, pg19=500."
+        ),
+    )
+    parser.add_argument(
+        "--corpus-target-tokens",
+        action="append",
+        default=None,
+        metavar="CORPUS=COUNT",
+        help=(
+            "Override scored targets per full corpus window while retaining the complete context. "
+            "This can reproduce explicitly reported paper token counts."
+        ),
+    )
+    parser.add_argument(
         "--windows-per-document",
         type=int,
         default=2,
@@ -969,6 +989,30 @@ def main() -> int:
     )
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
+    corpus_window_counts = {corpus: args.windows_per_corpus for corpus in (args.corpus or [])}
+    for value in args.corpus_window_count or []:
+        try:
+            corpus, count_text = value.split("=", 1)
+            count = int(count_text)
+        except ValueError:
+            parser.error(f"invalid --corpus-window-count {value!r}; expected CORPUS=COUNT")
+        if corpus not in corpus_window_counts:
+            parser.error(f"--corpus-window-count names unselected corpus {corpus!r}")
+        if count < 1:
+            parser.error("--corpus-window-count values must be positive")
+        corpus_window_counts[corpus] = count
+    corpus_target_tokens = {corpus: args.window_tokens - 1 for corpus in (args.corpus or [])}
+    for value in args.corpus_target_tokens or []:
+        try:
+            corpus, count_text = value.split("=", 1)
+            count = int(count_text)
+        except ValueError:
+            parser.error(f"invalid --corpus-target-tokens {value!r}; expected CORPUS=COUNT")
+        if corpus not in corpus_target_tokens:
+            parser.error(f"--corpus-target-tokens names unselected corpus {corpus!r}")
+        if not 1 <= count < args.window_tokens:
+            parser.error("--corpus-target-tokens must be in [1, window_tokens - 1]")
+        corpus_target_tokens[corpus] = count
     if args.corpus and args.target_mode != "full_solution":
         parser.error("--target-mode final_answer/dual applies to GSM8K screening, not corpus language modeling")
     if args.corpus and args.forbid_range:
@@ -1060,17 +1104,25 @@ def main() -> int:
             artifact = json.loads(corpus_artifact.read_text(encoding="utf-8"))
             expected = {
                 "corpora": args.corpus,
-                "windows_per_corpus": args.windows_per_corpus,
+                "corpus_window_counts": corpus_window_counts,
+                "corpus_target_tokens": corpus_target_tokens,
                 "window_tokens": args.window_tokens,
                 "tokenizer": args.model,
             }
-            mismatches = {key: (artifact.get(key), value) for key, value in expected.items() if artifact.get(key) != value}
+            actual_window_counts = artifact.get("corpus_window_counts")
+            if actual_window_counts is None and isinstance(artifact.get("windows_per_corpus"), int):
+                actual_window_counts = {
+                    corpus: artifact["windows_per_corpus"] for corpus in artifact.get("corpora", [])
+                }
+            actual = {**artifact, "corpus_window_counts": actual_window_counts}
+            mismatches = {key: (actual.get(key), value) for key, value in expected.items() if actual.get(key) != value}
             if mismatches:
                 parser.error(f"corpus artifact does not match this screen: {mismatches}")
             LOG.info(f"Loaded {len(artifact['windows'])} shared tokenized corpus windows from {corpus_artifact}")
         if artifact is None:
             windows = []
             for corpus in args.corpus:
+                requested_windows = corpus_window_counts[corpus]
                 dataset_name, dataset_config = specs[corpus]
                 local_format, local_pattern = local_specs[corpus]
                 local_files = sorted(corpus_data_root.glob(local_pattern))
@@ -1106,16 +1158,22 @@ def main() -> int:
                             break
                         windows.append({"corpus": corpus, "token_ids": list(map(int, window))})
                         accepted += 1
-                        if accepted == args.windows_per_corpus:
+                        if accepted == requested_windows:
                             break
-                    if accepted == args.windows_per_corpus:
+                    if accepted == requested_windows:
                         break
-                if accepted != args.windows_per_corpus:
+                if accepted != requested_windows:
                     parser.error(f"{corpus} yielded only {accepted} qualifying windows after {examined} documents")
                 corpus_counts[corpus] = {"windows": accepted, "documents_examined": examined}
             artifact = {
                 "corpora": args.corpus,
-                "windows_per_corpus": args.windows_per_corpus,
+                "windows_per_corpus": (
+                    next(iter(set(corpus_window_counts.values())))
+                    if len(set(corpus_window_counts.values())) == 1
+                    else None
+                ),
+                "corpus_window_counts": corpus_window_counts,
+                "corpus_target_tokens": corpus_target_tokens,
                 "windows_per_document": args.windows_per_document,
                 "window_tokens": args.window_tokens,
                 "tokenizer": args.model,
@@ -1129,10 +1187,18 @@ def main() -> int:
                 temporary.replace(corpus_artifact)
                 LOG.info(f"Wrote shared tokenized corpus windows to {corpus_artifact}")
         corpus_counts = artifact["corpus_counts"]
-        contexts = [
-            {"language_modeling": ([window["token_ids"][0]], window["token_ids"][1:])}
-            for window in artifact["windows"]
-        ]
+        contexts = []
+        for window in artifact["windows"]:
+            target_count = corpus_target_tokens[window["corpus"]]
+            context_count = len(window["token_ids"]) - target_count
+            contexts.append(
+                {
+                    "language_modeling": (
+                        window["token_ids"][:context_count],
+                        window["token_ids"][context_count:],
+                    )
+                }
+            )
         if tokenizer.bos_token_id is None:
             # Qwen3 intentionally defines no BOS. Starting each window at its
             # first text token preserves the checkpoint's tokenizer contract;
@@ -1370,6 +1436,8 @@ def main() -> int:
         "dataset": args.dataset,
         "corpora": args.corpus,
         "corpus_counts": corpus_counts,
+        "corpus_window_counts": corpus_window_counts if args.corpus else None,
+        "corpus_target_tokens": corpus_target_tokens if args.corpus else None,
         "corpus_data_root": str(args.corpus_data_root.resolve()) if args.corpus else None,
         "windows_per_document": args.windows_per_document if args.corpus else None,
         "window_tokens": args.window_tokens if args.corpus else None,
@@ -1490,6 +1558,33 @@ def main() -> int:
             )
             for objective in candidate_nll
         }
+        if args.corpus and "language_modeling" in result["objectives"]:
+            corpus_summaries = {}
+            percent_changes = []
+            for corpus in args.corpus:
+                indices = [
+                    index for index, window in enumerate(artifact["windows"])
+                    if window["corpus"] == corpus
+                ]
+                summary = summarize_paired_losses(
+                    indices,
+                    [native_nll["language_modeling"][index] for index in indices],
+                    [native_counts["language_modeling"][index] for index in indices],
+                    [candidate_nll["language_modeling"][index] for index in indices],
+                    [candidate_counts["language_modeling"][index] for index in indices],
+                    tail_quantile=args.tail_quantile,
+                    tail_weight=args.tail_weight,
+                    harm_tolerance=args.harm_tolerance,
+                )
+                percent_change = 100.0 * (
+                    summary["target_perplexity"] / summary["native_target_perplexity"] - 1.0
+                )
+                summary["percent_perplexity_change"] = percent_change
+                corpus_summaries[corpus] = summary
+                percent_changes.append(percent_change)
+            language_modeling = result["objectives"]["language_modeling"]
+            language_modeling["corpora"] = corpus_summaries
+            language_modeling["paper_mean_percent_perplexity_change"] = sum(percent_changes) / len(percent_changes)
         results.append(result)
         telemetry.candidate_completed(result)
         _write_report(
