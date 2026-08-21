@@ -10,7 +10,8 @@ import time
 from pathlib import Path
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from tokenicer import Tokenicer
+from transformers import AutoModelForCausalLM
 
 from recirculation import RecirculationConfig
 from recirculation.cuda_backend import CUDAConcurrentRunner
@@ -24,7 +25,7 @@ def main() -> None:
     parser.add_argument("--repetitions", type=int, default=3)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
-    tokenizer = AutoTokenizer.from_pretrained(args.model, local_files_only=True)
+    tokenizer = Tokenicer.load(args.model, local_files_only=True)
     model = AutoModelForCausalLM.from_pretrained(
         args.model, local_files_only=True, dtype=torch.float16, attn_implementation="sdpa"
     ).eval().to("cuda")

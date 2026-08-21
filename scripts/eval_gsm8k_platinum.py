@@ -23,7 +23,8 @@ from evalution.scorers.gsm8k import (
     gsm8k_platinum_numeric_target,
     numbers_equal,
 )
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from tokenicer import Tokenicer
+from transformers import AutoModelForCausalLM
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
@@ -414,7 +415,7 @@ def main() -> int:
     if len(documents) != args.rows:
         raise ValueError(f"Requested {args.rows} rows but only {len(documents)} are available in the selected range")
 
-    tokenizer = AutoTokenizer.from_pretrained(args.model, local_files_only=False)
+    tokenizer = Tokenicer.load(args.model, local_files_only=False)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
     device = torch.device(resolved_device) if backend != "mlx" else None

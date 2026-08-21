@@ -32,7 +32,8 @@ for _thread_variable in (
 import torch
 from datasets import load_dataset
 from logbar import LogBar
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from tokenicer import Tokenicer
+from transformers import AutoModelForCausalLM
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
@@ -433,7 +434,7 @@ def main() -> int:
 
     torch.set_num_threads(int(os.environ["OMP_NUM_THREADS"]))
     local_files_only = not args.allow_download
-    tokenizer = AutoTokenizer.from_pretrained(args.model, local_files_only=local_files_only)
+    tokenizer = Tokenicer.load(args.model, local_files_only=local_files_only)
     model = (
         AutoModelForCausalLM.from_pretrained(
             args.model,

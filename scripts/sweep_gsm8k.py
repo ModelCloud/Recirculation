@@ -15,7 +15,8 @@ from pathlib import Path
 import torch
 from datasets import load_dataset
 from evalution.scorers.gsm8k import numbers_equal
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from tokenicer import Tokenicer
+from transformers import AutoModelForCausalLM
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
@@ -329,7 +330,7 @@ def main() -> int:
     documents = [dataset[index] for index in range(args.row_start, stop)]
     if len(documents) != args.rows:
         raise ValueError("requested row range exceeds the dataset")
-    tokenizer = AutoTokenizer.from_pretrained(args.model)
+    tokenizer = Tokenicer.load(args.model)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
     model = (

@@ -12,7 +12,8 @@ import statistics
 import time
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from tokenicer import Tokenicer
+from transformers import AutoModelForCausalLM
 
 from recirculation import RecirculationConfig
 from recirculation.cuda_backend import CUDAGraphedPrefill, CUDAPrefillRunner, measure_forward_error
@@ -30,7 +31,7 @@ def main() -> None:
     parser.add_argument("--repetitions", type=int, default=3)
     args = parser.parse_args()
 
-    tokenizer = AutoTokenizer.from_pretrained(args.model, local_files_only=True)
+    tokenizer = Tokenicer.load(args.model, local_files_only=True)
     model = (
         AutoModelForCausalLM.from_pretrained(args.model, local_files_only=True, dtype=torch.float16).eval().to("cuda")
     )

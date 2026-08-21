@@ -13,7 +13,7 @@ from pathlib import Path
 import mlx.core as mx
 from datasets import load_dataset
 from mlx_lm import load
-from transformers import AutoTokenizer
+from tokenicer import Tokenicer
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
@@ -40,7 +40,7 @@ def main() -> int:
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     model, _ = load(args.model)
-    tokenizer = AutoTokenizer.from_pretrained(args.model)
+    tokenizer = Tokenicer.load(args.model)
     fewshots, _ = _task_contract(REPO_ROOT / "configs/gsm8k-platinum-cot-llama.yaml")
     dataset = load_dataset("madrylab/gsm8k-platinum", name="main", split="test")
     prompts = [_prompt_ids(tokenizer, str(dataset[index]["question"]), fewshots) for index in range(args.rows)]
