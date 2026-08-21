@@ -125,6 +125,9 @@ python scripts/screen_cuda_recirculation.py \
 
 Qwen3-8B has 36 decoder layers, so an unrestricted scan contains 630 ordered `source > destination` paths per alpha.
 Use repeated `--path SOURCE:DESTINATION` arguments to smoke-test or refine a shortlist before launching the full grid.
+Candidate execution is deterministically randomized by default so partial runs sample the layer space instead of always
+starting at 1→0, 2→0, 3→0. JSON and Markdown ledgers store the full scan-index→path/alpha schedule and each result's
+scan index. Set `--scan-seed` to choose a different reproducible order or `--scan-order sequential` for legacy order.
 
 ## Install and test
 

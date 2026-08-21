@@ -15,7 +15,7 @@ from recirculation.screening import (
     screen_result_key,
     summarize_paired_losses,
 )
-from scripts.screen_cuda_recirculation import MODEL_DTYPES
+from scripts.screen_cuda_recirculation import MODEL_DTYPES, _candidate_schedule, _ordered_candidates
 
 
 def test_path_search_starts_at_conservative_alpha():
@@ -24,6 +24,21 @@ def test_path_search_starts_at_conservative_alpha():
 
 def test_cuda_screening_exposes_fp16_and_bf16_model_dtypes():
     assert MODEL_DTYPES == {"float16": torch.float16, "bfloat16": torch.bfloat16}
+
+
+def test_cuda_screening_randomizes_and_persists_a_reproducible_candidate_schedule():
+    paths = [(source, destination) for destination in range(4) for source in range(destination + 1, 4)]
+    sequential = _ordered_candidates(paths, [0.05, 0.1], scan_order="sequential", scan_seed=7)
+    randomized = _ordered_candidates(paths, [0.05, 0.1], scan_order="random", scan_seed=7)
+
+    assert randomized != sequential
+    assert randomized == _ordered_candidates(paths, [0.05, 0.1], scan_order="random", scan_seed=7)
+    assert set(randomized) == set(sequential)
+    schedule = _candidate_schedule(randomized)
+    assert [item["scan_index"] for item in schedule] == list(range(len(randomized)))
+    assert [
+        (item["source_layer"], item["destination_layer"], item["alpha"]) for item in schedule
+    ] == randomized
 
 
 def test_gsm8k_solution_target_keeps_reasoning_and_removes_calculator_annotations():

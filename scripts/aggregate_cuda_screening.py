@@ -33,6 +33,8 @@ _SETTING_KEYS = (
     "row_stop_exclusive",
     "common_prefix_tokens",
     "corpus_prefix_policy",
+    "scan_order",
+    "scan_seed",
     "target_mode",
     "tail_quantile",
     "tail_weight",

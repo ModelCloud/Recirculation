@@ -13,6 +13,7 @@ import argparse
 import json
 import os
 import platform
+import random
 import subprocess
 import sys
 import time
@@ -79,6 +80,31 @@ def _parse_range(value):
     if start < 0 or stop <= start:
         raise argparse.ArgumentTypeError("ranges must be non-empty START:STOP intervals")
     return start, stop
+
+
+def _ordered_candidates(paths, alphas, *, scan_order: str, scan_seed: int):
+    """Build a reproducible candidate schedule without low-layer-first bias."""
+
+    candidates = [(source, destination, alpha) for source, destination in paths for alpha in alphas]
+    if len(set(candidates)) != len(candidates):
+        raise ValueError("candidate paths and alphas must be unique")
+    if scan_order == "random":
+        random.Random(scan_seed).shuffle(candidates)
+    elif scan_order != "sequential":
+        raise ValueError(f"unsupported scan order: {scan_order}")
+    return candidates
+
+
+def _candidate_schedule(candidates):
+    return [
+        {
+            "scan_index": scan_index,
+            "source_layer": source,
+            "destination_layer": destination,
+            "alpha": alpha,
+        }
+        for scan_index, (source, destination, alpha) in enumerate(candidates)
+    ]
 
 
 def _overlaps(left, right):
@@ -361,6 +387,13 @@ def main() -> int:
     parser.add_argument("--alpha", action="append", type=float, default=None)
     parser.add_argument("--path", action="append", type=_parse_path, default=None)
     parser.add_argument(
+        "--scan-order",
+        choices=("random", "sequential"),
+        default="random",
+        help="Candidate execution order. Random is deterministic under --scan-seed and avoids low-layer-first bias.",
+    )
+    parser.add_argument("--scan-seed", type=int, default=20260821)
+    parser.add_argument(
         "--max-distance",
         type=int,
         default=None,
@@ -594,8 +627,10 @@ def main() -> int:
             )
         ]
     alphas = args.alpha or [DEFAULT_PATH_ALPHA]
-    candidates = [(source, destination, alpha) for source, destination in paths for alpha in alphas]
+    candidates = _ordered_candidates(paths, alphas, scan_order=args.scan_order, scan_seed=args.scan_seed)
     candidate_keys = set(candidates)
+    candidate_schedule = _candidate_schedule(candidates)
+    scan_indices = {candidate: index for index, candidate in enumerate(candidates)}
     results = []
     started = time.perf_counter()
     implementation_commit = _implementation_commit()
@@ -604,6 +639,8 @@ def main() -> int:
     if args.resume and args.output.exists():
         previous = json.loads(args.output.read_text(encoding="utf-8"))
         previous_settings = previous.get("settings", {})
+        previous_scan_order = previous_settings.get("scan_order", "sequential")
+        previous_scan_seed = previous_settings.get("scan_seed", args.scan_seed)
         expected_settings = {
             "scoring_schema": "dual_objective_v1",
             "model": args.model,
@@ -626,13 +663,31 @@ def main() -> int:
             for key, value in expected_settings.items()
             if previous_settings.get(key) != value
         }
+        if previous_scan_order != args.scan_order:
+            mismatches["scan_order"] = (previous_scan_order, args.scan_order)
+        if previous_scan_seed != args.scan_seed:
+            mismatches["scan_seed"] = (previous_scan_seed, args.scan_seed)
         if mismatches:
             parser.error(f"cannot resume output with different settings: {mismatches}")
+        stored_schedule = previous_settings.get("candidate_schedule")
+        if stored_schedule is not None:
+            stored_schedule = sorted(stored_schedule, key=lambda item: item["scan_index"])
+            stored_candidates = [
+                (int(item["source_layer"]), int(item["destination_layer"]), float(item["alpha"]))
+                for item in stored_schedule
+            ]
+            if set(stored_candidates) != candidate_keys or len(stored_candidates) != len(candidates):
+                parser.error("cannot resume output whose stored candidate schedule differs from this scan")
+            candidates = stored_candidates
+            candidate_schedule = _candidate_schedule(candidates)
+            scan_indices = {candidate: index for index, candidate in enumerate(candidates)}
         results = [
             item
             for item in previous.get("results", [])
             if (item["source_layer"], item["destination_layer"], item["alpha"]) in candidate_keys
         ]
+        for item in results:
+            item["scan_index"] = scan_indices[(item["source_layer"], item["destination_layer"], item["alpha"])]
         if results:
             native_nll = {}
             native_counts = {}
@@ -716,6 +771,9 @@ def main() -> int:
         "common_prefix_tokens": common_length,
         "corpus_prefix_policy": corpus_prefix_policy,
         "alphas": alphas,
+        "scan_order": args.scan_order,
+        "scan_seed": args.scan_seed,
+        "candidate_schedule": candidate_schedule,
         "max_distance": args.max_distance,
         "scheduler": args.scheduler,
         "candidate_workers": args.candidate_workers,
@@ -799,6 +857,7 @@ def main() -> int:
         }
         for future in as_completed(futures):
             result = future.result()
+            result["scan_index"] = scan_indices[futures[future]]
             candidate_nll = result.pop("row_nll_totals")
             candidate_counts = result.pop("row_target_counts")
             result["objectives"] = {

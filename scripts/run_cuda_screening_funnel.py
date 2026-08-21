@@ -59,6 +59,10 @@ def _screen_base(args, output: Path, *, target_mode: str) -> list[str]:
         str(args.row_batch_size),
         "--candidate-workers",
         str(args.candidate_workers),
+        "--scan-order",
+        args.scan_order,
+        "--scan-seed",
+        str(args.scan_seed),
         "--target-mode",
         target_mode,
         "--tail-quantile",
@@ -95,6 +99,8 @@ def main() -> int:
         help="Deprecated single-alpha override for stage 1; by default stage 1 evaluates --alpha-grid.",
     )
     parser.add_argument("--top-paths", type=int, default=8)
+    parser.add_argument("--scan-order", choices=("random", "sequential"), default="random")
+    parser.add_argument("--scan-seed", type=int, default=20260821)
     parser.add_argument(
         "--alpha-grid",
         type=float,

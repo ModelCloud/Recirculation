@@ -233,25 +233,26 @@ def render_screen_report_markdown(report: dict) -> str:
     if language_modeling:
         lines.extend(
             [
-                "| Path | Alpha | Seconds | LM PPL | LM ΔNLL | LM robust | LM tail harm | LM I/R/N |",
-                "|---:|---:|---:|---:|---:|---:|---:|---:|",
+                "| Scan | Path | Alpha | Seconds | LM PPL | LM ΔNLL | LM robust | LM tail harm | LM I/R/N |",
+                "|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
             ]
         )
     else:
         lines.extend(
             [
                 (
-                    "| Path | Alpha | Seconds | Final PPL | Final ΔNLL | Final robust | Final tail harm | "
+                    "| Scan | Path | Alpha | Seconds | Final PPL | Final ΔNLL | Final robust | Final tail harm | "
                     "Final I/R/N | Full PPL | Full ΔNLL | Full robust | Full tail harm | Full I/R/N |"
                 ),
-                "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+                "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
             ]
         )
     for result in results:
         if language_modeling:
             metrics = result["objectives"]["language_modeling"]
             lines.append(
-                f"| {result['source_layer']}→{result['destination_layer']} | {result['alpha']:.6g} | "
+                f"| {result.get('scan_index', '—')} | {result['source_layer']}→{result['destination_layer']} | "
+                f"{result['alpha']:.6g} | "
                 f"{result.get('seconds', 0.0):.3f} | {metrics['target_perplexity']:.9g} | "
                 f"{metrics['native_delta_nll']:.9g} | {metrics['screen_score']:.9g} | "
                 f"{metrics['tail_harm_nll']:.9g} | "
@@ -275,9 +276,33 @@ def render_screen_report_markdown(report: dict) -> str:
         final_values = values(final)
         full_values = values(full)
         lines.append(
-            f"| {result['source_layer']}→{result['destination_layer']} | {result['alpha']:.6g} | "
+            f"| {result.get('scan_index', '—')} | {result['source_layer']}→{result['destination_layer']} | "
+            f"{result['alpha']:.6g} | "
             f"{result.get('seconds', 0.0):.3f} | " + " | ".join((*final_values, *full_values)) + " |"
         )
+    schedule = report.get("settings", {}).get("candidate_schedule", [])
+    if schedule:
+        completed_indices = {result.get("scan_index") for result in results}
+        lines.extend(
+            [
+                "",
+                "## Candidate schedule",
+                "",
+                (
+                    f"Order: `{report['settings'].get('scan_order', 'unknown')}`; "
+                    f"seed: `{report['settings'].get('scan_seed', 'unknown')}`."
+                ),
+                "",
+                "| Scan | Path | Alpha | State |",
+                "|---:|---:|---:|---:|",
+            ]
+        )
+        for item in sorted(schedule, key=lambda candidate: candidate["scan_index"]):
+            state = "complete" if item["scan_index"] in completed_indices else "scheduled"
+            lines.append(
+                f"| {item['scan_index']} | {item['source_layer']}→{item['destination_layer']} | "
+                f"{item['alpha']:.6g} | {state} |"
+            )
     return "\n".join(lines) + "\n"
 
 
