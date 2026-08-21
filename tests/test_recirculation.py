@@ -367,6 +367,128 @@ def test_qwen3_concurrent_chunked_score_matches_sequential_gate(monkeypatch):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_qwen3_candidate_batch_matches_individual_dual_gemm():
+    transformers = pytest.importorskip("transformers")
+    from recirculation.cuda_backend import CUDABatchedPathRunner, CUDAConcurrentRunner, measure_forward_error
+
+    torch.manual_seed(17)
+    model = (
+        transformers.Qwen3ForCausalLM(
+            transformers.Qwen3Config(
+                vocab_size=64,
+                hidden_size=64,
+                intermediate_size=128,
+                num_hidden_layers=4,
+                num_attention_heads=4,
+                num_key_value_heads=2,
+                head_dim=16,
+                bos_token_id=None,
+            )
+        )
+        .half()
+        .eval()
+        .cuda()
+    )
+    model.set_attn_implementation("eager")
+    configs = (
+        RecirculationConfig(source_layer=1, destination_layer=0, alpha=0.05),
+        RecirculationConfig(source_layer=2, destination_layer=0, alpha=0.05),
+        RecirculationConfig(source_layer=3, destination_layer=0, alpha=0.05),
+    )
+    tokens = torch.tensor([[1, 2, 3, 4], [7, 8, 9, 10]], device="cuda")
+    mask = torch.ones_like(tokens)
+    targets = {
+        position: ([0, 1], [int(tokens[0, position] + 1), int(tokens[1, position] + 1)])
+        for position in range(tokens.shape[1])
+    }
+    expected = []
+    for config in configs:
+        runner = CUDAConcurrentRunner(model, config, use_python_threads=False, dual_gemm=True)
+        try:
+            nll, counts = runner.score(
+                tokens,
+                targets,
+                attention_mask=mask,
+                return_per_row=True,
+                projection_chunk_tokens=4,
+            )
+        finally:
+            runner.close()
+        expected.append(nll)
+        assert counts == [4, 4]
+
+    candidate, candidate_counts = CUDABatchedPathRunner(model, configs).score(
+        tokens,
+        targets,
+        attention_mask=mask,
+        projection_chunk_tokens=4,
+    )
+    measure_forward_error(
+        torch.tensor(expected, device="cuda"), torch.tensor(candidate, device="cuda")
+    ).require()
+    assert candidate_counts == [[4, 4], [4, 4], [4, 4]]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_llama_candidate_batch_matches_individual_dual_gemm():
+    transformers = pytest.importorskip("transformers")
+    from recirculation.cuda_backend import CUDABatchedPathRunner, CUDAPrefillRunner, measure_forward_error
+
+    torch.manual_seed(29)
+    model = (
+        transformers.LlamaForCausalLM(
+            transformers.LlamaConfig(
+                vocab_size=64,
+                hidden_size=64,
+                intermediate_size=128,
+                num_hidden_layers=4,
+                num_attention_heads=4,
+                num_key_value_heads=2,
+                head_dim=16,
+            )
+        )
+        .half()
+        .eval()
+        .cuda()
+    )
+    model.set_attn_implementation("eager")
+    configs = (
+        RecirculationConfig(source_layer=1, destination_layer=0, alpha=0.05),
+        RecirculationConfig(source_layer=2, destination_layer=0, alpha=0.05),
+        RecirculationConfig(source_layer=3, destination_layer=0, alpha=0.05),
+    )
+    tokens = torch.tensor([[1, 2, 3, 4], [7, 8, 9, 10]], device="cuda")
+    mask = torch.ones_like(tokens)
+    targets = {
+        position: ([0, 1], [int(tokens[0, position] + 1), int(tokens[1, position] + 1)])
+        for position in range(tokens.shape[1])
+    }
+    expected = []
+    for config in configs:
+        runner = CUDAPrefillRunner(
+            model,
+            config,
+            allow_terminal_padding=True,
+            projection_chunk_tokens=4,
+            mask_free_unpadded=True,
+        )
+        nll, counts = runner.score(tokens, targets, attention_mask=mask, return_per_row=True)
+        expected.append(nll)
+        assert counts == [4, 4]
+
+    candidate, candidate_counts = CUDABatchedPathRunner(model, configs).score(
+        tokens,
+        targets,
+        attention_mask=mask,
+        projection_chunk_tokens=4,
+    )
+    measure_forward_error(
+        torch.tensor(expected, device="cuda"), torch.tensor(candidate, device="cuda")
+    ).require()
+    assert candidate_counts == [[4, 4], [4, 4], [4, 4]]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
 def test_cuda_generation_matches_updated_torch_controller(monkeypatch):
     transformers = pytest.importorskip("transformers")
     from recirculation.cuda_backend import CUDAConcurrentRunner

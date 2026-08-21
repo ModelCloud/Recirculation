@@ -42,7 +42,12 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 from recirculation import RecirculationConfig
-from recirculation.cuda_backend import CUDAConcurrentRunner, CUDAGraphedConcurrentPrefill, CUDAPrefillRunner
+from recirculation.cuda_backend import (
+    CUDABatchedPathRunner,
+    CUDAConcurrentRunner,
+    CUDAGraphedConcurrentPrefill,
+    CUDAPrefillRunner,
+)
 from recirculation.screening import (
     DEFAULT_PATH_ALPHA,
     PROXY_RANKINGS,
@@ -607,6 +612,126 @@ def _score_candidate(
                 batch_runner.close()
 
 
+def _candidate_batches(candidates, width):
+    """Group paths by shared replay boundary while retaining randomized group order."""
+
+    pending = list(candidates)
+    while pending:
+        first = pending.pop(0)
+        group = [first]
+        matching = []
+        for index, candidate in enumerate(pending):
+            if candidate[1:] == first[1:]:
+                matching.append(index)
+                if len(group) + len(matching) == width:
+                    break
+        for index in reversed(matching):
+            group.append(pending.pop(index))
+        yield group
+
+
+def _effective_candidate_batch_size(requested, row_batch_size, sequence_length, token_budget):
+    """Bound candidate width by the live candidate-row-token cache footprint."""
+
+    if min(requested, row_batch_size, sequence_length, token_budget) < 1:
+        raise ValueError("candidate batch sizing inputs must be positive")
+    return max(1, min(requested, token_budget // (row_batch_size * sequence_length)))
+
+
+def _effective_row_batch_size(requested, candidate_batch_size, sequence_length, token_budget):
+    """Reduce scoring rows when one candidate alone would exceed the memory budget."""
+
+    if min(requested, candidate_batch_size, sequence_length, token_budget) < 1:
+        raise ValueError("row batch sizing inputs must be positive")
+    return max(1, min(requested, token_budget // (candidate_batch_size * sequence_length)))
+
+
+def _score_candidate_batch(
+    model,
+    contexts,
+    candidates,
+    row_batch_size,
+    pad_token_id,
+    projection_chunk_tokens,
+    progress_callbacks=None,
+):
+    """Score same-destination paths together in the model batch dimension."""
+
+    started = time.perf_counter()
+    configs = [
+        RecirculationConfig(source_layer=source, destination_layer=destination, alpha=alpha)
+        for source, destination, alpha in candidates
+    ]
+    callbacks = progress_callbacks or [None] * len(candidates)
+    for callback in callbacks:
+        if callback is not None:
+            callback("candidate_started")
+    runner = CUDABatchedPathRunner(model, configs)
+    candidate_nll = [
+        {objective: [] for objective in contexts[0]} for _candidate in candidates
+    ]
+    candidate_counts = [
+        {objective: [] for objective in contexts[0]} for _candidate in candidates
+    ]
+    with torch.inference_mode():
+        for batch_start in range(0, len(contexts), row_batch_size):
+            batch = contexts[batch_start : batch_start + row_batch_size]
+            for objective in contexts[0]:
+                scoring_rows = [row[objective] for row in batch]
+                sequences = [context + answer_ids[:-1] for context, answer_ids in scoring_rows]
+                maximum_length = max(map(len, sequences))
+                batch_tokens = torch.full(
+                    (len(scoring_rows), maximum_length),
+                    pad_token_id,
+                    dtype=torch.long,
+                    device="cuda",
+                )
+                attention_mask = torch.zeros_like(batch_tokens)
+                targets_by_position = {}
+                for row, ((context, answer_ids), sequence) in enumerate(zip(scoring_rows, sequences)):
+                    batch_tokens[row, : len(sequence)] = torch.tensor(sequence, device="cuda")
+                    attention_mask[row, : len(sequence)] = 1
+                    for target_index, target in enumerate(answer_ids):
+                        position = len(context) - 1 + target_index
+                        rows, targets = targets_by_position.setdefault(position, ([], []))
+                        rows.append(row)
+                        targets.append(int(target))
+                if not bool(attention_mask.all()):
+                    raise ValueError(
+                        "candidate batching requires equal-length unpadded rows; use width one for padded data"
+                    )
+                nll_values, count_values = runner.score(
+                    batch_tokens,
+                    targets_by_position,
+                    attention_mask=attention_mask,
+                    projection_chunk_tokens=projection_chunk_tokens,
+                )
+                for candidate_index in range(len(candidates)):
+                    candidate_nll[candidate_index][objective].extend(nll_values[candidate_index])
+                    candidate_counts[candidate_index][objective].extend(count_values[candidate_index])
+                    callback = callbacks[candidate_index]
+                    if callback is not None:
+                        callback(
+                            "batch_completed",
+                            rows=len(scoring_rows),
+                            padded_token_positions=len(scoring_rows) * maximum_length,
+                        )
+    group_seconds = time.perf_counter() - started
+    return [
+        {
+            "source_layer": source,
+            "destination_layer": destination,
+            "alpha": alpha,
+            "row_nll_totals": candidate_nll[index],
+            "row_target_counts": candidate_counts[index],
+            "seconds": group_seconds / len(candidates),
+            "candidate_batch_seconds": group_seconds,
+            "candidate_batch_width": len(candidates),
+        }
+        for index, (source, destination, alpha) in enumerate(candidates)
+    ]
+
+
 def _score_native_dense(model, contexts, row_batch_size, pad_token_id, projection_chunk_tokens):
     """Score alpha=0 with ordinary parallel causal prefill and chunked LM projection."""
 
@@ -726,6 +851,18 @@ def main() -> int:
     )
     parser.add_argument("--scheduler", choices=("concurrent", "sequential"), default="concurrent")
     parser.add_argument("--candidate-workers", type=int, default=1)
+    parser.add_argument(
+        "--candidate-batch-size",
+        type=int,
+        default=1,
+        help="Batch same-destination Qwen3 paths in one process; widths above one require corpus scoring and dual GEMM.",
+    )
+    parser.add_argument(
+        "--candidate-token-budget",
+        type=int,
+        default=65536,
+        help="Cap candidate_width * row_batch * sequence_length to control KV/activation memory.",
+    )
     parser.add_argument("--row-batch-size", type=int, default=32)
     parser.add_argument(
         "--projection-chunk-tokens",
@@ -811,6 +948,8 @@ def main() -> int:
         args.rows,
         args.report_every,
         args.candidate_workers,
+        args.candidate_batch_size,
+        args.candidate_token_budget,
         args.row_batch_size,
         args.projection_chunk_tokens,
         args.windows_per_corpus,
@@ -827,6 +966,15 @@ def main() -> int:
         parser.error("the sequential scheduler does not support --graph-prefix")
     if args.candidate_workers != 1 and args.graph_prefix:
         parser.error("CUDA Graph prefix capture requires --candidate-workers 1")
+    if args.candidate_batch_size > 1:
+        if bool(getattr(sys, "_is_gil_enabled", lambda: True)()):
+            parser.error("candidate batching requires CPython 3.14t with -X gil=0")
+        if not args.corpus:
+            parser.error("candidate batching currently requires fixed-window corpus scoring")
+        if args.scheduler != "concurrent" or not args.dual_gemm:
+            parser.error("candidate batching requires --scheduler concurrent and --dual-gemm")
+        if args.candidate_workers != 1 or args.graph_prefix:
+            parser.error("candidate batching requires one worker and does not support prefix graphs")
     if not 0.0 <= args.tail_quantile < 1.0:
         parser.error("tail-quantile must be in [0, 1)")
     if args.tail_weight < 0.0 or args.harm_tolerance < 0.0:
@@ -967,6 +1115,36 @@ def main() -> int:
                     tokenizer(gold_answer, add_special_tokens=False).input_ids,
                 )
             contexts.append(row)
+    requested_candidate_batch_size = args.candidate_batch_size
+    requested_row_batch_size = args.row_batch_size
+    if args.candidate_batch_size > 1:
+        maximum_sequence_length = max(
+            len(context) + len(answer_ids) - 1
+            for row in contexts
+            for context, answer_ids in row.values()
+        )
+        args.candidate_batch_size = _effective_candidate_batch_size(
+            args.candidate_batch_size,
+            min(args.row_batch_size, len(contexts)),
+            maximum_sequence_length,
+            args.candidate_token_budget,
+        )
+        if args.candidate_batch_size != requested_candidate_batch_size:
+            LOG.info(
+                f"Reducing candidate batch width {requested_candidate_batch_size}->{args.candidate_batch_size} "
+                f"to honor the {args.candidate_token_budget} candidate-row-token memory budget"
+            )
+        args.row_batch_size = _effective_row_batch_size(
+            args.row_batch_size,
+            args.candidate_batch_size,
+            maximum_sequence_length,
+            args.candidate_token_budget,
+        )
+        if args.row_batch_size != requested_row_batch_size:
+            LOG.info(
+                f"Reducing row batch size {requested_row_batch_size}->{args.row_batch_size} "
+                f"to honor the {args.candidate_token_budget} candidate-row-token memory budget"
+            )
     baseline_contract = _baseline_contract(
         args,
         common_prefix_tokens=common_length,
@@ -1143,7 +1321,11 @@ def main() -> int:
         "max_distance": args.max_distance,
         "scheduler": args.scheduler,
         "candidate_workers": args.candidate_workers,
+        "requested_candidate_batch_size": requested_candidate_batch_size,
+        "candidate_batch_size": args.candidate_batch_size,
+        "candidate_token_budget": args.candidate_token_budget,
         "python_threads": args.python_threads,
+        "requested_row_batch_size": requested_row_batch_size,
         "row_batch_size": args.row_batch_size,
         "projection_chunk_tokens": args.projection_chunk_tokens,
         "mask_free_unpadded": args.mask_free_unpadded,
@@ -1225,89 +1407,107 @@ def main() -> int:
 
         return update
 
-    torch.cuda.synchronize()
-    with ThreadPoolExecutor(max_workers=args.candidate_workers, thread_name_prefix="recirculation-screen") as executor:
-        futures = {
-            executor.submit(
-                _score_candidate,
-                model,
-                prefix,
-                contexts,
-                candidate,
-                args.scheduler,
-                args.python_threads,
-                args.row_batch_size,
-                int(
-                    tokenizer.pad_token_id
-                    if tokenizer.pad_token_id is not None
-                    else tokenizer.eos_token_id
-                ),
-                args.graph_prefix,
-                args.projection_chunk_tokens,
-                args.mask_free_unpadded,
-                args.dual_gemm,
-                progress_callback(candidate),
-            ): candidate
-            for candidate in remaining_candidates
-        }
-        for future in as_completed(futures):
-            result = future.result()
-            result["scan_index"] = scan_indices[futures[future]]
-            candidate_nll = result.pop("row_nll_totals")
-            candidate_counts = result.pop("row_target_counts")
-            result["objectives"] = {
-                objective: summarize_paired_losses(
-                    list(range(args.row_start, stop)),
-                    native_nll[objective],
-                    native_counts[objective],
-                    candidate_nll[objective],
-                    candidate_counts[objective],
-                    tail_quantile=args.tail_quantile,
-                    tail_weight=args.tail_weight,
-                    harm_tolerance=args.harm_tolerance,
-                )
-                for objective in candidate_nll
-            }
-            results.append(result)
-            telemetry.candidate_completed(result)
-            _write_report(
-                args.output,
-                status="running",
-                implementation_commit=implementation_commit,
-                settings=settings,
-                started=started,
-                results=results,
-                total=len(candidates),
-                elapsed_offset=elapsed_offset,
+    def accept_result(result, candidate):
+        result["scan_index"] = scan_indices[candidate]
+        candidate_nll = result.pop("row_nll_totals")
+        candidate_counts = result.pop("row_target_counts")
+        result["objectives"] = {
+            objective: summarize_paired_losses(
+                list(range(args.row_start, stop)),
+                native_nll[objective],
+                native_counts[objective],
+                candidate_nll[objective],
+                candidate_counts[objective],
+                tail_quantile=args.tail_quantile,
+                tail_weight=args.tail_weight,
+                harm_tolerance=args.harm_tolerance,
             )
-            if args.empty_cache_every and len(results) % args.empty_cache_every == 0:
-                torch.cuda.empty_cache()
-            if len(results) % args.report_every == 0 or len(results) == len(candidates):
-                leaders = {
-                    name: min(
-                        results,
-                        key=lambda item, objective=objective, robust=robust: objective_result_key(
-                            item, objective, robust=robust
-                        ),
-                    )
-                    for name, objective, robust in PROXY_RANKINGS
-                    if objective in results[0]["objectives"]
-                }
-                summary = "; ".join(
-                    f"{name}={item['source_layer']}->{item['destination_layer']}@{item['alpha']:g}"
-                    for name, item in leaders.items()
+            for objective in candidate_nll
+        }
+        results.append(result)
+        telemetry.candidate_completed(result)
+        _write_report(
+            args.output,
+            status="running",
+            implementation_commit=implementation_commit,
+            settings=settings,
+            started=started,
+            results=results,
+            total=len(candidates),
+            elapsed_offset=elapsed_offset,
+        )
+        if args.empty_cache_every and len(results) % args.empty_cache_every == 0:
+            torch.cuda.empty_cache()
+        if len(results) % args.report_every == 0 or len(results) == len(candidates):
+            leaders = {
+                name: min(
+                    results,
+                    key=lambda item, objective=objective, robust=robust: objective_result_key(
+                        item, objective, robust=robust
+                    ),
                 )
-                LOG.info(f"candidates={len(results)}/{len(candidates)} {summary}")
-                for name, objective, robust in PROXY_RANKINGS:
-                    if name not in leaders:
-                        continue
-                    item = leaders[name]
-                    metrics = item["objectives"][objective]
-                    LOG.info(
-                        f"{name}: target_ppl={metrics['target_perplexity']:.6f} "
-                        f"score={metrics['screen_score']:.6f} regressed={metrics['regressed_rows']} "
-                        f"penalized={robust}"
-                    )
+                for name, objective, robust in PROXY_RANKINGS
+                if objective in results[0]["objectives"]
+            }
+            summary = "; ".join(
+                f"{name}={item['source_layer']}->{item['destination_layer']}@{item['alpha']:g}"
+                for name, item in leaders.items()
+            )
+            LOG.info(f"candidates={len(results)}/{len(candidates)} {summary}")
+            for name, objective, robust in PROXY_RANKINGS:
+                if name not in leaders:
+                    continue
+                item = leaders[name]
+                metrics = item["objectives"][objective]
+                LOG.info(
+                    f"{name}: target_ppl={metrics['target_perplexity']:.6f} "
+                    f"score={metrics['screen_score']:.6f} regressed={metrics['regressed_rows']} "
+                    f"penalized={robust}"
+                )
+
+    torch.cuda.synchronize()
+    pad_token_id = int(
+        tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+    )
+    if args.candidate_batch_size > 1:
+        for candidate_batch in _candidate_batches(remaining_candidates, args.candidate_batch_size):
+            batch_results = _score_candidate_batch(
+                model,
+                contexts,
+                candidate_batch,
+                args.row_batch_size,
+                pad_token_id,
+                args.projection_chunk_tokens,
+                [progress_callback(candidate) for candidate in candidate_batch],
+            )
+            for result, candidate in zip(batch_results, candidate_batch):
+                accept_result(result, candidate)
+    else:
+        with ThreadPoolExecutor(
+            max_workers=args.candidate_workers, thread_name_prefix="recirculation-screen"
+        ) as executor:
+            futures = {
+                executor.submit(
+                    _score_candidate,
+                    model,
+                    prefix,
+                    contexts,
+                    candidate,
+                    args.scheduler,
+                    args.python_threads,
+                    args.row_batch_size,
+                    pad_token_id,
+                    args.graph_prefix,
+                    args.projection_chunk_tokens,
+                    args.mask_free_unpadded,
+                    args.dual_gemm,
+                    progress_callback(candidate),
+                ): candidate
+                for candidate in remaining_candidates
+            }
+            for future in as_completed(futures):
+                candidate = futures[future]
+                accept_result(future.result(), candidate)
 
     telemetry.stop()
     _write_report(

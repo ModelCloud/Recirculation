@@ -19,10 +19,13 @@ from recirculation.screening import (
 from scripts.run_cuda_screening_race import _derive_stage_artifacts, _promote
 from scripts.screen_cuda_recirculation import (
     MODEL_DTYPES,
+    _PathTelemetry,
+    _candidate_batches,
+    _effective_candidate_batch_size,
+    _effective_row_batch_size,
     _candidate_schedule,
     _candidate_work,
     _ordered_candidates,
-    _PathTelemetry,
 )
 
 
@@ -47,6 +50,29 @@ def test_cuda_screening_randomizes_and_persists_a_reproducible_candidate_schedul
     assert [
         (item["source_layer"], item["destination_layer"], item["alpha"]) for item in schedule
     ] == randomized
+
+
+def test_cuda_candidate_batches_preserve_candidates_and_share_replay_boundary():
+    candidates = [(8, 2, 0.05), (7, 1, 0.05), (6, 2, 0.05), (5, 2, 0.1), (4, 2, 0.05)]
+    batches = list(_candidate_batches(candidates, 2))
+
+    assert [candidate for batch in batches for candidate in batch] == [
+        (8, 2, 0.05),
+        (6, 2, 0.05),
+        (7, 1, 0.05),
+        (5, 2, 0.1),
+        (4, 2, 0.05),
+    ]
+    assert all(len(batch) <= 2 for batch in batches)
+    assert all(len({candidate[1:] for candidate in batch}) == 1 for batch in batches)
+
+
+def test_cuda_candidate_batch_width_respects_row_token_memory_budget():
+    assert _effective_candidate_batch_size(8, 32, 256, 65536) == 8
+    assert _effective_candidate_batch_size(8, 128, 512, 65536) == 1
+    assert _effective_candidate_batch_size(8, 128, 1024, 65536) == 1
+    assert _effective_row_batch_size(128, 1, 512, 65536) == 128
+    assert _effective_row_batch_size(128, 1, 1024, 65536) == 64
 
 
 def test_cuda_path_telemetry_counts_existing_batches_without_cuda_queries(tmp_path):
