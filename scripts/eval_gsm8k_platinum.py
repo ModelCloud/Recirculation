@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 
-"""Paired GSM8K-Platinum evaluation for dense Llama with and without recirculation."""
+"""Paired GSM8K-Platinum evaluation for dense causal LMs with and without recirculation."""
 
 from __future__ import annotations
 

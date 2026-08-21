@@ -100,6 +100,8 @@ def _baseline_contract(args, *, common_prefix_tokens: int, objectives) -> dict:
     return {
         "scoring_schema": "dual_objective_v1",
         "model": args.model,
+        "model_type": args.model_type,
+        "decoder_layers": args.decoder_layers,
         "dtype": args.dtype,
         "dataset": args.dataset,
         "dataset_config": args.dataset_config,
@@ -211,8 +213,9 @@ def _score_candidate(
     candidate_started = time.perf_counter()
     source, destination, alpha = candidate
     config = RecirculationConfig(source_layer=source, destination_layer=destination, alpha=alpha)
-    candidate_stream = torch.cuda.Stream(device=prefix.device)
-    with torch.inference_mode(), torch.cuda.device(prefix.device), torch.cuda.stream(candidate_stream):
+    device = next(model.parameters()).device
+    candidate_stream = torch.cuda.Stream(device=device)
+    with torch.inference_mode(), torch.cuda.device(device), torch.cuda.stream(candidate_stream):
         runner = (
             CUDAConcurrentRunner(model, config, use_python_threads=use_python_threads)
             if scheduler == "concurrent"
@@ -220,22 +223,27 @@ def _score_candidate(
         )
         try:
             prefix_graph = None
+            if graph_prefix and prefix is None:
+                raise ValueError("graph-prefix screening requires a non-empty shared prefix")
             if graph_prefix:
                 if not isinstance(runner, CUDAConcurrentRunner):
                     raise ValueError("graph-prefix screening requires the concurrent scheduler")
                 runner.prefill(prefix[:, :2])
                 prefix_graph = CUDAGraphedConcurrentPrefill(runner, prefix, warmups=0)
                 _, cache, pending, _ = prefix_graph.prefill(prefix)
-            else:
+            elif prefix is not None:
                 _, cache, pending, _ = runner.prefill(prefix)
-            snapshot = runner.snapshot(cache, pending)
+            else:
+                cache = pending = snapshot = None
+            if prefix is not None:
+                snapshot = runner.snapshot(cache, pending)
             if prefix_graph is not None:
                 torch.cuda.synchronize(prefix.device)
             if row_batch_size > 1:
                 batch_runner = CUDAPrefillRunner(model, config, allow_terminal_padding=True)
                 objective_nll = {objective: [] for objective in contexts[0]}
                 objective_counts = {objective: [] for objective in contexts[0]}
-                prefix_length = snapshot.pending.token_position + 1
+                prefix_length = 0 if snapshot is None else snapshot.pending.token_position + 1
                 for batch_start in range(0, len(contexts), row_batch_size):
                     batch = contexts[batch_start : batch_start + row_batch_size]
                     for objective in contexts[0]:
@@ -263,10 +271,12 @@ def _score_candidate(
                                 rows, targets = targets_by_position.setdefault(position, ([], []))
                                 rows.append(row)
                                 targets.append(int(target))
-                        batch_nll, batch_targets = batch_runner.score_from_snapshot(
-                            batch_tokens,
-                            snapshot,
-                            targets_by_position,
+                        score = batch_runner.score if snapshot is None else batch_runner.score_from_snapshot
+                        score_args = (batch_tokens, targets_by_position)
+                        if snapshot is not None:
+                            score_args = (batch_tokens, snapshot, targets_by_position)
+                        batch_nll, batch_targets = score(
+                            *score_args,
                             attention_mask=attention_mask,
                             return_per_row=True,
                         )
@@ -286,7 +296,10 @@ def _score_candidate(
                 for objective, (context, answer_ids) in row.items():
                     sample_nll = 0.0
                     context_tensor = torch.tensor([context], dtype=torch.long, device="cuda")
-                    logits, cache, pending, _ = runner.prefill_from_snapshot(context_tensor, snapshot)
+                    if snapshot is None:
+                        logits, cache, pending, _ = runner.prefill(context_tensor)
+                    else:
+                        logits, cache, pending, _ = runner.prefill_from_snapshot(context_tensor, snapshot)
                     for token_index, token in enumerate(answer_ids):
                         token_logits = logits[0, -1].float()
                         sample_nll += float(torch.logsumexp(token_logits, dim=-1) - token_logits[int(token)])
@@ -358,9 +371,9 @@ def main() -> int:
     parser.add_argument("--row-batch-size", type=int, default=32)
     parser.add_argument(
         "--target-mode",
-        choices=("full_solution",),
+        choices=("final_answer", "full_solution", "dual"),
         default="full_solution",
-        help="Teacher-force the complete gold solution only as a shortlist proxy; final selection uses natural generation.",
+        help="Teacher-forced objective: numeric final answer, full solution, or both; final selection uses natural generation.",
     )
     parser.add_argument("--tail-quantile", type=float, default=0.9)
     parser.add_argument("--tail-weight", type=float, default=1.0)
@@ -397,6 +410,8 @@ def main() -> int:
     parser.add_argument("--report-every", type=int, default=10)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
+    if args.corpus and args.target_mode != "full_solution":
+        parser.error("--target-mode final_answer/dual applies to GSM8K screening, not corpus language modeling")
     if args.corpus and args.forbid_range:
         parser.error("--forbid-range applies only to indexed GSM8K screening")
     tuning_range = (args.row_start, args.row_start + args.rows)
@@ -444,6 +459,13 @@ def main() -> int:
         )
         .eval()
         .to("cuda")
+    )
+    decoder = model.get_decoder()
+    args.model_type = str(getattr(model.config, "model_type", type(model).__name__))
+    args.decoder_layers = len(decoder.layers)
+    LOG.info(
+        f"Loaded {args.model_type} causal LM with {args.decoder_layers} decoder layers; "
+        f"tokenizer_bos={tokenizer.bos_token_id}"
     )
     corpus_counts = {}
     if args.corpus:
@@ -509,9 +531,17 @@ def main() -> int:
             for window in artifact["windows"]
         ]
         if tokenizer.bos_token_id is None:
-            parser.error("corpus screening requires a tokenizer BOS token")
-        prefix = torch.tensor([[tokenizer.bos_token_id]], dtype=torch.long, device="cuda")
-        common_length = 1
+            # Qwen3 intentionally defines no BOS. Starting each window at its
+            # first text token preserves the checkpoint's tokenizer contract;
+            # substituting EOS or PAD would bias every candidate's recurrent state.
+            prefix = None
+            common_length = 0
+            corpus_prefix_policy = "none"
+            LOG.info("Tokenizer defines no BOS; scoring corpus windows from an empty cache")
+        else:
+            prefix = torch.tensor([[tokenizer.bos_token_id]], dtype=torch.long, device="cuda")
+            common_length = 1
+            corpus_prefix_policy = "bos"
         args.dataset = "+".join(args.corpus)
         args.dataset_config = "train"
         args.row_start = 0
@@ -519,6 +549,7 @@ def main() -> int:
         stop = len(contexts)
         forbidden_ranges = []
     else:
+        corpus_prefix_policy = None
         fewshots, _ = _task_contract(args.task_config)
         dataset = load_dataset(args.dataset, name=args.dataset_config, split="test")
         stop = args.row_start + args.rows
@@ -530,23 +561,28 @@ def main() -> int:
         common_length = min(_common_prefix_length(prompts), min(len(prompt) - 1 for prompt in prompts))
         prefix = torch.tensor([prompts[0][:common_length]], dtype=torch.long, device="cuda")
         contexts = []
+        final_answer_prefix = tokenizer("The final answer is ", add_special_tokens=False).input_ids
         for prompt, document, gold_answer in zip(prompts, documents, gold_answers):
-            full_target = gsm8k_solution_target(str(document["answer"]), gold_answer)
-            contexts.append(
-                {
-                    "full_solution": (
-                        prompt[common_length:],
-                        tokenizer(full_target, add_special_tokens=False).input_ids,
-                    )
-                }
-            )
+            row = {}
+            if args.target_mode in ("full_solution", "dual"):
+                full_target = gsm8k_solution_target(str(document["answer"]), gold_answer)
+                row["full_solution"] = (
+                    prompt[common_length:],
+                    tokenizer(full_target, add_special_tokens=False).input_ids,
+                )
+            if args.target_mode in ("final_answer", "dual"):
+                row["final_answer"] = (
+                    prompt[common_length:] + final_answer_prefix,
+                    tokenizer(gold_answer, add_special_tokens=False).input_ids,
+                )
+            contexts.append(row)
     baseline_contract = _baseline_contract(
         args,
         common_prefix_tokens=common_length,
         objectives=contexts[0],
     )
 
-    layer_count = len(model.get_decoder().layers)
+    layer_count = args.decoder_layers
     paths = args.path
     if paths is None:
         paths = [
@@ -571,6 +607,8 @@ def main() -> int:
         expected_settings = {
             "scoring_schema": "dual_objective_v1",
             "model": args.model,
+            "model_type": args.model_type,
+            "decoder_layers": args.decoder_layers,
             "dtype": args.dtype,
             "dataset": args.dataset,
             "row_start": args.row_start,
@@ -663,6 +701,8 @@ def main() -> int:
         "scoring_schema": "dual_objective_v1",
         "split_role": "tuning",
         "model": args.model,
+        "model_type": args.model_type,
+        "decoder_layers": args.decoder_layers,
         "dtype": args.dtype,
         "dataset": args.dataset,
         "corpora": args.corpus,
@@ -674,6 +714,7 @@ def main() -> int:
         "row_stop_exclusive": stop,
         "forbidden_ranges": forbidden_ranges,
         "common_prefix_tokens": common_length,
+        "corpus_prefix_policy": corpus_prefix_policy,
         "alphas": alphas,
         "max_distance": args.max_distance,
         "scheduler": args.scheduler,

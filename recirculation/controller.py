@@ -115,19 +115,39 @@ def torch_mix_reference(
     return beta * destination + alpha * source
 
 
-def _find_decoder_layers(model: nn.Module) -> nn.ModuleList:
-    """Find the standard Hugging Face decoder layer list without assuming a wrapper depth."""
+def _find_decoder(model: nn.Module) -> nn.Module:
+    """Find a Hugging Face decoder without assuming a specific causal-LM family.
 
-    for path in ("layers", "model.layers", "model.model.layers", "language_model.model.layers"):
+    Llama and Qwen3 both expose ``get_decoder()``, while lightweight test
+    doubles and some wrapped models expose the decoder only as an attribute.
+    Keeping this lookup model-family neutral is important because the replay
+    path also needs the decoder's rotary embedding and final norm.
+    """
+
+    get_decoder = getattr(model, "get_decoder", None)
+    if callable(get_decoder):
+        decoder = get_decoder()
+        if isinstance(getattr(decoder, "layers", None), nn.ModuleList):
+            return decoder
+    if isinstance(getattr(model, "layers", None), nn.ModuleList):
+        return model
+
+    for path in ("model", "model.model", "language_model.model"):
         current: Any = model
         try:
             for component in path.split("."):
                 current = getattr(current, component)
         except AttributeError:
             continue
-        if isinstance(current, nn.ModuleList):
+        if isinstance(getattr(current, "layers", None), nn.ModuleList):
             return current
-    raise ValueError("Recirculation requires a model exposing a decoder ModuleList at model.layers.")
+    raise ValueError("Recirculation requires a model exposing a decoder ModuleList at decoder.layers.")
+
+
+def _find_decoder_layers(model: nn.Module) -> nn.ModuleList:
+    """Find the standard Hugging Face decoder layer list."""
+
+    return _find_decoder(model).layers
 
 
 def _hidden_states_from_output(output: Any) -> torch.Tensor:
@@ -159,7 +179,8 @@ class RecirculationController:
     ):
         self.model = model
         self.config = config
-        layers = _find_decoder_layers(model)
+        self.decoder = _find_decoder(model)
+        layers = self.decoder.layers
         if not 0 <= config.destination_layer < len(layers):
             raise ValueError(f"destination_layer is outside the {len(layers)}-layer decoder.")
         if not 0 <= config.source_layer < len(layers):
@@ -245,7 +266,7 @@ class RecirculationController:
         if self._pending_first_iteration is None:
             return
         first_iteration_state = self._pending_first_iteration
-        decoder = self.model.model
+        decoder = self.decoder
         sequence_length = past_key_values.get_seq_length()
         if sequence_length < 1:
             raise RuntimeError("cannot recirculate an empty KV cache")

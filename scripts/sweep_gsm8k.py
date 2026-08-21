@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 
-"""Screen Llama recirculation source/destination pairs on GSM8K-Platinum."""
+"""Screen decoder-only LM recirculation paths on GSM8K-Platinum."""
 
 from __future__ import annotations
 

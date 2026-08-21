@@ -200,6 +200,97 @@ def test_cuda_concurrent_stacks_match_sequential_scheduler(monkeypatch):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_qwen3_torch_and_cuda_recirculation_match(monkeypatch):
+    """Qwen3's decoder contract must produce the same serial and two-stream states."""
+
+    transformers = pytest.importorskip("transformers")
+    from recirculation.cuda_backend import CUDAConcurrentRunner, CUDAPrefillRunner, measure_forward_error
+
+    monkeypatch.setattr(__import__("sys"), "_is_gil_enabled", lambda: True)
+    torch.manual_seed(20260821)
+    model = (
+        transformers.Qwen3ForCausalLM(
+            transformers.Qwen3Config(
+                vocab_size=64,
+                hidden_size=64,
+                intermediate_size=128,
+                num_hidden_layers=4,
+                num_attention_heads=4,
+                num_key_value_heads=2,
+                head_dim=16,
+                max_position_embeddings=64,
+            )
+        )
+        .half()
+        .eval()
+        .cuda()
+    )
+    config = RecirculationConfig(source_layer=2, destination_layer=0, alpha=0.05)
+    tokens = torch.tensor([[1, 7, 11, 13]], device="cuda")
+    expected_tokens = RecirculationController(model, config).generate(tokens, max_new_tokens=2)
+    sequential = CUDAPrefillRunner(model, config, fused=False).prefill(tokens, collect_logits=True)
+    concurrent = CUDAConcurrentRunner(model, config, use_python_threads=False)
+    try:
+        candidate = concurrent.prefill(tokens, collect_logits=True)
+        candidate_tokens = concurrent.generate(tokens, max_new_tokens=2)
+    finally:
+        concurrent.close()
+
+    measure_forward_error(sequential[3], candidate[3]).require()
+    measure_forward_error(sequential[2].destination, candidate[2].destination).require()
+    measure_forward_error(sequential[2].source, candidate[2].source).require()
+    torch.testing.assert_close(candidate_tokens, expected_tokens, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_qwen3_no_bos_batched_scoring_matches_scalar_scoring():
+    """Corpus scoring must start from text token zero when Qwen3 defines no BOS."""
+
+    transformers = pytest.importorskip("transformers")
+    from recirculation.cuda_backend import CUDAPrefillRunner
+
+    torch.manual_seed(7)
+    model = (
+        transformers.Qwen3ForCausalLM(
+            transformers.Qwen3Config(
+                vocab_size=64,
+                hidden_size=64,
+                intermediate_size=128,
+                num_hidden_layers=4,
+                num_attention_heads=4,
+                num_key_value_heads=2,
+                head_dim=16,
+                bos_token_id=None,
+            )
+        )
+        .half()
+        .eval()
+        .cuda()
+    )
+    config = RecirculationConfig(source_layer=2, destination_layer=0, alpha=0.05)
+    scalar = CUDAPrefillRunner(model, config)
+    row0 = scalar.prefill(torch.tensor([[1, 2]], device="cuda"), collect_logits=True)[3]
+    row1 = scalar.prefill(torch.tensor([[4]], device="cuda"), collect_logits=True)[3]
+    expected = torch.stack(
+        (
+            torch.logsumexp(row0[0, 0].float(), dim=-1) - row0[0, 0, 2].float(),
+            torch.logsumexp(row0[0, 1].float(), dim=-1) - row0[0, 1, 3].float(),
+            torch.logsumexp(row1[0, 0].float(), dim=-1) - row1[0, 0, 5].float(),
+        )
+    )
+    batched = CUDAPrefillRunner(model, config, allow_terminal_padding=True)
+    row_nll, row_counts = batched.score(
+        torch.tensor([[1, 2], [4, 0]], device="cuda"),
+        {0: ([0, 1], [2, 5]), 1: ([0], [3])},
+        attention_mask=torch.tensor([[1, 1], [1, 0]], device="cuda"),
+        return_per_row=True,
+    )
+
+    torch.testing.assert_close(torch.tensor(row_nll), torch.tensor([expected[:2].sum(), expected[2]]), rtol=2e-3, atol=2e-3)
+    assert row_counts == [2, 1]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
 def test_cuda_generation_matches_updated_torch_controller(monkeypatch):
     transformers = pytest.importorskip("transformers")
     from recirculation.cuda_backend import CUDAConcurrentRunner

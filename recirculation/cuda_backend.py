@@ -379,6 +379,29 @@ class CUDAPrefillRunner:
         )
 
     @torch.inference_mode()
+    def score(
+        self,
+        tokens: torch.Tensor,
+        targets_by_position: dict[int, tuple[list[int], list[int]]],
+        *,
+        attention_mask: torch.Tensor,
+        return_per_row: bool = False,
+    ) -> tuple[float, int] | tuple[list[float], list[int]]:
+        """Score sparse targets from an empty cache in one terminally padded batch.
+
+        This no-prefix entry point is required for tokenizer contracts such as
+        Qwen3's, where adding a synthetic BOS token would change the language-
+        modeling objective.
+        """
+
+        return self._score(
+            tokens,
+            targets_by_position,
+            attention_mask=attention_mask,
+            return_per_row=return_per_row,
+        )
+
+    @torch.inference_mode()
     def score_from_snapshot(
         self,
         tokens: torch.Tensor,
@@ -388,14 +411,37 @@ class CUDAPrefillRunner:
         attention_mask: torch.Tensor,
         return_per_row: bool = False,
     ) -> tuple[float, int] | tuple[list[float], list[int]]:
-        """Score sparse teacher-forced targets in one terminally padded batch."""
+        """Score sparse teacher-forced targets after a shared prefix snapshot."""
+
+        return self._score(
+            tokens,
+            targets_by_position,
+            attention_mask=attention_mask,
+            return_per_row=return_per_row,
+            snapshot=snapshot,
+        )
+
+    def _score(
+        self,
+        tokens: torch.Tensor,
+        targets_by_position: dict[int, tuple[list[int], list[int]]],
+        *,
+        attention_mask: torch.Tensor,
+        return_per_row: bool,
+        snapshot: CUDAPrefillSnapshot | None = None,
+    ) -> tuple[float, int] | tuple[list[float], list[int]]:
+        """Shared implementation for prefixed and true no-BOS scoring."""
 
         device = next(self.model.parameters()).device
         tokens = tokens.to(device=device, dtype=torch.long)
         if tokens.ndim != 2 or tokens.shape[0] == 0 or tokens.shape[1] == 0:
             raise ValueError("batched scoring requires tokens with shape [batch, sequence]")
-        cache, pending = self.restore(snapshot, batch_size=tokens.shape[0])
-        prefix_length = cache.get_seq_length()
+        if snapshot is None:
+            cache = pending = None
+            prefix_length = 0
+        else:
+            cache, pending = self.restore(snapshot, batch_size=tokens.shape[0])
+            prefix_length = cache.get_seq_length()
         attention_mask = attention_mask.to(device=device)
         if attention_mask.shape != (tokens.shape[0], prefix_length + tokens.shape[1]):
             raise ValueError("scoring attention mask must cover the cached prefix and continuation")
@@ -410,7 +456,8 @@ class CUDAPrefillRunner:
         try:
             for position in range(tokens.shape[1]):
                 prefix_mask = attention_mask[:, : prefix_length + position + 1]
-                self.controller._run_pending_top_stack_iteration(cache, prefix_mask)
+                if cache is not None:
+                    self.controller._run_pending_top_stack_iteration(cache, prefix_mask)
                 output = self.decoder(
                     input_ids=tokens[:, position : position + 1],
                     attention_mask=prefix_mask,

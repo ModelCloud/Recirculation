@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 
-"""Run robust path, alpha, paired-E2E, and holdout screening sequentially."""
+"""Run numeric proxy, full-solution, natural-generation, and holdout screening."""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ from logbar import LogBar
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
-from recirculation.screening import DEFAULT_PATH_ALPHA, proxy_shortlist
+from recirculation.screening import proxy_shortlist
 
 LOG = LogBar.shared()
 
@@ -41,7 +41,7 @@ def _run(command: list[str], *, output: Path, resume: bool, dry_run: bool) -> No
         subprocess.run(command, cwd=REPO_ROOT, check=True)
 
 
-def _screen_base(args, output: Path) -> list[str]:
+def _screen_base(args, output: Path, *, target_mode: str) -> list[str]:
     command = [
         sys.executable,
         "scripts/screen_cuda_recirculation.py",
@@ -60,7 +60,7 @@ def _screen_base(args, output: Path) -> list[str]:
         "--candidate-workers",
         str(args.candidate_workers),
         "--target-mode",
-        "full_solution",
+        target_mode,
         "--tail-quantile",
         str(args.tail_quantile),
         "--tail-weight",
@@ -82,8 +82,18 @@ def main() -> int:
     parser.add_argument("--dtype", choices=("float16", "bfloat16"), default="float16")
     parser.add_argument("--row-start", type=int, default=272)
     parser.add_argument("--rows", type=int, default=32)
-    parser.add_argument("--forbid-range", action="append", default=["0:272", "304:336"])
-    parser.add_argument("--path-alpha", type=float, default=DEFAULT_PATH_ALPHA)
+    parser.add_argument(
+        "--forbid-range",
+        action="append",
+        default=None,
+        help="Evaluation ranges excluded from tuning; explicit values replace the legacy defaults.",
+    )
+    parser.add_argument(
+        "--path-alpha",
+        type=float,
+        default=None,
+        help="Deprecated single-alpha override for stage 1; by default stage 1 evaluates --alpha-grid.",
+    )
     parser.add_argument("--top-paths", type=int, default=8)
     parser.add_argument(
         "--alpha-grid",
@@ -110,6 +120,8 @@ def main() -> int:
     parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
+    if args.forbid_range is None:
+        args.forbid_range = ["0:272", "304:336"]
     if (
         min(
             args.rows,
@@ -130,8 +142,10 @@ def main() -> int:
         "roundup_power2_divisions:4,graph_capture_record_stream_reuse:True",
     )
     stage1 = args.output_dir / "stage1_paths.json"
-    stage1_command = _screen_base(args, stage1)
-    stage1_command.extend(("--alpha", str(args.path_alpha)))
+    stage1_command = _screen_base(args, stage1, target_mode="final_answer")
+    stage1_alphas = [args.path_alpha] if args.path_alpha is not None else args.alpha_grid
+    for alpha in stage1_alphas:
+        stage1_command.extend(("--alpha", str(alpha)))
     _run(stage1_command, output=stage1, resume=args.resume, dry_run=args.dry_run)
     if args.dry_run:
         return 0
@@ -146,7 +160,7 @@ def main() -> int:
             break
 
     stage2 = args.output_dir / "stage2_alphas.json"
-    stage2_command = _screen_base(args, stage2)
+    stage2_command = _screen_base(args, stage2, target_mode="full_solution")
     for source, destination in top_paths:
         stage2_command.extend(("--path", f"{source}:{destination}"))
     for alpha in args.alpha_grid:

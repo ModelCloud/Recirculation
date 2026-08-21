@@ -17,6 +17,8 @@ independently verified.
 
 ## Progress
 
+- 2026-08-21 — Torch/CUDA inference and path/alpha screening now support Qwen3, including its intentional no-BOS
+  tokenizer contract.
 - 2026-08-20 — MLX ran the matched short Apple M4 evaluation 2.86x faster than Torch/MPS.
 - 2026-08-20 — Evaluation now auto-selects CUDA or MLX and can compare same-destination candidates together.
 - 2026-08-20 — Torch is now the single reference for MLX and CUDA accuracy checks.
@@ -89,6 +91,11 @@ For a paper-style language-modeling shortlist, corpus mode streams fixed windows
 below uses 256 qualifying documents per corpus and scores one 1024-token window from each. It does not add an answer
 cue; GSM8K natural generation remains the downstream promotion gate.
 
+The Torch and CUDA paths support Hugging Face Llama and Qwen3 causal-LM checkpoints. Tokenicer preserves each model's
+special-token contract: Llama corpus windows begin after the checkpoint BOS, while Qwen3—which intentionally has no
+BOS—starts from an empty KV cache and scores the second text token from the first. Recirculation does not substitute
+EOS or PAD as a synthetic Qwen3 BOS. Chat evaluation uses the checkpoint's own chat template.
+
 ```bash
 python scripts/screen_cuda_recirculation.py \
   --model /local-models/Llama-3.2-1B-Instruct \
@@ -101,6 +108,23 @@ python scripts/screen_cuda_recirculation.py \
   --alpha 0.10 \
   --output results/cuda_c4_pg19_paths.json
 ```
+
+For the locally downloaded Qwen3-8B checkpoint, the same search is selected with:
+
+```bash
+python scripts/screen_cuda_recirculation.py \
+  --model /local-models/Qwen3-8B \
+  --corpus c4 \
+  --corpus pg19 \
+  --windows-per-corpus 256 \
+  --window-tokens 1024 \
+  --corpus-artifact results/qwen3_c4_pg19_256x1024_windows.json \
+  --alpha 0.05 \
+  --output results/qwen3_cuda_paths.json
+```
+
+Qwen3-8B has 36 decoder layers, so an unrestricted scan contains 630 ordered `source > destination` paths per alpha.
+Use repeated `--path SOURCE:DESTINATION` arguments to smoke-test or refine a shortlist before launching the full grid.
 
 ## Install and test
 
