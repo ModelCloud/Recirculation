@@ -72,9 +72,9 @@ Humanities flip accounting are in the
 
 | Full benchmark | Dense score | Dense accuracy | Recirculation score | Recirculation accuracy | Delta | Relative accuracy change |
 |---|---:|---:|---:|---:|---:|---:|
-| GSM8K Platinum | 588/1,209 | 48.6352% | **597/1,209** | **49.3797%** | **+9 / +0.7444 pp** | **+1.5306%** |
-| MMLU-STEM | 1,263/3,153 | 40.0571% | **1,268/3,153** | **40.2157%** | **+5 / +0.1586 pp** | **+0.3959%** |
-| MMLU-Humanities | 2,027/4,705 | 43.0818% | **2,034/4,705** | **43.2306%** | **+7 / +0.1488 pp** | **+0.3453%** |
+| GSM8K Platinum | 588/1,209 | 48.64% | **597/1,209** | **49.38%** | **+9 / +0.74 pp** | **+1.53%** |
+| MMLU-STEM | 1,263/3,153 | 40.06% | **1,268/3,153** | **40.22%** | **+5 / +0.16 pp** | **+0.40%** |
+| MMLU-Humanities | 2,027/4,705 | 43.08% | **2,034/4,705** | **43.23%** | **+7 / +0.15 pp** | **+0.35%** |
 
 Relative change is `(recirculation accuracy - dense accuracy) / dense accuracy`. The three suites have different
 scoring contracts, so their correct counts and accuracies must not be combined. On the 4,705 aligned Humanities rows,
