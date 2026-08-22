@@ -38,3 +38,71 @@ VRAM from approximately 73 GB in the interrupted fixed-width run to approximatel
 25.7 GB. The completed JSON is
 `results/evaluations/llama32_1b_mmlu_humanities_recirc_10_1_alpha004_fp16_length_bucketed.json`.
 
+## Exact commands
+
+These are the literal commands used for the completed suite checkpoints. They use
+the same unified `scripts/evaluate.py run` entry point. All commands were executed
+from the repository root on CPython 3.14t with free threading enabled.
+
+### GSM8K Platinum
+
+```bash
+PYTHONUNBUFFERED=1 \
+HF_HUB_OFFLINE=1 \
+TRANSFORMERS_OFFLINE=1 \
+python3 -X gil=0 scripts/evaluate.py run \
+  --model /local-models/Llama-3.2-1B-Instruct \
+  --device cuda \
+  --benchmark gsm8k_platinum \
+  --benchmark mmlu_stem \
+  --benchmark mmlu_humanities \
+  --benchmark-arg gsm8k_platinum.variant=cot_llama \
+  --benchmark-arg gsm8k_platinum.apply_chat_template=true \
+  --path 10:1 \
+  --alpha 0.04 \
+  --report-every-seconds 60 \
+  --output results/evaluations/llama32_1b_full_gsm8k_platinum_mmlu_stem_humanities_recirc_10_1_alpha004_fp16.json
+```
+
+The combined process was stopped after GSM8K completed, so the durable GSM8K
+checkpoint is Markdown rather than a final combined JSON.
+
+### MMLU-STEM
+
+```bash
+PYTHONUNBUFFERED=1 \
+HF_HUB_OFFLINE=1 \
+TRANSFORMERS_OFFLINE=1 \
+python3 -X gil=0 scripts/evaluate.py run \
+  --model /local-models/Llama-3.2-1B-Instruct \
+  --device cuda \
+  --benchmark mmlu_stem \
+  --benchmark mmlu_humanities \
+  --path 10:1 \
+  --alpha 0.04 \
+  --report-every-seconds 30 \
+  --output results/evaluations/llama32_1b_mmlu_stem_humanities_recirc_10_1_alpha004_fp16.json
+```
+
+The process was stopped during the original oversized Humanities cohort after
+STEM completed. Its durable status file preserves the completed STEM aggregate.
+
+### MMLU-Humanities
+
+```bash
+PYTHONUNBUFFERED=1 \
+HF_HUB_OFFLINE=1 \
+TRANSFORMERS_OFFLINE=1 \
+python3 -X gil=0 scripts/evaluate.py run \
+  --model /local-models/Llama-3.2-1B-Instruct \
+  --device cuda \
+  --benchmark mmlu_humanities \
+  --path 10:1 \
+  --alpha 0.04 \
+  --report-every-seconds 30 \
+  --output results/evaluations/llama32_1b_mmlu_humanities_recirc_10_1_alpha004_fp16_length_bucketed.json
+```
+
+The completed JSON records the resolved automatic configuration: engine batch 32,
+512 unique MMLU prompts, 2,048 A/B/C/D requests, a 524,288 padded-token scoring
+budget, paged FlashAttention 2, continuous batching, FP16, and CUDA graphs disabled.
