@@ -10,6 +10,7 @@ from evalution.scorers.gsm8k import INVALID_ANSWER
 import scripts.evaluate as evaluation
 from scripts.evaluate import (
     REPO_ROOT,
+    _auto_mmlu_unique_batch_size,
     _build_evalution_suite,
     _candidate_batches,
     _candidate_specs,
@@ -23,6 +24,7 @@ from scripts.evaluate import (
     _parse_candidate,
     _parse_suite_assignment,
     _score_recirculation_chunks,
+    _suite_kwargs,
     _summary,
     _task_contract,
 )
@@ -269,6 +271,31 @@ def test_generic_suite_loader_supports_named_mmlu_groups():
     assert humanities.stream is False
 
 
+def test_recirculated_mmlu_admits_four_choices_per_unique_batch():
+    args = SimpleNamespace(
+        suite_arg=None,
+        benchmark_arg=None,
+        max_rows=None,
+        batch_size=32,
+        path=(10, 1),
+    )
+
+    assert _suite_kwargs(args, "mmlu_stem")["batch_size"] == 128
+    args.path = None
+    assert _suite_kwargs(args, "mmlu_stem")["batch_size"] == 32
+    args.path = (10, 1)
+    assert _suite_kwargs(args, "gsm8k_platinum")["batch_size"] == 32
+
+
+@pytest.mark.parametrize(
+    ("free_gib", "expected"),
+    ((4, 32), (8, 64), (16, 128), (32, 256), (64, 512), (96, 512)),
+)
+def test_mmlu_auto_batch_tracks_post_load_free_vram(free_gib, expected):
+    assert _auto_mmlu_unique_batch_size(free_gib << 30, minimum=32) == expected
+    assert _auto_mmlu_unique_batch_size(free_gib << 30, minimum=1024) == 1024
+
+
 def test_evalution_chunks_are_shifted_into_cuda_recirculation_targets():
     calls = []
 
@@ -313,6 +340,50 @@ def test_evalution_chunks_are_shifted_into_cuda_recirculation_targets():
         (-1.25, 2, {"row": 0}),
         (-2.5, 1, {"row": 1}),
     ]
+
+
+def test_evalution_single_token_choices_share_prefixes_and_batch_unique_rows():
+    calls = []
+
+    class ModelConfig:
+        pad_token_id = 0
+        eos_token_id = 2
+
+    class Runner:
+        device = "cpu"
+        model = SimpleNamespace(config=ModelConfig())
+
+        @staticmethod
+        def score_target_losses(tokens, targets, *, attention_mask):
+            calls.append((tokens.tolist(), targets, attention_mask.tolist()))
+            return [0.1, 0.2, 0.3, 0.4, 1.1, 1.2, 1.3, 1.4]
+
+    chunks = []
+    for row, prefix in enumerate(([1, 10, 11], [1, 20])):
+        for choice, target in enumerate((101, 102, 103, 104)):
+            chunks.append(
+                SimpleNamespace(
+                    input_ids=[*prefix, target],
+                    score_start=len(prefix),
+                    score_count=1,
+                    metadata={"row": row, "choice": choice},
+                )
+            )
+
+    outputs = _score_recirculation_chunks(Runner(), chunks, batch_size=2)
+
+    assert calls == [
+        (
+            [[1, 10, 11], [1, 20, 0]],
+            {1: ([1, 1, 1, 1], [101, 102, 103, 104]), 2: ([0, 0, 0, 0], [101, 102, 103, 104])},
+            [[1, 1, 1], [1, 1, 0]],
+        )
+    ]
+    assert [output.logprob for output in outputs] == pytest.approx(
+        [-1.1, -1.2, -1.3, -1.4, -0.1, -0.2, -0.3, -0.4]
+    )
+    assert [output.token_count for output in outputs] == [1] * 8
+    assert [output.metadata for output in outputs] == [chunk.metadata for chunk in chunks]
 
 
 def test_evalution_generation_progress_exposes_exact_partial_scores(monkeypatch):

@@ -482,8 +482,35 @@ def _suite_kwargs(args: argparse.Namespace, benchmark: str) -> dict[str, Any]:
             kwargs[key] = value
     if args.max_rows is not None:
         kwargs.setdefault("max_rows", args.max_rows)
-    kwargs.setdefault("batch_size", args.batch_size)
+    request_batch_size = args.batch_size
+    if (
+        args.path is not None
+        and request_batch_size is not None
+        and (benchmark == "mmlu" or benchmark in MMLU_GROUP_ALIASES)
+    ):
+        # Evalution represents each MMLU row as four one-token choice requests.
+        # Admit four times as many requests so the recirculation scorer receives
+        # `batch_size` unique prompts after exact shared-prefix consolidation.
+        request_batch_size *= 4
+    kwargs.setdefault("batch_size", request_batch_size)
     return kwargs
+
+
+def _auto_mmlu_unique_batch_size(free_device_bytes: int, *, minimum: int) -> int:
+    """Choose a conservative unique-prompt width from post-load free CUDA memory."""
+
+    gib = 1 << 30
+    if free_device_bytes >= 64 * gib:
+        automatic = 512
+    elif free_device_bytes >= 32 * gib:
+        automatic = 256
+    elif free_device_bytes >= 16 * gib:
+        automatic = 128
+    elif free_device_bytes >= 8 * gib:
+        automatic = 64
+    else:
+        automatic = 32
+    return max(minimum, automatic)
 
 
 def _build_evalution_suite(benchmark: str, kwargs: dict[str, Any]):
@@ -523,6 +550,11 @@ def _score_recirculation_chunks(runner, chunks, *, batch_size: int):
 
     if batch_size < 1:
         raise ValueError("recirculation scoring batch size must be positive")
+    if chunks and all(
+        chunk.score_count == 1 and chunk.score_start == len(chunk.input_ids) - 1
+        for chunk in chunks
+    ):
+        return _score_shared_prefix_choices(runner, chunks, batch_size=batch_size)
     device = getattr(runner, "device", None)
     if device is None:
         device = next(runner.model.parameters()).device
@@ -577,8 +609,82 @@ def _score_recirculation_chunks(runner, chunks, *, batch_size: int):
     return outputs
 
 
+def _score_shared_prefix_choices(runner, chunks, *, batch_size: int):
+    """Score one-token choices once per unique context instead of once per choice."""
+
+    device = getattr(runner, "device", None)
+    if device is None:
+        device = next(runner.model.parameters()).device
+    grouped: dict[tuple[int, ...], list[tuple[int, Any]]] = {}
+    for output_index, chunk in enumerate(chunks):
+        prefix = tuple(chunk.input_ids[:-1])
+        grouped.setdefault(prefix, []).append((output_index, chunk))
+    unique_contexts = list(grouped.items())
+    outputs: list[LoglikelihoodOutput | None] = [None] * len(chunks)
+    pad_token_id = getattr(runner.model.config, "pad_token_id", None)
+    if pad_token_id is None:
+        pad_token_id = getattr(runner.model.config, "eos_token_id", 0)
+    if isinstance(pad_token_id, (list, tuple)):
+        pad_token_id = pad_token_id[0]
+
+    for start in range(0, len(unique_contexts), batch_size):
+        context_batch = unique_contexts[start : start + batch_size]
+        padded_length = max(len(prefix) for prefix, _items in context_batch)
+        tokens = torch.full(
+            (len(context_batch), padded_length),
+            int(pad_token_id or 0),
+            dtype=torch.long,
+            device=device,
+        )
+        attention_mask = torch.zeros_like(tokens)
+        targets_by_position: dict[int, tuple[list[int], list[int]]] = {}
+        output_indices_by_position: dict[int, list[int]] = {}
+        for row_index, (prefix, items) in enumerate(context_batch):
+            tokens[row_index, : len(prefix)] = torch.tensor(
+                prefix,
+                dtype=torch.long,
+                device=device,
+            )
+            attention_mask[row_index, : len(prefix)] = 1
+            position = len(prefix) - 1
+            rows, targets = targets_by_position.setdefault(position, ([], []))
+            output_indices = output_indices_by_position.setdefault(position, [])
+            for output_index, chunk in items:
+                rows.append(row_index)
+                targets.append(int(chunk.input_ids[-1]))
+                output_indices.append(output_index)
+
+        losses = runner.score_target_losses(
+            tokens,
+            targets_by_position,
+            attention_mask=attention_mask,
+        )
+        loss_index = 0
+        for position in sorted(output_indices_by_position):
+            for output_index in output_indices_by_position[position]:
+                chunk = chunks[output_index]
+                outputs[output_index] = LoglikelihoodOutput(
+                    logprob=-float(losses[loss_index]),
+                    is_greedy=False,
+                    token_count=1,
+                    metadata=dict(chunk.metadata),
+                )
+                loss_index += 1
+        if loss_index != len(losses):
+            raise RuntimeError("shared-prefix scorer returned an unexpected target count")
+
+    if any(output is None for output in outputs):
+        raise RuntimeError("shared-prefix scorer did not produce every requested choice")
+    return outputs
+
+
 @contextmanager
-def _patch_evalution_recirculation_scoring(session, config: RecirculationConfig):
+def _patch_evalution_recirculation_scoring(
+    session,
+    config: RecirculationConfig,
+    *,
+    unique_batch_size: int,
+):
     """Route Evalution log-likelihood batches through the CUDA replay runner."""
 
     from recirculation.cuda_backend import CUDAPrefillRunner
@@ -594,7 +700,8 @@ def _patch_evalution_recirculation_scoring(session, config: RecirculationConfig)
     original_score_chunks = session_type._score_chunks
 
     def score_chunks(_session, chunks, *, batch_size):
-        return _score_recirculation_chunks(runner, chunks, batch_size=batch_size)
+        del batch_size
+        return _score_recirculation_chunks(runner, chunks, batch_size=unique_batch_size)
 
     session_type._score_chunks = score_chunks
     try:
@@ -933,6 +1040,7 @@ def _dense_evalution_main(argv: list[str]) -> int:
         )
 
     started = time.perf_counter()
+    mmlu_scoring_batch_size = args.batch_size
     suite_status = [
         {
             "benchmark": benchmark,
@@ -1049,6 +1157,24 @@ def _dense_evalution_main(argv: list[str]) -> int:
 
                 evaluation._session = engine.build(evaluation._model_config)
                 evaluation._execution = _describe_execution(evaluation._session)
+                if args.cuda_auto_optimized and any(
+                    benchmark == "mmlu" or benchmark in MMLU_GROUP_ALIASES
+                    for benchmark in args.benchmark
+                ):
+                    free_device_bytes, _total_device_bytes = torch.cuda.mem_get_info(
+                        torch.device(args.device)
+                    )
+                    mmlu_scoring_batch_size = _auto_mmlu_unique_batch_size(
+                        free_device_bytes,
+                        minimum=args.batch_size,
+                    )
+                    logger.info(
+                        "MMLU recirculation auto batch: unique_prompts=%d choice_requests=%d "
+                        "free_vram_gib=%.2f",
+                        mmlu_scoring_batch_size,
+                        4 * mmlu_scoring_batch_size,
+                        free_device_bytes / (1 << 30),
+                    )
                 for index, (benchmark, suite) in enumerate(
                     zip(args.benchmark, suites, strict=True)
                 ):
@@ -1072,9 +1198,12 @@ def _dense_evalution_main(argv: list[str]) -> int:
 
                         patch = paged_generation_patch()
                     else:
+                        if benchmark == "mmlu" or benchmark in MMLU_GROUP_ALIASES:
+                            suite.batch_size = 4 * mmlu_scoring_batch_size
                         patch = _patch_evalution_recirculation_scoring(
                             evaluation._session,
                             recirculation_config,
+                            unique_batch_size=mmlu_scoring_batch_size,
                         )
                     run_suite(index, suite, patch)
             result = evaluation.result().to_dict()
@@ -1098,6 +1227,7 @@ def _dense_evalution_main(argv: list[str]) -> int:
         "continuous_batching": args.continuous_batching,
         "paged_attention_requested": args.paged_attention,
         "cuda_graph": args.cuda_graph,
+        "mmlu_unique_scoring_batch_size": mmlu_scoring_batch_size,
         "recirculation_prefix_seed": getattr(
             getattr(evaluation, "_session", None), "_recirculation_prefix_seed", None
         ),

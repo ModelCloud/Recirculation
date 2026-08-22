@@ -447,6 +447,29 @@ class CUDAPrefillRunner:
         )
 
     @torch.inference_mode()
+    def score_target_losses(
+        self,
+        tokens: torch.Tensor,
+        targets_by_position: dict[int, tuple[list[int], list[int]]],
+        *,
+        attention_mask: torch.Tensor,
+    ) -> list[float]:
+        """Return one NLL per sparse target without replaying duplicate input rows.
+
+        Targets are returned in ascending position order and retain their list order
+        within each position.  This lets multiple-choice evaluators score several
+        one-token answers from one shared prompt state.
+        """
+
+        return self._score(
+            tokens,
+            targets_by_position,
+            attention_mask=attention_mask,
+            return_per_row=False,
+            return_target_losses=True,
+        )
+
+    @torch.inference_mode()
     def score_from_snapshot(
         self,
         tokens: torch.Tensor,
@@ -474,8 +497,12 @@ class CUDAPrefillRunner:
         attention_mask: torch.Tensor,
         return_per_row: bool,
         snapshot: CUDAPrefillSnapshot | None = None,
-    ) -> tuple[float, int] | tuple[list[float], list[int]]:
+        return_target_losses: bool = False,
+    ) -> tuple[float, int] | tuple[list[float], list[int]] | list[float]:
         """Shared implementation for prefixed and true no-BOS scoring."""
+
+        if return_per_row and return_target_losses:
+            raise ValueError("per-row and per-target scoring outputs are mutually exclusive")
 
         device = next(self.model.parameters()).device
         tokens = tokens.to(device=device, dtype=torch.long)
@@ -513,6 +540,7 @@ class CUDAPrefillRunner:
         projection_hidden = []
         projection_rows = []
         projection_targets = []
+        target_loss_batches = []
 
         def flush_projection():
             nonlocal target_count
@@ -523,6 +551,8 @@ class CUDAPrefillRunner:
             targets = torch.cat(projection_targets, dim=0)
             logits = project_causal_lm_logits(self.model, hidden).float()
             losses = torch.logsumexp(logits, dim=-1) - logits.gather(1, targets[:, None])[:, 0]
+            if return_target_losses:
+                target_loss_batches.append(losses)
             total_nll.add_(losses.sum())
             row_nll.index_add_(0, rows, losses)
             target_count += targets.numel()
@@ -563,6 +593,10 @@ class CUDAPrefillRunner:
                     if len(projection_hidden) == self.projection_chunk_tokens:
                         flush_projection()
             flush_projection()
+            if return_target_losses:
+                if not target_loss_batches:
+                    return []
+                return torch.cat(target_loss_batches).tolist()
             if return_per_row:
                 return row_nll.tolist(), row_counts
             return float(total_nll), target_count

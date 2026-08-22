@@ -293,6 +293,54 @@ def test_qwen3_no_bos_batched_scoring_matches_scalar_scoring():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_sparse_target_losses_reuse_one_hidden_state_for_multiple_choices():
+    transformers = pytest.importorskip("transformers")
+    from recirculation.cuda_backend import CUDAPrefillRunner
+
+    torch.manual_seed(13)
+    model = (
+        transformers.LlamaForCausalLM(
+            transformers.LlamaConfig(
+                vocab_size=64,
+                hidden_size=64,
+                intermediate_size=128,
+                num_hidden_layers=4,
+                num_attention_heads=4,
+                num_key_value_heads=2,
+                head_dim=16,
+            )
+        )
+        .half()
+        .eval()
+        .cuda()
+    )
+    model.set_attn_implementation("eager")
+    runner = CUDAPrefillRunner(
+        model,
+        RecirculationConfig(source_layer=2, destination_layer=0, alpha=0.05),
+        allow_terminal_padding=True,
+    )
+    tokens = torch.tensor([[1, 2, 3], [4, 5, 0]], device="cuda")
+    mask = torch.tensor([[1, 1, 1], [1, 1, 0]], device="cuda")
+    targets = {1: ([1, 1], [11, 12]), 2: ([0, 0], [21, 22])}
+
+    shared = runner.score_target_losses(tokens, targets, attention_mask=mask)
+    expected = []
+    for row, position, choices in ((1, 1, (11, 12)), (0, 2, (21, 22))):
+        for choice in choices:
+            nll, count = runner.score(
+                tokens[row : row + 1, : position + 1],
+                {position: ([0], [choice])},
+                attention_mask=torch.ones((1, position + 1), dtype=torch.long, device="cuda"),
+                return_per_row=False,
+            )
+            assert count == 1
+            expected.append(nll)
+
+    torch.testing.assert_close(torch.tensor(shared), torch.tensor(expected), rtol=2e-3, atol=2e-3)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
 def test_qwen3_concurrent_chunked_score_matches_sequential_gate(monkeypatch):
     transformers = pytest.importorskip("transformers")
     from recirculation.cuda_backend import CUDAConcurrentRunner, CUDAPrefillRunner, measure_forward_error
