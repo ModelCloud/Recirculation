@@ -19,6 +19,7 @@ from recirculation.screening import (
 from scripts.run_cuda_screening_race import _derive_stage_artifacts, _promote
 from scripts.screen_cuda_recirculation import (
     MODEL_DTYPES,
+    _build_scoring_batch,
     _candidate_batches,
     _candidate_schedule,
     _candidate_work,
@@ -90,6 +91,19 @@ def test_cuda_candidate_batch_width_respects_row_token_memory_budget():
     assert _effective_candidate_batch_size(8, 128, 1024, 65536) == 1
     assert _effective_row_batch_size(128, 1, 512, 65536) == 128
     assert _effective_row_batch_size(128, 1, 1024, 65536) == 64
+
+
+def test_cuda_scoring_batch_applies_prefix_and_shifts_every_target():
+    tokens, attention_mask, targets = _build_scoring_batch(
+        [([11], [12, 13]), ([21], [22, 23])],
+        [1],
+        pad_token_id=0,
+        device="cpu",
+    )
+
+    assert tokens.tolist() == [[1, 11, 12], [1, 21, 22]]
+    assert attention_mask.tolist() == [[1, 1, 1], [1, 1, 1]]
+    assert targets == {1: ([0, 1], [12, 22]), 2: ([0, 1], [13, 23])}
 
 
 def test_cuda_path_telemetry_counts_existing_batches_without_cuda_queries(tmp_path):

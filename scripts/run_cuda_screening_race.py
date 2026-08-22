@@ -198,6 +198,12 @@ def main() -> int:
     parser.add_argument("--row-batch-size", type=int, default=128)
     parser.add_argument("--projection-chunk-tokens", type=int, default=16)
     parser.add_argument("--candidate-batch-size", type=int, default=8)
+    parser.add_argument(
+        "--candidate-token-budget",
+        type=int,
+        default=65536,
+        help="Forward the candidate-width × row-batch × sequence-length memory budget.",
+    )
     parser.add_argument("--scan-seed", type=int, default=20260821)
     args = parser.parse_args()
     if not (0 < args.stage_rows_per_corpus[0] < args.stage_rows_per_corpus[1] < args.stage_rows_per_corpus[2]):
@@ -206,6 +212,8 @@ def main() -> int:
         parser.error("stage window lengths must be strictly increasing")
     if not (args.stage_keep[0] > args.stage_keep[1] > 0):
         parser.error("stage keep counts must be strictly decreasing and positive")
+    if args.candidate_token_budget < 1:
+        parser.error("candidate-token-budget must be positive")
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     corpus = json.loads(args.corpus_artifact.read_text(encoding="utf-8"))
@@ -273,6 +281,8 @@ def main() -> int:
             "1",
             "--candidate-batch-size",
             str(args.candidate_batch_size),
+            "--candidate-token-budget",
+            str(args.candidate_token_budget),
             "--projection-chunk-tokens",
             str(args.projection_chunk_tokens),
             "--mask-free-unpadded",
@@ -361,6 +371,7 @@ def main() -> int:
             "--path", f"{winner['source_layer']}:{winner['destination_layer']}",
             "--scan-order", "sequential", "--row-batch-size", str(args.row_batch_size),
             "--candidate-workers", "1", "--candidate-batch-size", str(args.candidate_batch_size),
+            "--candidate-token-budget", str(args.candidate_token_budget),
             "--projection-chunk-tokens", str(args.projection_chunk_tokens), "--mask-free-unpadded",
             "--attention-backend", "eager", "--dual-gemm", "--report-every", "1",
             "--telemetry-interval", "60", "--output", str(alpha_output),

@@ -137,7 +137,7 @@ def _candidate_schedule(candidates):
     ]
 
 
-def _candidate_work(contexts, row_batch_size):
+def _candidate_work(contexts, row_batch_size, prefix_tokens=0):
     """Describe host-visible work without touching or synchronizing CUDA."""
 
     batches = 0
@@ -147,7 +147,7 @@ def _candidate_work(contexts, row_batch_size):
         batch = contexts[batch_start : batch_start + row_batch_size]
         for objective in contexts[0]:
             sequence_lengths = [
-                len(context) + max(len(answer_ids) - 1, 0)
+                prefix_tokens + len(context) + max(len(answer_ids) - 1, 0)
                 for context, answer_ids in (row[objective] for row in batch)
             ]
             batches += 1
@@ -366,7 +366,7 @@ def _implementation_commit() -> str:
 
 def _baseline_contract(args, *, common_prefix_tokens: int, objectives) -> dict:
     return {
-        "scoring_schema": "dual_objective_v1",
+        "scoring_schema": "dual_objective_v2_prefix_aligned",
         "model": args.model,
         "model_type": args.model_type,
         "decoder_layers": args.decoder_layers,
@@ -669,8 +669,34 @@ def _effective_row_batch_size(requested, candidate_batch_size, sequence_length, 
     return max(1, min(requested, token_budget // (candidate_batch_size * sequence_length)))
 
 
+def _build_scoring_batch(scoring_rows, prefix_ids, pad_token_id, device):
+    """Build one prefix-aligned teacher-forcing batch and its sparse targets."""
+
+    sequences = [prefix_ids + context + answer_ids[:-1] for context, answer_ids in scoring_rows]
+    maximum_length = max(map(len, sequences))
+    tokens = torch.full(
+        (len(scoring_rows), maximum_length),
+        pad_token_id,
+        dtype=torch.long,
+        device=device,
+    )
+    attention_mask = torch.zeros_like(tokens)
+    targets_by_position = {}
+    prefix_length = len(prefix_ids)
+    for row, ((context, answer_ids), sequence) in enumerate(zip(scoring_rows, sequences)):
+        tokens[row, : len(sequence)] = torch.tensor(sequence, dtype=torch.long, device=device)
+        attention_mask[row, : len(sequence)] = 1
+        for target_index, target in enumerate(answer_ids):
+            position = prefix_length + len(context) - 1 + target_index
+            rows, targets = targets_by_position.setdefault(position, ([], []))
+            rows.append(row)
+            targets.append(int(target))
+    return tokens, attention_mask, targets_by_position
+
+
 def _score_candidate_batch(
     model,
+    prefix,
     contexts,
     candidates,
     row_batch_size,
@@ -690,6 +716,7 @@ def _score_candidate_batch(
         if callback is not None:
             callback("candidate_started")
     runner = CUDABatchedPathRunner(model, configs)
+    prefix_ids = [] if prefix is None else prefix[0].tolist()
     candidate_nll = [
         {objective: [] for objective in contexts[0]} for _candidate in candidates
     ]
@@ -701,24 +728,13 @@ def _score_candidate_batch(
             batch = contexts[batch_start : batch_start + row_batch_size]
             for objective in contexts[0]:
                 scoring_rows = [row[objective] for row in batch]
-                sequences = [context + answer_ids[:-1] for context, answer_ids in scoring_rows]
-                maximum_length = max(map(len, sequences))
-                batch_tokens = torch.full(
-                    (len(scoring_rows), maximum_length),
+                batch_tokens, attention_mask, targets_by_position = _build_scoring_batch(
+                    scoring_rows,
+                    prefix_ids,
                     pad_token_id,
-                    dtype=torch.long,
-                    device="cuda",
+                    "cuda",
                 )
-                attention_mask = torch.zeros_like(batch_tokens)
-                targets_by_position = {}
-                for row, ((context, answer_ids), sequence) in enumerate(zip(scoring_rows, sequences)):
-                    batch_tokens[row, : len(sequence)] = torch.tensor(sequence, device="cuda")
-                    attention_mask[row, : len(sequence)] = 1
-                    for target_index, target in enumerate(answer_ids):
-                        position = len(context) - 1 + target_index
-                        rows, targets = targets_by_position.setdefault(position, ([], []))
-                        rows.append(row)
-                        targets.append(int(target))
+                maximum_length = batch_tokens.shape[1]
                 if not bool(attention_mask.all()):
                     raise ValueError(
                         "candidate batching requires equal-length unpadded rows; use width one for padded data"
@@ -755,12 +771,20 @@ def _score_candidate_batch(
     ]
 
 
-def _score_native_dense(model, contexts, row_batch_size, pad_token_id, projection_chunk_tokens):
+def _score_native_dense(
+    model,
+    prefix,
+    contexts,
+    row_batch_size,
+    pad_token_id,
+    projection_chunk_tokens,
+):
     """Score alpha=0 with ordinary parallel causal prefill and chunked LM projection."""
 
     started = time.perf_counter()
     device = next(model.parameters()).device
     decoder = model.get_decoder()
+    prefix_ids = [] if prefix is None else prefix[0].tolist()
     objective_nll = {objective: [] for objective in contexts[0]}
     objective_counts = {objective: [] for objective in contexts[0]}
     with torch.inference_mode():
@@ -768,24 +792,12 @@ def _score_native_dense(model, contexts, row_batch_size, pad_token_id, projectio
             batch = contexts[batch_start : batch_start + row_batch_size]
             for objective in contexts[0]:
                 scoring_rows = [row[objective] for row in batch]
-                sequences = [context + answer_ids[:-1] for context, answer_ids in scoring_rows]
-                maximum_length = max(map(len, sequences))
-                tokens = torch.full(
-                    (len(batch), maximum_length),
+                tokens, attention_mask, targets_by_position = _build_scoring_batch(
+                    scoring_rows,
+                    prefix_ids,
                     pad_token_id,
-                    dtype=torch.long,
-                    device=device,
+                    device,
                 )
-                attention_mask = torch.zeros_like(tokens)
-                targets_by_position = {}
-                for row, ((context, answer_ids), sequence) in enumerate(zip(scoring_rows, sequences)):
-                    tokens[row, : len(sequence)] = torch.tensor(sequence, dtype=torch.long, device=device)
-                    attention_mask[row, : len(sequence)] = 1
-                    for target_index, target in enumerate(answer_ids):
-                        position = len(context) - 1 + target_index
-                        rows, targets = targets_by_position.setdefault(position, ([], []))
-                        rows.append(row)
-                        targets.append(int(target))
                 hidden = decoder(
                     input_ids=tokens,
                     attention_mask=attention_mask,
@@ -1099,9 +1111,9 @@ def main() -> int:
         }
         corpus_data_root = args.corpus_data_root.expanduser().resolve()
         corpus_artifact = args.corpus_artifact.expanduser().resolve() if args.corpus_artifact else None
-        artifact = None
+        corpus_artifact_data = None
         if corpus_artifact is not None and corpus_artifact.exists():
-            artifact = json.loads(corpus_artifact.read_text(encoding="utf-8"))
+            corpus_artifact_data = json.loads(corpus_artifact.read_text(encoding="utf-8"))
             expected = {
                 "corpora": args.corpus,
                 "corpus_window_counts": corpus_window_counts,
@@ -1109,17 +1121,23 @@ def main() -> int:
                 "window_tokens": args.window_tokens,
                 "tokenizer": args.model,
             }
-            actual_window_counts = artifact.get("corpus_window_counts")
-            if actual_window_counts is None and isinstance(artifact.get("windows_per_corpus"), int):
+            actual_window_counts = corpus_artifact_data.get("corpus_window_counts")
+            if actual_window_counts is None and isinstance(
+                corpus_artifact_data.get("windows_per_corpus"), int
+            ):
                 actual_window_counts = {
-                    corpus: artifact["windows_per_corpus"] for corpus in artifact.get("corpora", [])
+                    corpus: corpus_artifact_data["windows_per_corpus"]
+                    for corpus in corpus_artifact_data.get("corpora", [])
                 }
-            actual = {**artifact, "corpus_window_counts": actual_window_counts}
+            actual = {**corpus_artifact_data, "corpus_window_counts": actual_window_counts}
             mismatches = {key: (actual.get(key), value) for key, value in expected.items() if actual.get(key) != value}
             if mismatches:
                 parser.error(f"corpus artifact does not match this screen: {mismatches}")
-            LOG.info(f"Loaded {len(artifact['windows'])} shared tokenized corpus windows from {corpus_artifact}")
-        if artifact is None:
+            LOG.info(
+                f"Loaded {len(corpus_artifact_data['windows'])} shared tokenized corpus windows "
+                f"from {corpus_artifact}"
+            )
+        if corpus_artifact_data is None:
             windows = []
             for corpus in args.corpus:
                 requested_windows = corpus_window_counts[corpus]
@@ -1165,7 +1183,7 @@ def main() -> int:
                 if accepted != requested_windows:
                     parser.error(f"{corpus} yielded only {accepted} qualifying windows after {examined} documents")
                 corpus_counts[corpus] = {"windows": accepted, "documents_examined": examined}
-            artifact = {
+            corpus_artifact_data = {
                 "corpora": args.corpus,
                 "windows_per_corpus": (
                     next(iter(set(corpus_window_counts.values())))
@@ -1183,12 +1201,15 @@ def main() -> int:
             if corpus_artifact is not None:
                 corpus_artifact.parent.mkdir(parents=True, exist_ok=True)
                 temporary = corpus_artifact.with_name(f".{corpus_artifact.name}.{os.getpid()}.tmp")
-                temporary.write_text(json.dumps(artifact, separators=(",", ":")) + "\n", encoding="utf-8")
+                temporary.write_text(
+                    json.dumps(corpus_artifact_data, separators=(",", ":")) + "\n",
+                    encoding="utf-8",
+                )
                 temporary.replace(corpus_artifact)
                 LOG.info(f"Wrote shared tokenized corpus windows to {corpus_artifact}")
-        corpus_counts = artifact["corpus_counts"]
+        corpus_counts = corpus_artifact_data["corpus_counts"]
         contexts = []
-        for window in artifact["windows"]:
+        for window in corpus_artifact_data["windows"]:
             target_count = corpus_target_tokens[window["corpus"]]
             context_count = len(window["token_ids"]) - target_count
             contexts.append(
@@ -1249,7 +1270,7 @@ def main() -> int:
     requested_row_batch_size = args.row_batch_size
     if args.candidate_batch_size > 1:
         maximum_sequence_length = max(
-            len(context) + len(answer_ids) - 1
+            common_length + len(context) + len(answer_ids) - 1
             for row in contexts
             for context, answer_ids in row.values()
         )
@@ -1308,7 +1329,7 @@ def main() -> int:
         previous_scan_order = previous_settings.get("scan_order", "sequential")
         previous_scan_seed = previous_settings.get("scan_seed", args.scan_seed)
         expected_settings = {
-            "scoring_schema": "dual_objective_v1",
+            "scoring_schema": "dual_objective_v2_prefix_aligned",
             "model": args.model,
             "model_type": args.model_type,
             "decoder_layers": args.decoder_layers,
@@ -1372,14 +1393,16 @@ def main() -> int:
     if not results:
         baseline_path = args.native_baseline.expanduser().resolve() if args.native_baseline is not None else None
         if baseline_path is not None and baseline_path.exists():
-            artifact, native_nll, native_counts = _load_native_baseline(baseline_path, baseline_contract)
+            baseline_artifact, native_nll, native_counts = _load_native_baseline(
+                baseline_path, baseline_contract
+            )
             native = {
                 "source_layer": None,
                 "destination_layer": None,
                 "alpha": 0.0,
-                "seconds": float(artifact["seconds"]),
+                "seconds": float(baseline_artifact["seconds"]),
                 "shared_artifact": str(baseline_path),
-                "artifact_commit": artifact.get("implementation_commit"),
+                "artifact_commit": baseline_artifact.get("implementation_commit"),
             }
             LOG.info(f"Loaded shared dual-objective native baseline from {baseline_path}")
         else:
@@ -1391,6 +1414,7 @@ def main() -> int:
             if args.corpus:
                 native = _score_native_dense(
                     model,
+                    prefix,
                     contexts,
                     args.row_batch_size,
                     pad_token_id,
@@ -1427,7 +1451,7 @@ def main() -> int:
         LOG.info("Shared native baseline is ready; baseline-only run complete")
         return 0
     settings = {
-        "scoring_schema": "dual_objective_v1",
+        "scoring_schema": "dual_objective_v2_prefix_aligned",
         "split_role": "tuning",
         "model": args.model,
         "model_type": args.model_type,
@@ -1524,7 +1548,7 @@ def main() -> int:
     telemetry = _PathTelemetry(
         args.output,
         candidate_schedule,
-        _candidate_work(contexts, args.row_batch_size),
+        _candidate_work(contexts, args.row_batch_size, common_length),
         results,
         args.telemetry_interval,
     )
@@ -1563,7 +1587,7 @@ def main() -> int:
             percent_changes = []
             for corpus in args.corpus:
                 indices = [
-                    index for index, window in enumerate(artifact["windows"])
+                    index for index, window in enumerate(corpus_artifact_data["windows"])
                     if window["corpus"] == corpus
                 ]
                 summary = summarize_paired_losses(
@@ -1634,6 +1658,7 @@ def main() -> int:
         for candidate_batch in _candidate_batches(remaining_candidates, args.candidate_batch_size):
             batch_results = _score_candidate_batch(
                 model,
+                prefix,
                 contexts,
                 candidate_batch,
                 args.row_batch_size,
