@@ -17,6 +17,11 @@ independently verified.
 
 ## Progress
 
+- 2026-08-22 — Completed full-split FP16 evaluation of Llama 3.2 1B Instruct with the paper-corpus-selected
+  `10→1`, `alpha=0.04` intervention. Recirculation improved GSM8K Platinum from 588/1,209 to 597/1,209,
+  MMLU-STEM from 1,263/3,153 to 1,268/3,153, and MMLU-Humanities from 2,027/4,705 to 2,034/4,705.
+  The matched dense baseline, exact commands, resolved CUDA settings, artifact checksums, and paired Humanities flips
+  are recorded in the [full evaluation report](results/dense_baselines/llama32_1b_gsm8k_mmlu_dense_vs_recirc_10_1_alpha004_fp16.md).
 - 2026-08-21 — Added Qwen3-8B support across Torch/CUDA inference and path/alpha screening, including its no-BOS
   tokenizer contract. Qwen3-8B recirculation runs faster on Torch/MPS and MLX (MLX preferred on Apple Silicon), with
   1.57x prefill speedup at matching outputs and 1.82x faster prompt processing from fixed-prefix reuse.
@@ -25,9 +30,8 @@ independently verified.
   **4.533x prefill speedup** while meeting accuracy. Added the paper's zero-based ten-step ramp (`ramp_tokens=10`)
   and two-stack CUDA execution for both GIL-enabled and free-threaded Python. CUDA screening now jointly evaluates
   final-answer and full-solution perplexity, then applies the correct-to-wrong penalty during paired generation.
-  Locked disjoint evaluation finished at 59/128 baseline and 67/128 recirculation. Torch is the single reference for
-  MLX and CUDA accuracy, evaluation auto-selects CUDA or MLX, and can compare same-destination candidates together.
-  MLX ran the matched short Apple M4 evaluation 2.86x faster than Torch/MPS.
+  Torch is the single reference for MLX and CUDA accuracy, evaluation auto-selects CUDA or MLX, and can compare
+  same-destination candidates together. MLX ran the matched short Apple M4 evaluation 2.86x faster than Torch/MPS.
 
 The Torch path is the absolute reference for the published mathematical and state behavior. MLX and CUDA may use
 hardware-specific execution, but their outputs are checked against Torch and need to meet accuracy standards.
@@ -59,31 +63,35 @@ branches before `t+1` enters the upper stack. The intervention changes neither m
 ## Evaluation status
 
 Results produced before the same-token replay correction measured a different delayed cross-token intervention and
-are withdrawn as recirculation evidence. The initial corrected candidate was selected by final-answer likelihood. On
-128 disjoint rows, Evalution scored the baseline at 59 correct and recirculation at 67 correct; the positive estimate
-is still statistically noise-consistent, so the candidate remains provisional. The CUDA screening funnel no longer
-injects `The final answer is ` into the prompt. It uses complete-gold-solution likelihood only as a cheap shortlist
-proxy, then lets the dense and recirculation arms generate autoregressively with no answer cue. Only naturally
-generated paired accuracy can promote a candidate, and promotion requires both a positive net correction count and a
-positive harmed-row-penalized score. See [`results/`](results/) for the complete record.
+are withdrawn as recirculation evidence. The current result uses Llama 3.2 1B Instruct in FP16 and evaluates the full
+reported test splits with the paper-corpus-selected `10→1`, `alpha=0.04`, `beta=0.96` intervention. The dense and
+recirculation arms use the same model, prompts, scoring contracts, engine batch sizes, paged FlashAttention 2 settings,
+and MMLU token-budgeted cohorts. Full commands, environment versions, resolved settings, checksums, and row-level
+Humanities flip accounting are in the
+[detailed reproducibility report](results/dense_baselines/llama32_1b_gsm8k_mmlu_dense_vs_recirc_10_1_alpha004_fp16.md).
 
-| Arm | Configuration | Correct | Accuracy | Change vs. baseline |
-|---|---|---:|---:|---:|
-| Dense baseline | No recirculation | 59/128 | 46.09% | — |
-| Recirculation | 8→2, alpha 0.20 | **67/128** | **52.34%** | **+8 correct / +6.25 percentage points** |
+| Full benchmark | Dense score | Dense accuracy | Recirculation score | Recirculation accuracy | Delta | Relative accuracy change |
+|---|---:|---:|---:|---:|---:|---:|
+| GSM8K Platinum | 588/1,209 | 48.6352% | **597/1,209** | **49.3797%** | **+9 / +0.7444 pp** | **+1.5306%** |
+| MMLU-STEM | 1,263/3,153 | 40.0571% | **1,268/3,153** | **40.2157%** | **+5 / +0.1586 pp** | **+0.3959%** |
+| MMLU-Humanities | 2,027/4,705 | 43.0818% | **2,034/4,705** | **43.2306%** | **+7 / +0.1488 pp** | **+0.3453%** |
 
-This is a **13.56% relative accuracy increase**. The search rows and evaluation rows are disjoint.
+Relative change is `(recirculation accuracy - dense accuracy) / dense accuracy`. The three suites have different
+scoring contracts, so their correct counts and accuracies must not be combined. On the 4,705 aligned Humanities rows,
+recirculation produced 42 wrong→correct and 35 correct→wrong flips, a paired net of +7.
 
 | Evaluation detail | Value |
 |---|---|
 | Model | [`meta-llama/Llama-3.2-1B-Instruct`](https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct), dense and unquantized |
-| Dataset | [`madrylab/gsm8k-platinum`](https://huggingface.co/datasets/madrylab/gsm8k-platinum), configuration `main`, split `test` |
-| Path search | Test rows 272–303 (32 rows) |
-| Alpha search | Test rows 304–335 (32 rows) |
-| Locked evaluation | Test rows 144–271 (128 rows) |
-| Evaluation toolkit | [Evalution](https://github.com/ModelCloud/Evalution) `0.0.7`, GSM8K-Platinum `cot_llama`, primary metric `acc,num` |
+| Evaluation datasets | [`madrylab/gsm8k-platinum`](https://huggingface.co/datasets/madrylab/gsm8k-platinum) full `main/test` split; [`cais/mmlu`](https://huggingface.co/datasets/cais/mmlu) full STEM and Humanities test groups |
+| Evaluation rows | 1,209 GSM8K Platinum; 3,153 MMLU-STEM; 4,705 MMLU-Humanities |
+| Path/alpha search data | arXiv, C4, and PG-19 language-modeling windows; disjoint from GSM8K and MMLU evaluation data |
+| Evaluation toolkit | [Evalution](https://github.com/ModelCloud/Evalution) `0.0.12`; GSM8K `cot_llama` natural generation; MMLU five-shot A/B/C/D likelihood |
+| CUDA execution | FP16, paged FlashAttention 2, continuous batching, engine batch 32, MMLU suite batch 128, 512-prompt scoring cohorts |
 
-The path search, alpha search, and locked evaluation ranges are pairwise disjoint.
+The GSM8K comparison remains provisional: the unseeded continuous scheduler was not bit-for-bit stable across two
+dense runs, shifting five row scores and the aggregate by three correct answers. MMLU reproduced exactly. See the
+detailed report for this repeatability limitation rather than interpreting the one-shot GSM8K delta as deterministic.
 
 For a paper-style language-modeling shortlist, corpus mode reads fixed windows from local arXiv, C4, and PG-19
 training shards. By default it takes at most two complete 1024-token windows from each document, matching the paper's
@@ -169,27 +177,32 @@ pytest -q
 
 The tests verify the published norm-ratio mixture, prohibit cross-token injection, and check replay state handling.
 
-## Run the confirmation evaluation
+## Run the full evaluation
 
 The evaluator defaults to `--backend auto`: it selects the accelerated CUDA path when CUDA and Triton are available,
 MLX on Apple Silicon, then Torch on MPS or CPU. Use `--backend` and `--device` only when an explicit override is
 needed.
 
 ```bash
-python scripts/evaluate.py paired-gsm8k \
-  --row-start 144 \
-  --rows 128 \
-  --forbid-range 272:304 \
-  --forbid-range 304:336 \
-  --max-new-tokens 256 \
-  --source-layer 8 \
-  --destination-layer 2 \
-  --alpha 0.20 \
-  --output results/reproduction.json
+PYTHONUNBUFFERED=1 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
+python3 -X gil=0 scripts/evaluate.py run \
+  --model /local-models/Llama-3.2-1B-Instruct \
+  --device cuda \
+  --benchmark gsm8k_platinum \
+  --benchmark mmlu_stem \
+  --benchmark mmlu_humanities \
+  --benchmark-arg gsm8k_platinum.variant=cot_llama \
+  --benchmark-arg gsm8k_platinum.apply_chat_template=true \
+  --benchmark-arg mmlu_stem.batch_size=128 \
+  --benchmark-arg mmlu_humanities.batch_size=128 \
+  --path 10:1 \
+  --alpha 0.04 \
+  --report-every-seconds 60 \
+  --output results/evaluations/llama32_1b_full_recirc_10_1_alpha004_fp16.json
 ```
 
-The baseline uses ordinary backend-native generation. The intervention arm uses the same model, tokenizer, prompts,
-greedy decoding settings, and row order, but performs paper-faithful serial prefill.
+Remove only `--path 10:1` and `--alpha 0.04` to run the matched dense model. The committed detailed report records the
+literal commands used for both arms and every automatically resolved inference setting.
 
 On MLX, evaluation automatically snapshots the exact token prefix shared by all selected prompts and restores it for
 each row. This avoids repeatedly processing fixed few-shot examples without changing generated outputs.
