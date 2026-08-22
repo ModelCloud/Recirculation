@@ -307,12 +307,11 @@ def test_paged_state_validation_integer_steps_empty_copy_and_existing_attachment
 
     cache_two_groups = _fake_cache()
     cache_two_groups.group_cache_managers.append(SimpleNamespace())
-    with pytest.raises(ValueError, match="one full-attention"):
-        make_paged_cache_recirculation_aware(
-            cache_two_groups,
-            hidden_size=2,
-            dtype=torch.float32,
-        )
+    assert make_paged_cache_recirculation_aware(
+        cache_two_groups,
+        hidden_size=2,
+        dtype=torch.float32,
+    ).state_group == 0
 
 
 def _snapshot(prompt_tokens=4, layer_count=2):
@@ -392,7 +391,8 @@ def test_seed_paged_cache_validates_allocation_layers_and_kv_shape():
     for invalid_layer in (
         (None, torch.zeros(1, 1, 4, 2)),
         (torch.zeros(1, 1, 4, 2), None),
-        (torch.zeros(1, 1, 3, 2), torch.zeros(1, 1, 3, 2)),
+        (torch.zeros(1, 1, 5, 2), torch.zeros(1, 1, 5, 2)),
+        (torch.zeros(1, 1, 3, 2), torch.zeros(1, 1, 4, 2)),
     ):
         cache = _fake_cache(block_size=2, layer_count=1)
         snapshot = SimpleNamespace(cache_data=(invalid_layer,), pending=_snapshot().pending)
@@ -403,6 +403,32 @@ def test_seed_paged_cache_validates_allocation_layers_and_kv_shape():
                 prompt_ids=[1, 2, 3, 4],
                 snapshot=snapshot,
             )
+
+
+def test_seed_paged_cache_places_short_sliding_window_at_prompt_suffix():
+    cache = _fake_cache(block_size=2, layer_count=1)
+    key = torch.arange(3 * 2, dtype=torch.float32).reshape(1, 1, 3, 2)
+    value = key + 50
+    snapshot = SimpleNamespace(
+        cache_data=((key, value),),
+        pending=_snapshot().pending,
+    )
+
+    blocks = seed_paged_cache_from_snapshot(
+        cache,
+        request_id="seed",
+        prompt_ids=[1, 2, 3, 4],
+        snapshot=snapshot,
+    )
+
+    assert blocks == 2
+    # The 3-token local-attention suffix belongs to logical positions 1..3;
+    # position 0 is intentionally left untouched.
+    physical = torch.tensor([2, 3, 4, 5])
+    expected_key = key[0].transpose(0, 1)
+    expected_value = value[0].transpose(0, 1)
+    assert torch.equal(cache.key_cache[0][physical[1:]], expected_key)
+    assert torch.equal(cache.value_cache[0][physical[1:]], expected_value)
 
 
 def _forward_kwargs(cache, *, positions, writes, cu_q, reads=None, cu_k=None, block_table=None):

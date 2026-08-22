@@ -11,6 +11,7 @@ drives the model through packed paged-FlashAttention batches.
 from __future__ import annotations
 
 import queue
+import os
 import threading
 import time
 from collections import defaultdict
@@ -48,9 +49,13 @@ def patch_transformers_paged_cache_defaults(*, num_blocks: int, block_size: int 
     if min(num_blocks, block_size) < 1:
         raise ValueError("paged cache block count and size must be positive")
     from transformers import ContinuousBatchingConfig
+    from transformers.generation.continuous_batching.cache_manager import (
+        SlidingAttentionCacheAllocator,
+    )
 
     with _TRANSFORMERS_CONFIG_PATCH_LOCK:
         original_init = ContinuousBatchingConfig.__init__
+        original_sliding_fill = SlidingAttentionCacheAllocator.fill_block_table
 
         @wraps(original_init)
         def bounded_init(self, *args, **kwargs):
@@ -59,20 +64,52 @@ def patch_transformers_paged_cache_defaults(*, num_blocks: int, block_size: int 
             original_init(self, *args, **kwargs)
 
         ContinuousBatchingConfig.__init__ = bounded_init
+
+        def sliding_fill_block_table(self, request_id, past_length, query_length, block_table):
+            """Expose Gemma's rolling blocks to FA2's varlen block-table path.
+
+            Transformers 5.15 allocates and reads sliding-window blocks but
+            leaves ``fill_block_table`` unimplemented.  The model runner still
+            needs the table for a prefill/decode batch, so publish the already
+            allocated rolling blocks (capped to the window) just like the full
+            attention allocator.  The attention kernel uses the separate
+            sliding seqlens/read-index metadata for the wraparound semantics.
+            """
+            blocks = self.block_table.get(request_id)
+            if blocks is None:
+                raise ValueError(f"No block table found for request {request_id}")
+            total_length = min(
+                int(past_length) + int(query_length), int(self.sliding_window)
+            )
+            needed = min(
+                (total_length + self.block_size - 1) // self.block_size,
+                len(blocks),
+                int(block_table.shape[0]),
+            )
+            if needed:
+                block_table[:needed] = torch.tensor(
+                    blocks[:needed], device=block_table.device, dtype=block_table.dtype
+                )
+
+        SlidingAttentionCacheAllocator.fill_block_table = sliding_fill_block_table
         try:
             yield
         finally:
             ContinuousBatchingConfig.__init__ = original_init
+            SlidingAttentionCacheAllocator.fill_block_table = original_sliding_fill
 
 
 class RecirculationPagedState:
     """Store recurrent residuals at the same physical pages as paged KV state."""
 
-    def __init__(self, cache, hidden_size: int, dtype: torch.dtype) -> None:
+    def __init__(self, cache, hidden_size: int, dtype: torch.dtype, *, state_group: int = 0) -> None:
         if hidden_size < 1:
             raise ValueError("hidden_size must be positive")
         self.cache = cache
         self.hidden_size = hidden_size
+        self.state_group = int(state_group)
+        if not 0 <= self.state_group < len(cache.group_cache_managers):
+            raise ValueError("recirculation state group is outside the paged cache")
         physical_pages = int(cache.key_cache[0].shape[0])
         self.destination = torch.empty(
             (physical_pages, hidden_size), dtype=dtype, device=cache.device
@@ -133,7 +170,7 @@ class RecirculationPagedState:
     def physical_token_indices(self, request_ids: list[str], positions: list[int]) -> torch.Tensor:
         if len(request_ids) != len(positions):
             raise ValueError("request_ids and positions must have equal lengths")
-        allocator = self.cache.group_cache_managers[0]
+        allocator = self.cache.group_cache_managers[self.state_group]
         indices = []
         for request_id, position in zip(request_ids, positions, strict=True):
             if position < 0:
@@ -148,11 +185,19 @@ def make_paged_cache_recirculation_aware(cache, *, hidden_size: int, dtype: torc
 
     if hasattr(cache, "recirculation_state"):
         return cache.recirculation_state
-    if len(cache.group_cache_managers) != 1:
-        raise ValueError(
-            "paged recirculation currently requires one full-attention cache group"
-        )
-    state = RecirculationPagedState(cache, hidden_size, dtype)
+    state_group = getattr(cache, "_recirculation_state_group", None)
+    if state_group is None:
+        if not all(hasattr(manager, "block_table") for manager in cache.group_cache_managers):
+            state_group = 0
+        else:
+            state_group = max(
+                range(len(cache.group_cache_managers)),
+                key=lambda index: max(
+                    (len(blocks) for blocks in cache.group_cache_managers[index].block_table.values()),
+                    default=0,
+                ),
+            )
+    state = RecirculationPagedState(cache, hidden_size, dtype, state_group=state_group)
     original_copy_cache = cache.copy_cache
 
     def copy_cache_with_recirculation(self, source_blocks, destination_blocks):
@@ -161,6 +206,7 @@ def make_paged_cache_recirculation_aware(cache, *, hidden_size: int, dtype: torc
 
     cache.copy_cache = MethodType(copy_cache_with_recirculation, cache)
     cache.recirculation_state = state
+    cache._recirculation_state_group = state_group
     return state
 
 
@@ -179,43 +225,76 @@ def seed_paged_cache_from_snapshot(
     allocated = cache.allocate_blocks(block_count, request_id, allocated_blocks=0)
     if allocated != block_count:
         raise RuntimeError("paged cache could not allocate the shared prefix")
-    allocator = cache.group_cache_managers[0]
-    blocks = allocator.block_table[request_id]
-    physical = torch.cat(
-        [
-            torch.arange(
-                block * cache.block_size,
-                (block + 1) * cache.block_size,
-                device=cache.device,
-                dtype=torch.long,
-            )
-            for block in blocks
-        ]
-    )
+    allocators = cache.group_cache_managers
+    blocks_by_group = [allocator.block_table[request_id] for allocator in allocators]
+
+    def physical_for_blocks(blocks):
+        return torch.cat(
+            [
+                torch.arange(
+                    block * cache.block_size,
+                    (block + 1) * cache.block_size,
+                    device=cache.device,
+                    dtype=torch.long,
+                )
+                for block in blocks
+            ]
+        )
+
+    physical_by_group = [physical_for_blocks(blocks) for blocks in blocks_by_group]
     if len(snapshot.cache_data) != len(cache.layer_index_to_group_indices):
         raise ValueError("snapshot and paged cache layer counts differ")
+    prompt_length = len(prompt_ids)
     for layer_index, layer_data in enumerate(snapshot.cache_data):
         key, value = layer_data[:2]
-        if key is None or value is None or key.shape[2] != len(prompt_ids):
+        # Gemma 3 alternates global attention with sliding-window attention.
+        # DynamicCache therefore exports a suffix (typically 511 tokens) for
+        # local layers even when the shared prompt is 1024 tokens long.  The
+        # paged cache still owns the complete logical prompt; place a shorter
+        # layer cache at the corresponding suffix positions instead of
+        # rejecting the snapshot as malformed.
+        if key is None or value is None or key.ndim < 3 or value.ndim < 3:
             raise ValueError("snapshot does not contain a complete fixed-length KV prefix")
-        _group, layer_in_group = cache.layer_index_to_group_indices[layer_index]
-        cache.key_cache[layer_in_group].index_copy_(0, physical, key[0].transpose(0, 1))
-        cache.value_cache[layer_in_group].index_copy_(0, physical, value[0].transpose(0, 1))
+        key_length = int(key.shape[2])
+        value_length = int(value.shape[2])
+        if key_length != value_length or key_length < 1 or key_length > prompt_length:
+            raise ValueError("snapshot does not contain a complete fixed-length KV prefix")
+        group, layer_in_group = cache.layer_index_to_group_indices[layer_index]
+        physical = physical_by_group[group]
+        logical_start = prompt_length - key_length
+        # Sliding-window groups intentionally have only the suffix blocks;
+        # global groups retain the complete prompt.  Both map to the same
+        # logical suffix once their own block table is selected.
+        if logical_start < 0 or logical_start + key_length > len(physical):
+            if len(physical) < key_length:
+                raise ValueError("snapshot layer exceeds its paged cache group")
+            logical_start = len(physical) - key_length
+        physical_slice = physical[logical_start:logical_start + key_length]
+        cache.key_cache[layer_in_group].index_copy_(
+            0, physical_slice, key[0].transpose(0, 1)
+        )
+        cache.value_cache[layer_in_group].index_copy_(
+            0, physical_slice, value[0].transpose(0, 1)
+        )
 
     state = make_paged_cache_recirculation_aware(
         cache,
         hidden_size=snapshot.pending.destination_residual.shape[-1],
         dtype=snapshot.pending.destination_residual.dtype,
     )
+    state_group = max(
+        range(len(blocks_by_group)), key=lambda index: len(blocks_by_group[index])
+    )
+    state_physical = physical_by_group[state_group]
     state.store(
-        physical[-1:],
+        state_physical[-1:],
         snapshot.pending.destination_residual,
         snapshot.pending.source_residual,
         snapshot.pending.input_step,
     )
     cache._block_manager.mark_shareable_blocks_as_complete(
         num_complete_blocks=block_count,
-        allocated_blocks=blocks,
+        allocated_blocks=blocks_by_group[state_group],
         prompt_ids=prompt_ids,
     )
     cache.free_blocks(request_id)
@@ -279,6 +358,14 @@ def patch_evalution_paged_prefix_seeding(
                 f"shared prefix={len(prefix_ids)} tokens"
             )
             if not prefix_ids:
+                for cohort in _iter_cohorts(chain(preview, request_iter), cohort_width):
+                    yield from original_generate(cohort, batch_size=cohort_width)
+                return
+            if os.environ.get("RECIRCULATION_DISABLE_PAGED_PREFIX_SEED", "") == "1":
+                LOG.info(
+                    "Paged prefix seeding disabled by RECIRCULATION_DISABLE_PAGED_PREFIX_SEED=1; "
+                    "using full-prompt recirculation cohorts for positional correctness."
+                )
                 for cohort in _iter_cohorts(chain(preview, request_iter), cohort_width):
                     yield from original_generate(cohort, batch_size=cohort_width)
                 return
@@ -364,7 +451,7 @@ class PagedRecirculationForward:
         kwargs: dict,
         sequence_indices: list[int],
         positions: torch.Tensor,
-        physical_write_indices: torch.Tensor,
+        physical_write_indices: torch.Tensor | list[torch.Tensor],
         physical_read_indices: list[torch.Tensor] | None,
         max_kv_length: int | None = None,
     ) -> dict:
@@ -398,15 +485,28 @@ class PagedRecirculationForward:
         wave["max_seqlen_k"] = (
             max_kv_length if max_kv_length is not None else int(kv_lengths.max().item())
         )
-        wave["write_index"] = [physical_write_indices]
+        wave["write_index"] = (
+            physical_write_indices
+            if isinstance(physical_write_indices, list)
+            else [physical_write_indices]
+        )
 
         original_reads = kwargs["read_index"]
         wave_reads = []
-        for group_reads in original_reads:
+        concatenated_reads = (
+            torch.cat(physical_read_indices)
+            if physical_read_indices and kwargs.get("block_table") is None
+            else None
+        )
+        for group_index, group_reads in enumerate(original_reads):
             if physical_read_indices is None:
                 wave_reads.append(group_reads[:0])
+            elif concatenated_reads is not None:
+                wave_reads.append(concatenated_reads)
+            elif group_index < len(physical_read_indices):
+                wave_reads.append(physical_read_indices[group_index])
             else:
-                wave_reads.append(torch.cat(physical_read_indices))
+                wave_reads.append(group_reads[:0])
         wave["read_index"] = wave_reads
         block_table = kwargs.get("block_table")
         if block_table is not None:
@@ -470,7 +570,8 @@ class PagedRecirculationForward:
             dtype=next(self.model.parameters()).dtype,
             device=input_ids.device,
         )
-        original_write = kwargs["write_index"][0]
+        original_write_by_group = list(kwargs["write_index"])
+        original_write = original_write_by_group[0]
         original_cu_k = self._single_group(kwargs["cu_seq_lens_k"])
         original_read = kwargs["read_index"][0]
 
@@ -497,17 +598,34 @@ class PagedRecirculationForward:
             current_position_values = current_positions.tolist()
             block_table = kwargs.get("block_table")
             if block_table is None:
-                current_writes = original_write.index_select(0, query_tensor)
+                current_writes_by_group = [
+                    group_write.index_select(0, query_tensor)
+                    for group_write in original_write_by_group
+                ]
             else:
-                group_table = block_table[0]
+                representative_layers = {}
+                mapping = cache.layer_index_to_group_indices
+                layer_items = mapping.items() if hasattr(mapping, "items") else enumerate(mapping)
+                for layer_index, (group_index, _layer_in_group) in layer_items:
+                    representative_layers.setdefault(group_index, layer_index)
+                sliding_windows = getattr(cache, "sliding_windows", {})
                 rows = torch.tensor(sequence_indices, device=input_ids.device, dtype=torch.long)
-                blocks = group_table[rows, current_positions // cache.block_size]
-                current_writes = blocks * cache.block_size + current_positions % cache.block_size
+                current_writes_by_group = []
+                for group_index in range(block_table.shape[0]):
+                    layer_index = representative_layers.get(group_index)
+                    window = sliding_windows.get(layer_index, 1) if layer_index is not None else 1
+                    logical_positions = current_positions if window == 1 else current_positions % window
+                    table = block_table[group_index].index_select(0, rows)
+                    blocks = table.gather(1, (logical_positions // cache.block_size).unsqueeze(1)).squeeze(1)
+                    current_writes_by_group.append(
+                        blocks * cache.block_size + logical_positions % cache.block_size
+                    )
+            current_writes = current_writes_by_group[0]
             current_kwargs = self._wave_kwargs(
                 kwargs,
                 sequence_indices,
                 current_positions,
-                current_writes,
+                current_writes_by_group,
                 read_pieces(sequence_indices, [offset] * len(sequence_indices)),
                 max(current_position_values) + 1,
             )
@@ -523,6 +641,7 @@ class PagedRecirculationForward:
             replay_sequences = []
             replay_physical = []
             replay_offsets = []
+            replay_query_indices = []
             for sequence_index, position in zip(
                 sequence_indices, current_position_values, strict=True
             ):
@@ -533,20 +652,29 @@ class PagedRecirculationForward:
                 if block_table is None:
                     if offset > 0:
                         previous_query = cu_q_values[sequence_index] + offset - 1
-                        replay_physical.append(original_write[previous_query])
+                        replay_query_indices.append(previous_query)
+                        replay_physical.append(
+                            original_write_by_group[state.state_group][previous_query]
+                        )
                     else:
                         read_start = int(original_cu_k[sequence_index].item())
                         replay_physical.append(original_read[read_start + position - 1])
                 else:
-                    block = block_table[0, sequence_index, (position - 1) // cache.block_size]
+                    state_table = block_table[state.state_group]
+                    block = state_table[sequence_index, (position - 1) // cache.block_size]
                     replay_physical.append(block * cache.block_size + (position - 1) % cache.block_size)
             if replay_sequences:
                 replay_indices = torch.stack(replay_physical).to(dtype=torch.long)
                 replay_destination, replay_source, replay_steps = state.load(replay_indices)
-                torch._assert_async(
-                    torch.all(replay_steps == current_positions[current_positions > 0] - 1),
-                    "paged recurrent state does not precede the current token",
-                )
+                expected_steps = current_positions[current_positions > 0] - 1
+                if not torch.equal(replay_steps, expected_steps):
+                    raise RuntimeError(
+                        "paged recurrent state does not precede the current token: "
+                        f"state_group={state.state_group} replay_steps={replay_steps.detach().cpu().tolist()} "
+                        f"expected={expected_steps.detach().cpu().tolist()} "
+                        f"replay_indices={replay_indices.detach().cpu().tolist()} "
+                        f"positions={current_positions.detach().cpu().tolist()}"
+                    )
                 replay = self.mixer(
                     replay_destination.unsqueeze(0),
                     replay_source.unsqueeze(0),
@@ -555,11 +683,47 @@ class PagedRecirculationForward:
                     self.config.normalize_source,
                 )
                 replay_positions = replay_steps
+                if block_table is None:
+                    replay_writes_by_group = [
+                        original_write_by_group[group].index_select(
+                            0, torch.tensor(replay_query_indices, device=input_ids.device, dtype=torch.long)
+                        )
+                        for group in range(len(original_write_by_group))
+                    ] if replay_query_indices else [group[:0] for group in original_write_by_group]
+                else:
+                    # Prefix replay uses the logical previous position.  The
+                    # native block table has a rolling address for sliding
+                    # groups and a monotonic address for full groups.
+                    representative_layers = {}
+                    mapping = cache.layer_index_to_group_indices
+                    layer_items = mapping.items() if hasattr(mapping, "items") else enumerate(mapping)
+                    for layer_index, (group_index, _layer_in_group) in layer_items:
+                        representative_layers.setdefault(group_index, layer_index)
+                    replay_writes_by_group = []
+                    for group_index in range(len(original_write_by_group)):
+                        layer_index = representative_layers[group_index]
+                        sliding_windows = getattr(cache, "sliding_windows", {})
+                        window = sliding_windows.get(layer_index, 1)
+                        values = []
+                        for sequence_index, position in zip(
+                            replay_sequences, replay_positions.tolist(), strict=True
+                        ):
+                            if offset > 0:
+                                previous_query = cu_q_values[sequence_index] + offset - 1
+                                values.append(original_write_by_group[group_index][previous_query])
+                            else:
+                                logical_position = position - 1
+                                if window != 1:
+                                    logical_position %= window
+                                table = block_table[group_index, sequence_index]
+                                block = table[logical_position // cache.block_size]
+                                values.append(block * cache.block_size + logical_position % cache.block_size)
+                        replay_writes_by_group.append(torch.stack(values).to(dtype=torch.long))
                 replay_kwargs = self._wave_kwargs(
                     kwargs,
                     replay_sequences,
                     replay_positions,
-                    replay_indices,
+                    replay_writes_by_group,
                     read_pieces(replay_sequences, replay_offsets),
                     max(current_position_values),
                 )
@@ -592,7 +756,13 @@ class PagedRecirculationForward:
                     source = hidden
             if source is None:
                 raise RuntimeError("paged current pass did not capture the source layer")
-            state.store(current_writes, destination, source, current_positions)
+            # The recurrent state lives in the selected full-context cache
+            # group.  Gemma exposes separate sliding/full groups, so group 0
+            # is not necessarily the address space used for state.load().
+            # Storing with the matching group's physical addresses keeps the
+            # step metadata aligned with the subsequent replay token.
+            state_writes = current_writes_by_group[state.state_group]
+            state.store(state_writes, destination, source, current_positions)
             output_hidden[:, query_tensor] = self.decoder.norm(hidden)
 
         if isinstance(logits_to_keep, torch.Tensor):
