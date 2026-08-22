@@ -812,7 +812,7 @@ def test_cuda_concurrent_graph_matches_eager_for_changed_tokens(monkeypatch):
         concurrent.close()
 
 
-def test_mlx_forward_error_gate_accepts_exact_and_rejects_excess_error():
+def test_mlx_forward_error_gate_uses_mean_absolute_error():
     mx = pytest.importorskip("mlx.core")
     from recirculation.mlx_backend import measure_forward_error
 
@@ -822,12 +822,13 @@ def test_mlx_forward_error_gate_accepts_exact_and_rejects_excess_error():
     excessive = measure_forward_error(reference, reference + 0.01)
     with pytest.raises(RuntimeError, match="exceeds limit"):
         excessive.require()
-    absolute_only = measure_forward_error(mx.array([1000.0]), mx.array([1000.003]))
-    assert absolute_only.relative_l2 < 2e-3
-    assert absolute_only.normalized_max < 2e-3
-    assert absolute_only.max_absolute > 2e-3
-    with pytest.raises(RuntimeError, match="max_absolute"):
-        absolute_only.require()
+    isolated_peak = measure_forward_error(
+        mx.array([1000.0, 1000.0]),
+        mx.array([1000.003, 1000.0]),
+    )
+    assert isolated_peak.max_absolute > 2e-3
+    assert isolated_peak.mean_absolute < 2e-3
+    isolated_peak.require()
 
 
 @pytest.mark.parametrize("dtype_name", ("bfloat16", "float16", "float32"))

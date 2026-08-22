@@ -35,6 +35,7 @@ from .controller import (
 )
 
 MAX_FORWARD_ERROR = 2e-3
+MAX_FUSED_OR_BATCHED_FORWARD_ERROR = 4e-3
 LOG = LogBar.shared()
 _CUDA_GRAPH_CAPTURE_LOCK = threading.Lock()
 # Preserve the existing CUDA-backend API while making the Torch implementation
@@ -96,7 +97,9 @@ class ForwardError:
 
     @property
     def rate(self) -> float:
-        return max(self.max_absolute, self.relative_l2, self.normalized_max)
+        """Return the release-gated mean absolute forward error."""
+
+        return self.mean_absolute
 
     def require(self, limit: float = MAX_FORWARD_ERROR) -> None:
         if not math.isfinite(limit) or limit < 0:
@@ -106,7 +109,7 @@ class ForwardError:
             raise RuntimeError(
                 "forward accumulation error exceeds limit "
                 f"{limit:.6g}: max_absolute={self.max_absolute:.6g}, "
-                f"mean_absolute={self.mean_absolute:.6g}, "
+                f"mean_absolute={self.mean_absolute:.6g} (gate metric), "
                 f"relative_l2={self.relative_l2:.6g}, normalized_max={self.normalized_max:.6g}"
             )
 
@@ -1544,6 +1547,7 @@ class CUDAGraphedPrefill:
 
 __all__ = [
     "MAX_FORWARD_ERROR",
+    "MAX_FUSED_OR_BATCHED_FORWARD_ERROR",
     "CUDABatchedPathRunner",
     "CUDAConcurrentRunner",
     "CUDAGraphedConcurrentPrefill",

@@ -282,11 +282,16 @@ by default), because immediate one-row refill makes long few-shot prompts substa
 `--cuda-paged-admission-batch` to test another admission width. The path remains accuracy-gated against the Torch CUDA
 runner and does not enable CUDA graphs.
 
+TODO: make paged recirculation CUDA-graph compatible. The packed forward currently reads dynamic sequence metadata
+from CUDA on the host, which graph capture rejects. A graph-safe implementation needs fixed device-resident metadata,
+captured shape buckets, and forward-error validation before paged varlen/decode graphs can become an automatic default.
+
 On CUDA, the sweep/evaluation scripts now choose the validated settings automatically: FP16, FlashAttention 2, paged
-continuous batching, request/admission width 32, 256 cache blocks of 256 tokens, a 4,096-token scheduler budget, and
-the expandable-segments allocator. Dense Evalution and recirculation evaluation log the resolved values and save them
-in result provenance. Explicit `--no-cuda-paged-continuous`, `--no-paged-attention`, and `--no-continuous-batching`
-switches remain available for controlled comparisons and systems without the required kernels.
+continuous batching, coherent request/admission width 32, 256 cache blocks of 256 tokens, a cache-derived 65,536-token
+scheduler budget, and the expandable-segments allocator. CUDA graphs remain off until the graph-compatible paged TODO
+above is accuracy-gated. Dense Evalution and recirculation evaluation log the resolved values and save them in result
+provenance. Explicit `--no-cuda-paged-continuous`, `--no-paged-attention`, and `--no-continuous-batching` switches remain
+available for controlled comparisons and systems without the required kernels.
 
 ```bash
 python scripts/sweep_gsm8k.py \

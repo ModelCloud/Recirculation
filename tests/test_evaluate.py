@@ -17,10 +17,12 @@ from scripts.evaluate import (
     _decode_cli_value,
     _gold_answer,
     _instruction,
+    _observe_evalution_generation_progress,
     _paired,
     _parse_benchmark_assignment,
     _parse_candidate,
     _parse_suite_assignment,
+    _score_recirculation_chunks,
     _summary,
     _task_contract,
 )
@@ -255,6 +257,97 @@ def test_generic_suite_loader_supports_evalution_factories_and_local_arrow(tmp_p
     assert local_suite.dataset_loader() is evaluation._load_local_arrow
     with pytest.raises(ValueError, match="unknown Evalution benchmark"):
         _build_evalution_suite("not_a_real_benchmark", {})
+
+
+def test_generic_suite_loader_supports_named_mmlu_groups():
+    stem = _build_evalution_suite("mmlu_stem", {})
+    humanities = _build_evalution_suite("mmlu_humanities", {})
+
+    assert stem.task_name() == "mmlu_stem"
+    assert humanities.task_name() == "mmlu_humanities"
+
+
+def test_evalution_chunks_are_shifted_into_cuda_recirculation_targets():
+    calls = []
+
+    class ModelConfig:
+        pad_token_id = 0
+        eos_token_id = 2
+
+    class Runner:
+        device = "cpu"
+        model = SimpleNamespace(config=ModelConfig())
+
+        @staticmethod
+        def score(tokens, targets, *, attention_mask, return_per_row):
+            calls.append((tokens.tolist(), targets, attention_mask.tolist(), return_per_row))
+            return [1.25, 2.5], [2, 1]
+
+    chunks = [
+        SimpleNamespace(
+            input_ids=[1, 4, 5, 6],
+            score_start=2,
+            score_count=2,
+            metadata={"row": 0},
+        ),
+        SimpleNamespace(
+            input_ids=[1, 7, 8],
+            score_start=2,
+            score_count=1,
+            metadata={"row": 1},
+        ),
+    ]
+    outputs = _score_recirculation_chunks(Runner(), chunks, batch_size=2)
+
+    assert calls == [
+        (
+            [[1, 4, 5], [1, 7, 0]],
+            {1: ([0, 1], [5, 8]), 2: ([0], [6])},
+            [[1, 1, 1], [1, 1, 0]],
+            True,
+        )
+    ]
+    assert [(output.logprob, output.token_count, output.metadata) for output in outputs] == [
+        (-1.25, 2, {"row": 0}),
+        (-2.5, 1, {"row": 1}),
+    ]
+
+
+def test_evalution_generation_progress_exposes_exact_partial_scores(monkeypatch):
+    import evalution.benchmarks.base as benchmark_base
+
+    events = []
+
+    class Suite:
+        def score_progress_title(self, *, processed, aggregate_scores, invalid_predictions):
+            del self
+            return f"suite: scoring {processed} {aggregate_scores} {invalid_predictions}"
+
+    monkeypatch.setattr(
+        benchmark_base,
+        "manual_progress",
+        lambda total, *args, **kwargs: (total, args, kwargs),
+    )
+    suite = Suite()
+    with _observe_evalution_generation_progress(
+        suite,
+        lambda **values: events.append(values),
+    ):
+        benchmark_base.manual_progress(12, title="suite: scoring")
+        suite.score_progress_title(
+            processed=3,
+            aggregate_scores={"acc,num": 2.0},
+            invalid_predictions=1,
+        )
+
+    assert events == [
+        {"total": 12},
+        {
+            "processed": 3,
+            "aggregate_scores": {"acc,num": 2.0},
+            "invalid_predictions": 1,
+        },
+    ]
 
 
 def test_generic_evalution_runner_reuses_one_model_for_multiple_suites(monkeypatch, tmp_path):

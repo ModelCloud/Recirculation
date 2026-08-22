@@ -13,7 +13,7 @@ import platform
 import subprocess
 import sys
 import time
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from importlib.metadata import version as package_version
 from pathlib import Path
 from typing import Any
@@ -27,6 +27,7 @@ import torch
 import yaml
 from datasets import Dataset, load_dataset
 from evalution import Transformers
+from evalution.engines.base import LoglikelihoodOutput
 from evalution.logbar import get_logger
 from evalution.scorers.gsm8k import (
     INVALID_ANSWER,
@@ -49,6 +50,10 @@ from recirculation import (
 from recirculation.inference_defaults import resolve_dense_cuda_defaults
 
 DEFAULT_MODEL = "/local-models/Llama-3.2-1B-Instruct"
+MMLU_GROUP_ALIASES = {
+    "mmlu_stem": "stem",
+    "mmlu_humanities": "humanities",
+}
 
 
 def _task_contract(path: Path):
@@ -467,7 +472,7 @@ def _parse_benchmark_assignment(value: str) -> tuple[str, str, Any]:
 
 
 def _available_benchmarks() -> list[str]:
-    return sorted(EVALUTION_BENCHMARK_FACTORIES)
+    return sorted({*EVALUTION_BENCHMARK_FACTORIES, *MMLU_GROUP_ALIASES})
 
 
 def _suite_kwargs(args: argparse.Namespace, benchmark: str) -> dict[str, Any]:
@@ -482,7 +487,11 @@ def _suite_kwargs(args: argparse.Namespace, benchmark: str) -> dict[str, Any]:
 
 
 def _build_evalution_suite(benchmark: str, kwargs: dict[str, Any]):
-    factory = EVALUTION_BENCHMARK_FACTORIES.get(benchmark)
+    factory_name = "mmlu" if benchmark in MMLU_GROUP_ALIASES else benchmark
+    kwargs = dict(kwargs)
+    if benchmark in MMLU_GROUP_ALIASES:
+        kwargs.setdefault("subsets", MMLU_GROUP_ALIASES[benchmark])
+    factory = EVALUTION_BENCHMARK_FACTORIES.get(factory_name)
     if factory is None:
         raise ValueError(
             f"unknown Evalution benchmark {benchmark!r}; use --list-benchmarks to inspect targets"
@@ -504,6 +513,150 @@ def _build_evalution_suite(benchmark: str, kwargs: dict[str, Any]):
         {"dataset_loader": lambda self: _load_local_arrow},
     )
     return local_suite_type(**kwargs)
+
+
+def _score_recirculation_chunks(runner, chunks, *, batch_size: int):
+    """Score Evalution teacher-forcing chunks with paper-faithful CUDA replay."""
+
+    if batch_size < 1:
+        raise ValueError("recirculation scoring batch size must be positive")
+    device = getattr(runner, "device", None)
+    if device is None:
+        device = next(runner.model.parameters()).device
+    outputs = []
+    for start in range(0, len(chunks), batch_size):
+        batch = chunks[start : start + batch_size]
+        if any(chunk.score_start < 1 or chunk.score_count < 1 for chunk in batch):
+            raise ValueError("recirculation scoring requires non-empty prefix and target spans")
+        input_rows = [list(chunk.input_ids[:-1]) for chunk in batch]
+        padded_length = max(map(len, input_rows))
+        pad_token_id = getattr(runner.model.config, "pad_token_id", None)
+        if pad_token_id is None:
+            pad_token_id = getattr(runner.model.config, "eos_token_id", 0)
+        if isinstance(pad_token_id, (list, tuple)):
+            pad_token_id = pad_token_id[0]
+        tokens = torch.full(
+            (len(batch), padded_length),
+            int(pad_token_id or 0),
+            dtype=torch.long,
+            device=device,
+        )
+        attention_mask = torch.zeros_like(tokens)
+        targets_by_position: dict[int, tuple[list[int], list[int]]] = {}
+        for row_index, (chunk, input_ids) in enumerate(zip(batch, input_rows, strict=True)):
+            tokens[row_index, : len(input_ids)] = torch.tensor(
+                input_ids,
+                dtype=torch.long,
+                device=device,
+            )
+            attention_mask[row_index, : len(input_ids)] = 1
+            for target_offset in range(chunk.score_count):
+                target_index = chunk.score_start + target_offset
+                position = target_index - 1
+                rows, targets = targets_by_position.setdefault(position, ([], []))
+                rows.append(row_index)
+                targets.append(int(chunk.input_ids[target_index]))
+        row_nll, row_counts = runner.score(
+            tokens,
+            targets_by_position,
+            attention_mask=attention_mask,
+            return_per_row=True,
+        )
+        for chunk, nll, token_count in zip(batch, row_nll, row_counts, strict=True):
+            outputs.append(
+                LoglikelihoodOutput(
+                    logprob=-float(nll),
+                    is_greedy=False,
+                    token_count=int(token_count),
+                    metadata=dict(chunk.metadata),
+                )
+            )
+    return outputs
+
+
+@contextmanager
+def _patch_evalution_recirculation_scoring(session, config: RecirculationConfig):
+    """Route Evalution log-likelihood batches through the CUDA replay runner."""
+
+    from recirculation.cuda_backend import CUDAPrefillRunner
+
+    runner = CUDAPrefillRunner(
+        session.model,
+        config,
+        fused=True,
+        allow_terminal_padding=True,
+        projection_chunk_tokens=16,
+    )
+    session_type = type(session)
+    original_score_chunks = session_type._score_chunks
+
+    def score_chunks(_session, chunks, *, batch_size):
+        return _score_recirculation_chunks(runner, chunks, batch_size=batch_size)
+
+    session_type._score_chunks = score_chunks
+    try:
+        yield
+    finally:
+        session_type._score_chunks = original_score_chunks
+
+
+def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
+    """Write status without exposing a partially serialized JSON document."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pending = path.with_suffix(path.suffix + ".new")
+    pending.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    pending.replace(path)
+
+
+@contextmanager
+def _observe_evalution_generation_progress(suite, callback):
+    """Expose exact BaseTestSuite partial metrics hidden by headless LogBar."""
+
+    import evalution.benchmarks.base as benchmark_base
+
+    suite_type = type(suite)
+    if not hasattr(suite_type, "score_progress_title"):
+        yield
+        return
+    had_local_title = "score_progress_title" in suite_type.__dict__
+    local_title = suite_type.__dict__.get("score_progress_title")
+    resolved_title = suite_type.score_progress_title
+    original_manual_progress = benchmark_base.manual_progress
+
+    def score_progress_title(self, *, processed, aggregate_scores, invalid_predictions):
+        title = resolved_title(
+            self,
+            processed=processed,
+            aggregate_scores=aggregate_scores,
+            invalid_predictions=invalid_predictions,
+        )
+        if self is suite:
+            callback(
+                processed=int(processed),
+                aggregate_scores=dict(aggregate_scores),
+                invalid_predictions=int(invalid_predictions),
+            )
+        return title
+
+    def manual_progress(total, *args, **kwargs):
+        title = kwargs.get("title")
+        if title is None and args:
+            title = args[0]
+        if isinstance(title, str) and ": scoring" in title:
+            callback(total=int(total))
+        return original_manual_progress(total, *args, **kwargs)
+
+    suite_type.score_progress_title = score_progress_title
+    benchmark_base.manual_progress = manual_progress
+    try:
+        yield
+    finally:
+        benchmark_base.manual_progress = original_manual_progress
+        if had_local_title:
+            suite_type.score_progress_title = local_title
+        else:
+            delattr(suite_type, "score_progress_title")
 
 
 def _dense_evalution_main(argv: list[str]) -> int:
@@ -560,10 +713,39 @@ def _dense_evalution_main(argv: list[str]) -> int:
         action=argparse.BooleanOptionalAction,
         default=None,
     )
-    parser.add_argument("--max-batch-tokens", type=int, default=4096)
+    parser.add_argument(
+        "--cuda-graph",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Experimentally capture paged varlen/decode CUDA graphs (off by default).",
+    )
+    parser.add_argument(
+        "--max-batch-tokens",
+        type=int,
+        default=None,
+        help=(
+            "Continuous scheduler token-admission budget. CUDA auto mode derives a "
+            "cache-safe value from the paged-cache geometry (65,536 with defaults)."
+        ),
+    )
     parser.add_argument("--max-blocks-per-request", type=int, default=8)
     parser.add_argument("--paged-num-blocks", type=int, default=256)
     parser.add_argument("--paged-block-size", type=int, default=256)
+    parser.add_argument(
+        "--path",
+        type=_parse_path,
+        default=None,
+        help="Apply one recirculation path as SOURCE:DESTINATION to every selected suite.",
+    )
+    parser.add_argument("--alpha", type=float, default=0.10)
+    parser.add_argument("--beta", type=float, default=None)
+    parser.add_argument("--ramp-tokens", type=int, default=0)
+    parser.add_argument(
+        "--report-every-seconds",
+        type=float,
+        default=60.0,
+        help="Emit and persist partial Evalution metrics at this interval.",
+    )
     args = parser.parse_args(argv)
 
     if args.list_benchmarks:
@@ -600,6 +782,36 @@ def _dense_evalution_main(argv: list[str]) -> int:
         parser.error("paged scheduler sizes must be positive")
     if args.max_rows is not None and args.max_rows < 1:
         parser.error("--max-rows must be positive")
+    if args.report_every_seconds <= 0:
+        parser.error("--report-every-seconds must be positive")
+    recirculation_config = None
+    if args.path is not None:
+        try:
+            recirculation_config = RecirculationConfig(
+                source_layer=args.path[0],
+                destination_layer=args.path[1],
+                alpha=args.alpha,
+                beta=args.beta,
+                ramp_tokens=args.ramp_tokens,
+            )
+        except ValueError as error:
+            parser.error(str(error))
+        unsupported = sorted(
+            benchmark
+            for benchmark in args.benchmark
+            if benchmark != "gsm8k_platinum"
+            and benchmark != "mmlu"
+            and benchmark not in MMLU_GROUP_ALIASES
+        )
+        if unsupported:
+            parser.error(
+                "generic recirculation evaluation currently supports gsm8k_platinum and MMLU; "
+                f"unsupported: {unsupported}"
+            )
+        if not cuda_device:
+            parser.error("generic recirculation evaluation currently requires a CUDA device")
+        if not args.paged_attention:
+            parser.error("recirculated GSM8K evaluation requires CUDA paged attention")
 
     try:
         suites = [
@@ -613,15 +825,18 @@ def _dense_evalution_main(argv: list[str]) -> int:
     if Path(model_path).exists() and not (Path(model_path) / "config.json").is_file():
         raise FileNotFoundError(f"model config not found: {Path(model_path) / 'config.json'}")
     output_path = args.output.expanduser().resolve()
+    status_path = output_path.with_suffix(".status.json")
     logger = get_logger()
     logger.info(
         "Evalution run: benchmarks=%s dtype=float16 attention=%s continuous=%s "
-        "paged=%s batch_size=%d model=%s",
+        "paged=%s cuda_graph=%s batch_size=%d max_batch_tokens=%d model=%s",
         args.benchmark,
         args.attention_backend,
         args.continuous_batching,
         args.paged_attention,
+        args.cuda_graph,
         args.batch_size,
+        args.max_batch_tokens,
         model_path,
     )
     attention = (
@@ -638,7 +853,7 @@ def _dense_evalution_main(argv: list[str]) -> int:
         max_batch_tokens=args.max_batch_tokens,
         max_blocks_per_request=args.max_blocks_per_request,
         use_async_batching=False,
-        use_cuda_graph=False,
+        use_cuda_graph=args.cuda_graph,
     )
     cache_patch = nullcontext()
     if args.paged_attention:
@@ -650,6 +865,31 @@ def _dense_evalution_main(argv: list[str]) -> int:
         )
 
     started = time.perf_counter()
+    suite_status = [
+        {
+            "benchmark": benchmark,
+            "name": suite.task_name(),
+            "state": "pending",
+            "completed_rows": 0,
+            "total_rows": args.max_rows,
+            "metrics": {},
+        }
+        for benchmark, suite in zip(args.benchmark, suites, strict=True)
+    ]
+    live_status = {
+        "status": "running",
+        "output": str(output_path),
+        "elapsed_seconds": 0.0,
+        "active_suite": None,
+        "suites": suite_status,
+    }
+
+    def write_live_status() -> None:
+        live_status["elapsed_seconds"] = time.perf_counter() - started
+        _atomic_json(status_path, live_status)
+
+    write_live_status()
+
     with cache_patch:
         evaluation = engine.model(
             path=model_path,
@@ -657,9 +897,118 @@ def _dense_evalution_main(argv: list[str]) -> int:
             model_kwargs={"local_files_only": args.local_files_only},
             tokenizer_kwargs={"local_files_only": args.local_files_only},
         )
+        def run_suite(index, suite, execution_patch) -> None:
+            entry = suite_status[index]
+            entry["state"] = "active"
+            live_status["active_suite"] = entry["name"]
+            last_report = [0.0]
+            write_live_status()
+
+            def progress_callback(**updates) -> None:
+                total = updates.get("total")
+                if total is not None:
+                    entry["total_rows"] = int(total)
+                processed = updates.get("processed")
+                if processed is not None:
+                    processed = int(processed)
+                    entry["completed_rows"] = processed
+                    aggregate_scores = updates.get("aggregate_scores", {})
+                    entry["metric_totals"] = {
+                        name: float(value) for name, value in aggregate_scores.items()
+                    }
+                    entry["metrics"] = {
+                        name: float(value) / processed
+                        for name, value in aggregate_scores.items()
+                    } if processed else {}
+                    entry["invalid_predictions"] = int(updates.get("invalid_predictions", 0))
+                now = time.perf_counter()
+                force = bool(
+                    processed
+                    and entry.get("total_rows")
+                    and processed == entry["total_rows"]
+                )
+                if processed and (force or now - last_report[0] >= args.report_every_seconds):
+                    metric_text = " ".join(
+                        f"{name}={value:.4f}" for name, value in entry["metrics"].items()
+                    )
+                    logger.info(
+                        "%s partial rows=%d/%s %s invalid=%d",
+                        entry["name"],
+                        processed,
+                        entry.get("total_rows") or "?",
+                        metric_text,
+                        entry.get("invalid_predictions", 0),
+                    )
+                    write_live_status()
+                    last_report[0] = now
+
+            try:
+                with _observe_evalution_generation_progress(
+                    suite, progress_callback
+                ), execution_patch:
+                    evaluation.run(suite)
+            except BaseException as error:
+                entry["state"] = "failed"
+                entry["error"] = f"{type(error).__name__}: {error}"
+                live_status["status"] = "failed"
+                live_status["active_suite"] = None
+                write_live_status()
+                raise
+            entry["state"] = "complete"
+            completed_results = getattr(evaluation, "_test_results", ())
+            if completed_results:
+                completed_result = completed_results[-1]
+                entry["completed_rows"] = len(completed_result.samples)
+                entry["total_rows"] = len(completed_result.samples)
+                entry["metrics"] = {
+                    name: float(value) for name, value in completed_result.metrics.items()
+                }
+            live_status["active_suite"] = None
+            write_live_status()
+
         try:
-            for suite in suites:
-                evaluation.run(suite)
+            if recirculation_config is None:
+                for index, suite in enumerate(suites):
+                    run_suite(index, suite, nullcontext())
+            else:
+                from evalution.runtime import _describe_execution
+
+                from recirculation.cuda_backend import FusedNormMix
+                from recirculation.transformers_paged_patch import (
+                    patch_evalution_paged_prefix_seeding,
+                    patch_model_paged_recirculation,
+                )
+
+                evaluation._session = engine.build(evaluation._model_config)
+                evaluation._execution = _describe_execution(evaluation._session)
+                for index, (benchmark, suite) in enumerate(
+                    zip(args.benchmark, suites, strict=True)
+                ):
+                    if benchmark == "gsm8k_platinum":
+                        @contextmanager
+                        def paged_generation_patch():
+                            with (
+                                patch_model_paged_recirculation(
+                                    evaluation._session.model,
+                                    recirculation_config,
+                                    FusedNormMix(),
+                                ),
+                                patch_evalution_paged_prefix_seeding(
+                                    evaluation._session,
+                                    recirculation_config,
+                                    block_size=args.paged_block_size,
+                                    preview_size=args.batch_size,
+                                ),
+                            ):
+                                yield
+
+                        patch = paged_generation_patch()
+                    else:
+                        patch = _patch_evalution_recirculation_scoring(
+                            evaluation._session,
+                            recirculation_config,
+                        )
+                    run_suite(index, suite, patch)
             result = evaluation.result().to_dict()
         except Exception:
             evaluation.close()
@@ -680,6 +1029,19 @@ def _dense_evalution_main(argv: list[str]) -> int:
         "attention_backend": args.attention_backend,
         "continuous_batching": args.continuous_batching,
         "paged_attention_requested": args.paged_attention,
+        "cuda_graph": args.cuda_graph,
+        "recirculation_prefix_seed": getattr(
+            getattr(evaluation, "_session", None), "_recirculation_prefix_seed", None
+        ),
+        "recirculation_admission": getattr(
+            getattr(evaluation, "_session", None), "_recirculation_admission", None
+        ),
+        "forward_error_gate": {
+            "metric": "mean_absolute",
+            "limit": 4e-3,
+            "kernel_classification": "fused_or_batched",
+            "oracle": "unfused_unbatched_same_dtype",
+        } if recirculation_config is not None else None,
         "batch_size": args.batch_size,
         "max_batch_tokens": args.max_batch_tokens,
         "max_blocks_per_request": args.max_blocks_per_request,
@@ -687,9 +1049,24 @@ def _dense_evalution_main(argv: list[str]) -> int:
         "paged_block_size": args.paged_block_size,
         "cuda_auto_optimized": args.cuda_auto_optimized,
         "allocator_config": os.environ["PYTORCH_ALLOC_CONF"],
+        "recirculation": (
+            {
+                "source_layer": recirculation_config.source_layer,
+                "destination_layer": recirculation_config.destination_layer,
+                "alpha": recirculation_config.alpha,
+                "beta": recirculation_config.beta,
+                "normalize_source": recirculation_config.normalize_source,
+                "ramp_tokens": recirculation_config.ramp_tokens,
+            }
+            if recirculation_config is not None
+            else None
+        ),
     }
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    live_status["status"] = "complete"
+    live_status["active_suite"] = None
+    write_live_status()
     logger.info(
         "evaluation complete: suites=%d rows=%d elapsed=%.2fs rows_per_second=%.3f output=%s",
         len(suites),

@@ -27,6 +27,11 @@ def _dense_args(**overrides):
         "attention_backend": None,
         "continuous_batching": None,
         "paged_attention": None,
+        "cuda_graph": None,
+        "max_batch_tokens": None,
+        "max_blocks_per_request": 8,
+        "paged_num_blocks": 256,
+        "paged_block_size": 256,
     }
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -108,6 +113,8 @@ def test_dense_cuda_defaults_enable_full_fast_path():
     assert args.attention_backend == "flash_attention_2"
     assert args.continuous_batching is True
     assert args.paged_attention is True
+    assert args.cuda_graph is False
+    assert args.max_batch_tokens == 65_536
 
 
 def test_dense_cuda_defaults_fall_back_without_flash_attention():
@@ -120,6 +127,8 @@ def test_dense_cuda_defaults_fall_back_without_flash_attention():
     assert args.attention_backend == "sdpa"
     assert args.continuous_batching is False
     assert args.paged_attention is False
+    assert args.cuda_graph is False
+    assert args.max_batch_tokens == 65_536
 
 
 def test_dense_explicit_settings_are_preserved():
@@ -128,6 +137,8 @@ def test_dense_explicit_settings_are_preserved():
         attention_backend="eager",
         continuous_batching=True,
         paged_attention=False,
+        cuda_graph=False,
+        max_batch_tokens=12_345,
     )
 
     automatic = resolve_dense_cuda_defaults(args, flash_available=True)
@@ -137,6 +148,21 @@ def test_dense_explicit_settings_are_preserved():
     assert args.attention_backend == "eager"
     assert args.continuous_batching is True
     assert args.paged_attention is False
+    assert args.cuda_graph is False
+    assert args.max_batch_tokens == 12_345
+
+
+def test_dense_cuda_token_budget_is_bounded_by_request_capacity():
+    args = _dense_args(
+        batch_size=4,
+        paged_num_blocks=256,
+        paged_block_size=256,
+        max_blocks_per_request=8,
+    )
+
+    resolve_dense_cuda_defaults(args, flash_available=True)
+
+    assert args.max_batch_tokens == 8_192
 
 
 def test_dense_paged_attention_requires_flash_and_continuous_batching():
@@ -148,5 +174,10 @@ def test_dense_paged_attention_requires_flash_and_continuous_batching():
     with pytest.raises(ValueError, match="requires --continuous-batching"):
         resolve_dense_cuda_defaults(
             _dense_args(paged_attention=True, continuous_batching=False),
+            flash_available=True,
+        )
+    with pytest.raises(ValueError, match="requires --paged-attention"):
+        resolve_dense_cuda_defaults(
+            _dense_args(paged_attention=False, cuda_graph=True),
             flash_available=True,
         )

@@ -15,12 +15,30 @@ from recirculation.transformers_paged_patch import (
     PagedRecirculationForward,
     RecirculationContinuousBatchingManager,
     RecirculationPagedState,
+    _common_block_prefix,
+    _iter_cohorts,
     make_paged_cache_recirculation_aware,
     patch_model_paged_recirculation,
     patch_transformers_continuous_batching,
     patch_transformers_paged_cache_defaults,
     seed_paged_cache_from_snapshot,
 )
+
+
+def test_common_block_prefix_is_exact_and_block_aligned():
+    rows = [[1, 2, 3, 4, 5], [1, 2, 3, 4, 6], [1, 2, 3, 4, 7]]
+
+    assert _common_block_prefix(rows, 4) == [1, 2, 3, 4]
+    assert _common_block_prefix(rows, 8) == []
+    assert _common_block_prefix([], 4) == []
+    with pytest.raises(ValueError, match="block_size"):
+        _common_block_prefix(rows, 0)
+
+
+def test_iter_cohorts_is_lazy_and_keeps_remainder():
+    assert list(_iter_cohorts(iter(range(7)), 3)) == [[0, 1, 2], [3, 4, 5], [6]]
+    with pytest.raises(ValueError, match="width"):
+        list(_iter_cohorts([], 0))
 
 
 class _FakeRunner:

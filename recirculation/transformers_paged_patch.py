@@ -16,9 +16,11 @@ import time
 from collections import defaultdict
 from contextlib import contextmanager, nullcontext
 from functools import wraps
+from itertools import chain, islice
 from types import MethodType
 
 import torch
+from logbar import LogBar
 from transformers.generation.continuous_batching.requests import GenerationOutput, RequestStatus
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
@@ -30,6 +32,7 @@ from .controller import (
 )
 
 _TRANSFORMERS_CONFIG_PATCH_LOCK = threading.RLock()
+LOG = LogBar.shared()
 
 
 @contextmanager
@@ -219,6 +222,127 @@ def seed_paged_cache_from_snapshot(
     return block_count
 
 
+def _common_block_prefix(token_rows: list[list[int]], block_size: int) -> list[int]:
+    """Return the exact block-aligned prefix shared by all supplied requests."""
+
+    if block_size < 1:
+        raise ValueError("block_size must be positive")
+    if not token_rows:
+        return []
+    common = 0
+    for values in zip(*token_rows, strict=False):
+        if len(set(values)) != 1:
+            break
+        common += 1
+    common = common // block_size * block_size
+    return token_rows[0][:common]
+
+
+def _iter_cohorts(items, width: int):
+    """Yield bounded request cohorts without materializing the full evaluation."""
+
+    if width < 1:
+        raise ValueError("cohort width must be positive")
+    source = iter(items)
+    while cohort := list(islice(source, width)):
+        yield cohort
+
+
+@contextmanager
+def patch_evalution_paged_prefix_seeding(
+    session,
+    config: RecirculationConfig,
+    *,
+    block_size: int,
+    preview_size: int,
+):
+    """Seed a recurrent shared prefix before Evalution admits its first cohort."""
+
+    if preview_size < 1:
+        raise ValueError("preview_size must be positive")
+    original_generate = session.generate_continuous
+
+    def generate_continuous(self, requests, *, batch_size=None):
+        def iterator():
+            request_iter = iter(requests)
+            cohort_width = min(preview_size, batch_size or preview_size)
+            preview = list(islice(request_iter, cohort_width))
+            if not preview:
+                return
+            prepared_ids = [
+                self._prepare_request_for_generation(request)[1]
+                for _request_key, request in preview
+            ]
+            prefix_ids = _common_block_prefix(prepared_ids, block_size)
+            LOG.info(
+                f"Recirculation paged admission: coherent cohorts width={cohort_width}, "
+                f"shared prefix={len(prefix_ids)} tokens"
+            )
+            if not prefix_ids:
+                for cohort in _iter_cohorts(chain(preview, request_iter), cohort_width):
+                    yield from original_generate(cohort, batch_size=cohort_width)
+                return
+
+            from .cuda_backend import CUDAConcurrentRunner
+
+            prefix = torch.tensor(
+                [prefix_ids], dtype=torch.long, device=next(self.model.parameters()).device
+            )
+            runner = CUDAConcurrentRunner(self.model, config, use_python_threads=True)
+            try:
+                _, cache, pending, _ = runner.prefill(prefix)
+                snapshot = runner.snapshot(cache, pending)
+                torch.cuda.synchronize(runner.device)
+            finally:
+                runner.close()
+
+            original_ensure = self._ensure_continuous_batching_manager
+            seeded = False
+
+            def ensure_manager(bound_self, *args, **kwargs):
+                nonlocal seeded
+                manager = original_ensure(*args, **kwargs)
+                if not seeded:
+                    deadline = time.perf_counter() + 30.0
+                    while getattr(manager, "batch_processor", None) is None:
+                        if not manager.is_running():
+                            raise RuntimeError("paged manager stopped during prefix seeding")
+                        if time.perf_counter() >= deadline:
+                            raise TimeoutError("paged manager prefix seeding timed out")
+                        time.sleep(0.001)
+                    blocks = seed_paged_cache_from_snapshot(
+                        manager.batch_processor.cache,
+                        request_id="evalution_recirculation_prefix_seed",
+                        prompt_ids=prefix_ids,
+                        snapshot=snapshot,
+                    )
+                    bound_self._recirculation_prefix_seed = {
+                        "tokens": len(prefix_ids),
+                        "blocks": blocks,
+                    }
+                    bound_self._recirculation_admission = {
+                        "mode": "coherent_cohorts",
+                        "width": cohort_width,
+                    }
+                    seeded = True
+                return manager
+
+            self._ensure_continuous_batching_manager = MethodType(ensure_manager, self)
+            try:
+                for cohort in _iter_cohorts(chain(preview, request_iter), cohort_width):
+                    yield from original_generate(cohort, batch_size=cohort_width)
+            finally:
+                self._ensure_continuous_batching_manager = original_ensure
+
+        return iterator()
+
+    session.generate_continuous = MethodType(generate_continuous, session)
+    try:
+        yield
+    finally:
+        session.generate_continuous = original_generate
+
+
 class PagedRecirculationForward:
     """Run tokenwise recirculation over Transformers packed paged-attention batches."""
 
@@ -242,6 +366,7 @@ class PagedRecirculationForward:
         positions: torch.Tensor,
         physical_write_indices: torch.Tensor,
         physical_read_indices: list[torch.Tensor] | None,
+        max_kv_length: int | None = None,
     ) -> dict:
         device = positions.device
         wave = {
@@ -270,7 +395,9 @@ class PagedRecirculationForward:
         wave["cu_seq_lens_k"] = torch.cat(
             (torch.zeros(1, device=device, dtype=cu_dtype), kv_lengths.cumsum(0))
         )
-        wave["max_seqlen_k"] = int(kv_lengths.max().item())
+        wave["max_seqlen_k"] = (
+            max_kv_length if max_kv_length is not None else int(kv_lengths.max().item())
+        )
         wave["write_index"] = [physical_write_indices]
 
         original_reads = kwargs["read_index"]
@@ -332,8 +459,12 @@ class PagedRecirculationForward:
             dtype=next(self.model.parameters()).dtype,
         )
         cu_q = kwargs["cu_seq_lens_q"]
-        sequence_count = len(cu_q) - 1
-        lengths = [int((cu_q[index + 1] - cu_q[index]).item()) for index in range(sequence_count)]
+        cu_q_values = cu_q.tolist()
+        sequence_count = len(cu_q_values) - 1
+        lengths = [
+            cu_q_values[index + 1] - cu_q_values[index]
+            for index in range(sequence_count)
+        ]
         output_hidden = torch.empty(
             (1, input_ids.shape[1], self.model.config.hidden_size),
             dtype=next(self.model.parameters()).dtype,
@@ -360,9 +491,10 @@ class PagedRecirculationForward:
 
         for offset in range(max(lengths)):
             sequence_indices = [index for index, length in enumerate(lengths) if offset < length]
-            query_indices = [int(cu_q[index].item()) + offset for index in sequence_indices]
+            query_indices = [cu_q_values[index] + offset for index in sequence_indices]
             query_tensor = torch.tensor(query_indices, device=input_ids.device, dtype=torch.long)
             current_positions = position_ids[0].index_select(0, query_tensor)
+            current_position_values = current_positions.tolist()
             block_table = kwargs.get("block_table")
             if block_table is None:
                 current_writes = original_write.index_select(0, query_tensor)
@@ -377,6 +509,7 @@ class PagedRecirculationForward:
                 current_positions,
                 current_writes,
                 read_pieces(sequence_indices, [offset] * len(sequence_indices)),
+                max(current_position_values) + 1,
             )
             current = self.decoder.embed_tokens(input_ids[:, query_tensor])
             destination = self._run_layers(
@@ -391,7 +524,7 @@ class PagedRecirculationForward:
             replay_physical = []
             replay_offsets = []
             for sequence_index, position in zip(
-                sequence_indices, current_positions.tolist(), strict=True
+                sequence_indices, current_position_values, strict=True
             ):
                 if position <= 0:
                     continue
@@ -399,7 +532,7 @@ class PagedRecirculationForward:
                 replay_offsets.append(offset - 1)
                 if block_table is None:
                     if offset > 0:
-                        previous_query = int(cu_q[sequence_index].item()) + offset - 1
+                        previous_query = cu_q_values[sequence_index] + offset - 1
                         replay_physical.append(original_write[previous_query])
                     else:
                         read_start = int(original_cu_k[sequence_index].item())
@@ -410,8 +543,10 @@ class PagedRecirculationForward:
             if replay_sequences:
                 replay_indices = torch.stack(replay_physical).to(dtype=torch.long)
                 replay_destination, replay_source, replay_steps = state.load(replay_indices)
-                if not torch.equal(replay_steps, current_positions[current_positions > 0] - 1):
-                    raise RuntimeError("paged recurrent state does not precede the current token")
+                torch._assert_async(
+                    torch.all(replay_steps == current_positions[current_positions > 0] - 1),
+                    "paged recurrent state does not precede the current token",
+                )
                 replay = self.mixer(
                     replay_destination.unsqueeze(0),
                     replay_source.unsqueeze(0),
@@ -426,6 +561,7 @@ class PagedRecirculationForward:
                     replay_positions,
                     replay_indices,
                     read_pieces(replay_sequences, replay_offsets),
+                    max(current_position_values),
                 )
                 self._run_layers(
                     replay,
@@ -464,8 +600,10 @@ class PagedRecirculationForward:
         elif isinstance(logits_to_keep, int) and logits_to_keep > 0:
             output_hidden = output_hidden[:, -logits_to_keep:]
         logits = project_causal_lm_logits(self.model, output_hidden)
-        if not bool(torch.isfinite(logits).all()):
-            raise RuntimeError("paged recirculation produced non-finite logits")
+        torch._assert_async(
+            torch.isfinite(logits).all(),
+            "paged recirculation produced non-finite logits",
+        )
         # Retain the most recent raw projection for the repository's numerical
         # gate.  This is detached and replaced on every scheduler iteration, so
         # it neither preserves an autograd graph nor grows with decode length.

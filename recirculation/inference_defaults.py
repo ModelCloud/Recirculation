@@ -35,6 +35,8 @@ def resolve_recirculation_cuda_defaults(args, *, flash_available: bool) -> tuple
 def resolve_dense_cuda_defaults(args, *, flash_available: bool) -> bool:
     """Mutate a dense-Evalution namespace and return whether all CUDA defaults were automatic."""
 
+    max_batch_tokens = getattr(args, "max_batch_tokens", None)
+    cuda_graph = getattr(args, "cuda_graph", None)
     auto_requested = all(
         value is None
         for value in (
@@ -42,6 +44,8 @@ def resolve_dense_cuda_defaults(args, *, flash_available: bool) -> bool:
             args.attention_backend,
             args.continuous_batching,
             args.paged_attention,
+            max_batch_tokens,
+            cuda_graph,
         )
     )
     if args.batch_size is None:
@@ -52,10 +56,26 @@ def resolve_dense_cuda_defaults(args, *, flash_available: bool) -> bool:
         args.paged_attention = flash_available
     if args.continuous_batching is None:
         args.continuous_batching = args.paged_attention
+    if cuda_graph is None:
+        # The repository-owned packed recirculation forward still consumes
+        # dynamic CUDA metadata on the host and is not graph-capture safe.
+        args.cuda_graph = False
+    if max_batch_tokens is None:
+        cache_capacity = int(getattr(args, "paged_num_blocks", 256)) * int(
+            getattr(args, "paged_block_size", 256)
+        )
+        request_capacity = (
+            int(args.batch_size)
+            * int(getattr(args, "max_blocks_per_request", 8))
+            * int(getattr(args, "paged_block_size", 256))
+        )
+        args.max_batch_tokens = min(cache_capacity, request_capacity)
     if args.paged_attention and not flash_available:
         raise ValueError(
             "paged attention requires FlashAttention 2; install flash-attn or pass --no-paged-attention"
         )
     if args.paged_attention and not args.continuous_batching:
         raise ValueError("--paged-attention requires --continuous-batching")
+    if args.cuda_graph and not args.paged_attention:
+        raise ValueError("--cuda-graph requires --paged-attention")
     return auto_requested and flash_available

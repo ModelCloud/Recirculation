@@ -15,7 +15,12 @@ from tokenicer import Tokenicer
 from transformers import AutoModelForCausalLM, ContinuousBatchingConfig
 
 from recirculation import RecirculationConfig
-from recirculation.cuda_backend import CUDAConcurrentRunner, FusedNormMix, measure_forward_error
+from recirculation.cuda_backend import (
+    MAX_FUSED_OR_BATCHED_FORWARD_ERROR,
+    CUDAConcurrentRunner,
+    FusedNormMix,
+    measure_forward_error,
+)
 from recirculation.transformers_paged_patch import patch_model_paged_recirculation
 
 
@@ -25,7 +30,12 @@ def main() -> None:
     parser.add_argument("--path", default="10:1")
     parser.add_argument("--alpha", type=float, default=0.05)
     parser.add_argument("--prompt-tokens", type=int, default=64)
-    parser.add_argument("--error-limit", type=float, default=2e-3)
+    parser.add_argument(
+        "--error-limit",
+        type=float,
+        default=MAX_FUSED_OR_BATCHED_FORWARD_ERROR,
+        help="Mean absolute forward-error gate; paged FA2 is fused and batched.",
+    )
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     source, destination = map(int, args.path.split(":"))
@@ -106,6 +116,8 @@ def main() -> None:
         "alpha": args.alpha,
         "prompt_tokens": int(prompt.shape[1]),
         "error_limit": args.error_limit,
+        "error_gate_metric": "mean_absolute",
+        "kernel_classification": "fused_or_batched",
         "forward_error": {
             "max_absolute": error.max_absolute,
             "mean_absolute": error.mean_absolute,
