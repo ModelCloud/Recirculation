@@ -56,3 +56,28 @@ forward-logit error, not the more punitive maximum error and not an aggregate ev
 - `git diff --check`: passed
 - Automatic 96 GB selection smoke test: 512 unique prompts / 2,048 choice requests
 
+## Long-context token-budgeted cohorts
+
+- Implementation commit: `17b2e17`
+- Automatic padded-token budget on this device: 524,288
+- Ordering: stable token-length sort with outputs restored to their original row/choice indices
+- Telemetry: cohort count, `rows×max_tokens` layout, and active cohort are logged
+
+The first 512 Humanities prompts average 1,960 tokens and reach 3,082 tokens,
+compared with 436 average and 664 maximum for the first 512 STEM prompts. A
+fixed 512-row cohort therefore made the evaluator appear stalled and grew to
+73 GB VRAM without returning after more than 12 minutes.
+
+| Humanities configuration | Cohort layout | Padded tokens | Result |
+|---|---|---:|---:|
+| Fixed width 512 | `512×3082` | 1,577,984 | incomplete after >12 min; 73 GB VRAM |
+| Length sorted, budget 524,288 | `238×2194, 190×2758, 84×3082` | 1,305,080 | 532.41 s; 0.962 rows/s; ~25.7 GB VRAM |
+
+The completed 512-row result was 248/512 (`acc,ll=48.44%`) with zero invalid
+predictions. The new path completed at least 1.35× sooner than the interrupted
+fixed-width lower bound and reduced observed VRAM by approximately 65%. Short
+STEM prompts remain in one 512-row cohort because their padded work fits the
+same token budget.
+
+Validation after the token-budget change: 134 passed, 25 skipped; Ruff and
+`git diff --check` passed.
