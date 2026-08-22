@@ -18,6 +18,7 @@ from scripts.evaluate import (
     _decode_cli_value,
     _gold_answer,
     _instruction,
+    _length_sorted_context_batches,
     _observe_evalution_generation_progress,
     _paired,
     _parse_benchmark_assignment,
@@ -296,6 +297,40 @@ def test_mmlu_auto_batch_tracks_post_load_free_vram(free_gib, expected):
     assert _auto_mmlu_unique_batch_size(free_gib << 30, minimum=1024) == 1024
 
 
+def test_length_sorted_context_batches_bound_padded_token_work():
+    contexts = [((1,) * length, f"row-{length}") for length in (10, 3, 8, 4, 12, 5)]
+
+    cohorts = list(
+        _length_sorted_context_batches(
+            contexts,
+            max_batch_size=4,
+            padded_token_budget=24,
+        )
+    )
+
+    assert [[len(prefix) for prefix, _value in cohort] for cohort in cohorts] == [
+        [3, 4, 5],
+        [8, 10],
+        [12],
+    ]
+    assert all(
+        len(cohort) <= 4 and len(cohort[-1][0]) * len(cohort) <= 24
+        for cohort in cohorts
+    )
+
+
+def test_length_sorted_context_batches_allow_one_over_budget_prompt():
+    cohorts = list(
+        _length_sorted_context_batches(
+            [((1,) * 100, "long")],
+            max_batch_size=8,
+            padded_token_budget=32,
+        )
+    )
+
+    assert cohorts == [[((1,) * 100, "long")]]
+
+
 def test_evalution_chunks_are_shifted_into_cuda_recirculation_targets():
     calls = []
 
@@ -374,9 +409,9 @@ def test_evalution_single_token_choices_share_prefixes_and_batch_unique_rows():
 
     assert calls == [
         (
-            [[1, 10, 11], [1, 20, 0]],
-            {1: ([1, 1, 1, 1], [101, 102, 103, 104]), 2: ([0, 0, 0, 0], [101, 102, 103, 104])},
-            [[1, 1, 1], [1, 1, 0]],
+            [[1, 20, 0], [1, 10, 11]],
+            {1: ([0, 0, 0, 0], [101, 102, 103, 104]), 2: ([1, 1, 1, 1], [101, 102, 103, 104])},
+            [[1, 1, 0], [1, 1, 1]],
         )
     ]
     assert [output.logprob for output in outputs] == pytest.approx(

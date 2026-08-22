@@ -513,6 +513,36 @@ def _auto_mmlu_unique_batch_size(free_device_bytes: int, *, minimum: int) -> int
     return max(minimum, automatic)
 
 
+def _length_sorted_context_batches(
+    contexts,
+    *,
+    max_batch_size: int,
+    padded_token_budget: int | None,
+):
+    """Yield stable length buckets bounded by padded token work."""
+
+    if max_batch_size < 1:
+        raise ValueError("maximum context batch size must be positive")
+    if padded_token_budget is not None and padded_token_budget < 1:
+        raise ValueError("padded context token budget must be positive when provided")
+    ordered = sorted(contexts, key=lambda item: len(item[0]))
+    cohort = []
+    for item in ordered:
+        padded_length = len(item[0])
+        exceeds_size = len(cohort) >= max_batch_size
+        exceeds_tokens = (
+            padded_token_budget is not None
+            and cohort
+            and padded_length * (len(cohort) + 1) > padded_token_budget
+        )
+        if exceeds_size or exceeds_tokens:
+            yield cohort
+            cohort = []
+        cohort.append(item)
+    if cohort:
+        yield cohort
+
+
 def _build_evalution_suite(benchmark: str, kwargs: dict[str, Any]):
     factory_name = "mmlu" if benchmark in MMLU_GROUP_ALIASES else benchmark
     kwargs = dict(kwargs)
@@ -545,7 +575,13 @@ def _build_evalution_suite(benchmark: str, kwargs: dict[str, Any]):
     return local_suite_type(**kwargs)
 
 
-def _score_recirculation_chunks(runner, chunks, *, batch_size: int):
+def _score_recirculation_chunks(
+    runner,
+    chunks,
+    *,
+    batch_size: int,
+    padded_token_budget: int | None = None,
+):
     """Score Evalution teacher-forcing chunks with paper-faithful CUDA replay."""
 
     if batch_size < 1:
@@ -554,7 +590,12 @@ def _score_recirculation_chunks(runner, chunks, *, batch_size: int):
         chunk.score_count == 1 and chunk.score_start == len(chunk.input_ids) - 1
         for chunk in chunks
     ):
-        return _score_shared_prefix_choices(runner, chunks, batch_size=batch_size)
+        return _score_shared_prefix_choices(
+            runner,
+            chunks,
+            batch_size=batch_size,
+            padded_token_budget=padded_token_budget,
+        )
     device = getattr(runner, "device", None)
     if device is None:
         device = next(runner.model.parameters()).device
@@ -609,7 +650,13 @@ def _score_recirculation_chunks(runner, chunks, *, batch_size: int):
     return outputs
 
 
-def _score_shared_prefix_choices(runner, chunks, *, batch_size: int):
+def _score_shared_prefix_choices(
+    runner,
+    chunks,
+    *,
+    batch_size: int,
+    padded_token_budget: int | None,
+):
     """Score one-token choices once per unique context instead of once per choice."""
 
     device = getattr(runner, "device", None)
@@ -627,9 +674,32 @@ def _score_shared_prefix_choices(runner, chunks, *, batch_size: int):
     if isinstance(pad_token_id, (list, tuple)):
         pad_token_id = pad_token_id[0]
 
-    for start in range(0, len(unique_contexts), batch_size):
-        context_batch = unique_contexts[start : start + batch_size]
+    context_batches = list(
+        _length_sorted_context_batches(
+            unique_contexts,
+            max_batch_size=batch_size,
+            padded_token_budget=padded_token_budget,
+        )
+    )
+    logger = get_logger()
+    logger.info(
+        "recirculation likelihood cohorts: unique_contexts=%d cohorts=%d layout=%s",
+        len(unique_contexts),
+        len(context_batches),
+        ",".join(
+            f"{len(cohort)}x{max(len(prefix) for prefix, _items in cohort)}"
+            for cohort in context_batches
+        ),
+    )
+    for cohort_index, context_batch in enumerate(context_batches, start=1):
         padded_length = max(len(prefix) for prefix, _items in context_batch)
+        logger.info(
+            "recirculation likelihood cohort active: %d/%d rows=%d padded_tokens=%d",
+            cohort_index,
+            len(context_batches),
+            len(context_batch),
+            len(context_batch) * padded_length,
+        )
         tokens = torch.full(
             (len(context_batch), padded_length),
             int(pad_token_id or 0),
@@ -684,6 +754,7 @@ def _patch_evalution_recirculation_scoring(
     config: RecirculationConfig,
     *,
     unique_batch_size: int,
+    padded_token_budget: int | None,
 ):
     """Route Evalution log-likelihood batches through the CUDA replay runner."""
 
@@ -701,7 +772,12 @@ def _patch_evalution_recirculation_scoring(
 
     def score_chunks(_session, chunks, *, batch_size):
         del batch_size
-        return _score_recirculation_chunks(runner, chunks, batch_size=unique_batch_size)
+        return _score_recirculation_chunks(
+            runner,
+            chunks,
+            batch_size=unique_batch_size,
+            padded_token_budget=padded_token_budget,
+        )
 
     session_type._score_chunks = score_chunks
     try:
@@ -903,6 +979,15 @@ def _dense_evalution_main(argv: list[str]) -> int:
             "cache-safe value from the paged-cache geometry (65,536 with defaults)."
         ),
     )
+    parser.add_argument(
+        "--mmlu-scoring-token-budget",
+        type=int,
+        default=None,
+        help=(
+            "Maximum padded prompt tokens per recirculation likelihood cohort. "
+            "CUDA auto mode uses 1,024 tokens per selected unique-prompt slot."
+        ),
+    )
     parser.add_argument("--max-blocks-per-request", type=int, default=8)
     parser.add_argument("--paged-num-blocks", type=int, default=256)
     parser.add_argument("--paged-block-size", type=int, default=256)
@@ -955,6 +1040,8 @@ def _dense_evalution_main(argv: list[str]) -> int:
         args.paged_block_size,
     ) < 1:
         parser.error("paged scheduler sizes must be positive")
+    if args.mmlu_scoring_token_budget is not None and args.mmlu_scoring_token_budget < 1:
+        parser.error("--mmlu-scoring-token-budget must be positive")
     if args.max_rows is not None and args.max_rows < 1:
         parser.error("--max-rows must be positive")
     if args.report_every_seconds <= 0:
@@ -1041,6 +1128,7 @@ def _dense_evalution_main(argv: list[str]) -> int:
 
     started = time.perf_counter()
     mmlu_scoring_batch_size = args.batch_size
+    mmlu_scoring_token_budget = args.mmlu_scoring_token_budget
     suite_status = [
         {
             "benchmark": benchmark,
@@ -1175,6 +1263,16 @@ def _dense_evalution_main(argv: list[str]) -> int:
                         4 * mmlu_scoring_batch_size,
                         free_device_bytes / (1 << 30),
                     )
+                if mmlu_scoring_token_budget is None:
+                    mmlu_scoring_token_budget = 1024 * mmlu_scoring_batch_size
+                if any(
+                    benchmark == "mmlu" or benchmark in MMLU_GROUP_ALIASES
+                    for benchmark in args.benchmark
+                ):
+                    logger.info(
+                        "MMLU recirculation token budget: padded_tokens=%d",
+                        mmlu_scoring_token_budget,
+                    )
                 for index, (benchmark, suite) in enumerate(
                     zip(args.benchmark, suites, strict=True)
                 ):
@@ -1204,6 +1302,7 @@ def _dense_evalution_main(argv: list[str]) -> int:
                             evaluation._session,
                             recirculation_config,
                             unique_batch_size=mmlu_scoring_batch_size,
+                            padded_token_budget=mmlu_scoring_token_budget,
                         )
                     run_suite(index, suite, patch)
             result = evaluation.result().to_dict()
@@ -1228,6 +1327,7 @@ def _dense_evalution_main(argv: list[str]) -> int:
         "paged_attention_requested": args.paged_attention,
         "cuda_graph": args.cuda_graph,
         "mmlu_unique_scoring_batch_size": mmlu_scoring_batch_size,
+        "mmlu_scoring_token_budget": mmlu_scoring_token_budget,
         "recirculation_prefix_seed": getattr(
             getattr(evaluation, "_session", None), "_recirculation_prefix_seed", None
         ),
