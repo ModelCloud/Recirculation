@@ -491,6 +491,9 @@ def _build_evalution_suite(benchmark: str, kwargs: dict[str, Any]):
     kwargs = dict(kwargs)
     if benchmark in MMLU_GROUP_ALIASES:
         kwargs.setdefault("subsets", MMLU_GROUP_ALIASES[benchmark])
+        # A materialized local Dataset lets the progress observer count the
+        # selected subjects before MMLU begins its four-choice request stream.
+        kwargs.setdefault("stream", False)
     factory = EVALUTION_BENCHMARK_FACTORIES.get(factory_name)
     if factory is None:
         raise ValueError(
@@ -611,20 +614,21 @@ def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
 
 @contextmanager
 def _observe_evalution_generation_progress(suite, callback):
-    """Expose exact BaseTestSuite partial metrics hidden by headless LogBar."""
+    """Expose exact generation and multiple-choice row progress from Evalution."""
 
     import evalution.benchmarks.base as benchmark_base
 
     suite_type = type(suite)
-    if not hasattr(suite_type, "score_progress_title"):
-        yield
-        return
-    had_local_title = "score_progress_title" in suite_type.__dict__
-    local_title = suite_type.__dict__.get("score_progress_title")
-    resolved_title = suite_type.score_progress_title
-    original_manual_progress = benchmark_base.manual_progress
+    has_score_title = hasattr(suite_type, "score_progress_title")
+    had_local_title = has_score_title and "score_progress_title" in suite_type.__dict__
+    local_title = suite_type.__dict__.get("score_progress_title") if has_score_title else None
+    resolved_title = suite_type.score_progress_title if has_score_title else None
+    had_local_estimator = "_estimated_total_for_split" in suite_type.__dict__
+    local_estimator = suite_type.__dict__.get("_estimated_total_for_split")
+    resolved_estimator = getattr(suite_type, "_estimated_total_for_split", None)
 
     def score_progress_title(self, *, processed, aggregate_scores, invalid_predictions):
+        assert resolved_title is not None
         title = resolved_title(
             self,
             processed=processed,
@@ -639,24 +643,88 @@ def _observe_evalution_generation_progress(suite, callback):
             )
         return title
 
-    def manual_progress(total, *args, **kwargs):
-        title = kwargs.get("title")
-        if title is None and args:
-            title = args[0]
-        if isinstance(title, str) and ": scoring" in title:
+    def estimated_total(self, *, loaded_docs, split):
+        assert resolved_estimator is not None
+        total = resolved_estimator(self, loaded_docs=loaded_docs, split=split)
+        if total is None and self is suite and hasattr(loaded_docs, "column_names"):
+            selected = self._selected_subjects()
+            if selected is not None and "subject" in loaded_docs.column_names:
+                total = sum(
+                    self._normalize_subset_token(subject) in selected
+                    if hasattr(self, "_normalize_subset_token")
+                    else str(subject).strip().lower().replace(" ", "_") in selected
+                    for subject in loaded_docs["subject"]
+                )
+                if self.max_rows is not None:
+                    total = min(total, self.max_rows)
+        if self is suite and total is not None:
             callback(total=int(total))
-        return original_manual_progress(total, *args, **kwargs)
+        return total
 
-    suite_type.score_progress_title = score_progress_title
-    benchmark_base.manual_progress = manual_progress
+    manual_progress_targets = {benchmark_base}
+    suite_module = sys.modules.get(suite_type.__module__)
+    if suite_module is not None and hasattr(suite_module, "manual_progress"):
+        manual_progress_targets.add(suite_module)
+    original_manual_progress = {
+        module: module.manual_progress for module in manual_progress_targets
+    }
+
+    def wrap_manual_progress(original):
+        def manual_progress(total, *args, **kwargs):
+            title = kwargs.get("title")
+            if title is None and args:
+                title = args[0]
+            progress = original(total, *args, **kwargs)
+            if not isinstance(title, str):
+                return progress
+            if "scoring answer choices" in title:
+                callback(total=int(total) // 4)
+                completed_requests = 0
+
+                class ChoiceProgressObserver:
+                    def next(self, *next_args, **next_kwargs):
+                        nonlocal completed_requests
+                        result = progress.next(*next_args, **next_kwargs)
+                        completed_requests += 1
+                        if completed_requests % 4 == 0:
+                            callback(
+                                processed=completed_requests // 4,
+                                aggregate_scores={},
+                                invalid_predictions=0,
+                            )
+                        return result
+
+                    def __getattr__(self, name):
+                        return getattr(progress, name)
+
+                return ChoiceProgressObserver()
+            if ": scoring" in title:
+                callback(total=int(total))
+            return progress
+
+        return manual_progress
+
+    if has_score_title:
+        suite_type.score_progress_title = score_progress_title
+    if resolved_estimator is not None:
+        suite_type._estimated_total_for_split = estimated_total
+    for module, original in original_manual_progress.items():
+        module.manual_progress = wrap_manual_progress(original)
     try:
         yield
     finally:
-        benchmark_base.manual_progress = original_manual_progress
-        if had_local_title:
-            suite_type.score_progress_title = local_title
-        else:
-            delattr(suite_type, "score_progress_title")
+        for module, original in original_manual_progress.items():
+            module.manual_progress = original
+        if has_score_title:
+            if had_local_title:
+                suite_type.score_progress_title = local_title
+            else:
+                delattr(suite_type, "score_progress_title")
+        if resolved_estimator is not None:
+            if had_local_estimator:
+                suite_type._estimated_total_for_split = local_estimator
+            else:
+                delattr(suite_type, "_estimated_total_for_split")
 
 
 def _dense_evalution_main(argv: list[str]) -> int:

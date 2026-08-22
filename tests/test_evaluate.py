@@ -265,6 +265,8 @@ def test_generic_suite_loader_supports_named_mmlu_groups():
 
     assert stem.task_name() == "mmlu_stem"
     assert humanities.task_name() == "mmlu_humanities"
+    assert stem.stream is False
+    assert humanities.stream is False
 
 
 def test_evalution_chunks_are_shifted_into_cuda_recirculation_targets():
@@ -348,6 +350,53 @@ def test_evalution_generation_progress_exposes_exact_partial_scores(monkeypatch)
             "invalid_predictions": 1,
         },
     ]
+
+
+def test_evalution_mmlu_progress_reports_completed_rows(monkeypatch):
+    import importlib
+
+    mmlu_module = importlib.import_module("evalution.benchmarks.mmlu")
+
+    events = []
+
+    class Progress:
+        def next(self):
+            return self
+
+        def draw(self):
+            return self
+
+    class Suite:
+        __module__ = mmlu_module.__name__
+        max_rows = None
+
+        @staticmethod
+        def _selected_subjects():
+            return {"abstract_algebra"}
+
+        def _estimated_total_for_split(self, *, loaded_docs, split):
+            del self, loaded_docs, split
+            return 3
+
+    monkeypatch.setattr(mmlu_module, "manual_progress", lambda *_args, **_kwargs: Progress())
+    suite = Suite()
+    with _observe_evalution_generation_progress(suite, lambda **values: events.append(values)):
+        assert suite._estimated_total_for_split(loaded_docs=[], split="test") == 3
+        progress = mmlu_module.manual_progress(12, title="mmlu_stem: scoring answer choices")
+        for _ in range(8):
+            progress.next().draw()
+
+    assert {"total": 3} in events
+    assert {
+        "processed": 1,
+        "aggregate_scores": {},
+        "invalid_predictions": 0,
+    } in events
+    assert {
+        "processed": 2,
+        "aggregate_scores": {},
+        "invalid_predictions": 0,
+    } in events
 
 
 def test_generic_evalution_runner_reuses_one_model_for_multiple_suites(monkeypatch, tmp_path):
