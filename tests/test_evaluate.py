@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import sys
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -16,6 +17,7 @@ from scripts.evaluate import (
     _candidate_specs,
     _common_prefix_length,
     _decode_cli_value,
+    _DenseSharedPrefixScoringRunner,
     _gold_answer,
     _instruction,
     _length_sorted_context_batches,
@@ -329,6 +331,59 @@ def test_length_sorted_context_batches_allow_one_over_budget_prompt():
     )
 
     assert cohorts == [[((1,) * 100, "long")]]
+
+
+def test_dense_shared_prefix_runner_scores_targets_in_position_order():
+    torch = pytest.importorskip("torch")
+
+    class Decoder:
+        @staticmethod
+        def __call__(input_ids, **_kwargs):
+            hidden = torch.nn.functional.one_hot(input_ids % 4, num_classes=4).float()
+            return SimpleNamespace(last_hidden_state=hidden)
+
+    class Model:
+        config = SimpleNamespace(final_logit_softcapping=None)
+
+        def __init__(self):
+            self.decoder = Decoder()
+            self.output = torch.nn.Linear(4, 8, bias=False)
+            with torch.no_grad():
+                self.output.weight.copy_(torch.arange(32).reshape(8, 4) / 16)
+
+        def get_decoder(self):
+            return self.decoder
+
+        def get_output_embeddings(self):
+            return self.output
+
+    session = SimpleNamespace(
+        model=Model(),
+        input_device=torch.device("cpu"),
+        _scoring_attention_context=nullcontext,
+    )
+    runner = _DenseSharedPrefixScoringRunner(session)
+    tokens = torch.tensor([[1, 2, 3], [2, 3, 0]])
+    targets_by_position = {1: ([1, 1], [4, 5]), 2: ([0, 0], [6, 7])}
+
+    losses = runner.score_target_losses(
+        tokens,
+        targets_by_position,
+        attention_mask=torch.tensor([[1, 1, 1], [1, 1, 0]]),
+    )
+
+    hidden = torch.stack(
+        (
+            torch.nn.functional.one_hot(torch.tensor(3), num_classes=4).float(),
+            torch.nn.functional.one_hot(torch.tensor(3), num_classes=4).float(),
+            torch.nn.functional.one_hot(torch.tensor(3), num_classes=4).float(),
+            torch.nn.functional.one_hot(torch.tensor(3), num_classes=4).float(),
+        )
+    )
+    logits = session.model.output(hidden).float()
+    targets = torch.tensor([4, 5, 6, 7])
+    expected = torch.logsumexp(logits, dim=-1) - logits.gather(1, targets[:, None])[:, 0]
+    torch.testing.assert_close(torch.tensor(losses), expected)
 
 
 def test_evalution_chunks_are_shifted_into_cuda_recirculation_targets():

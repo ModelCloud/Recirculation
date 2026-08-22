@@ -47,6 +47,7 @@ from recirculation import (
     RecirculationConfig,
     RecirculationController,
 )
+from recirculation.controller import project_causal_lm_logits
 from recirculation.inference_defaults import resolve_dense_cuda_defaults
 
 DEFAULT_MODEL = "/local-models/Llama-3.2-1B-Instruct"
@@ -748,6 +749,77 @@ def _score_shared_prefix_choices(
     return outputs
 
 
+class _DenseSharedPrefixScoringRunner:
+    """Score sparse one-token targets with one ordinary dense prefill per context."""
+
+    def __init__(self, session):
+        self.session = session
+        self.model = session.model
+        self.device = session.input_device
+
+    @torch.inference_mode()
+    def score_target_losses(
+        self,
+        tokens: torch.Tensor,
+        targets_by_position: dict[int, tuple[list[int], list[int]]],
+        *,
+        attention_mask: torch.Tensor,
+    ) -> list[float]:
+        tokens = tokens.to(device=self.device, dtype=torch.long)
+        attention_mask = attention_mask.to(device=self.device)
+        with self.session._scoring_attention_context():
+            output = self.model.get_decoder()(
+                input_ids=tokens,
+                attention_mask=attention_mask,
+                use_cache=False,
+                return_dict=True,
+            )
+        hidden = []
+        targets = []
+        for position in sorted(targets_by_position):
+            rows, target_values = targets_by_position[position]
+            row_indices = torch.tensor(rows, dtype=torch.long, device=self.device)
+            hidden.append(output.last_hidden_state[row_indices, position])
+            targets.extend(target_values)
+        selected_hidden = torch.cat(hidden, dim=0)
+        target_tensor = torch.tensor(targets, dtype=torch.long, device=self.device)
+        logits = project_causal_lm_logits(self.model, selected_hidden).float()
+        losses = torch.logsumexp(logits, dim=-1) - logits.gather(
+            1,
+            target_tensor[:, None],
+        )[:, 0]
+        return losses.tolist()
+
+
+@contextmanager
+def _patch_evalution_dense_shared_prefix_scoring(
+    session,
+    *,
+    unique_batch_size: int,
+    padded_token_budget: int | None,
+):
+    """Give dense MMLU the same choice consolidation and cohort geometry."""
+
+    runner = _DenseSharedPrefixScoringRunner(session)
+    session_type = type(session)
+    original_score_chunks = session_type._score_chunks
+
+    def score_chunks(_session, chunks, *, batch_size):
+        del batch_size
+        return _score_recirculation_chunks(
+            runner,
+            chunks,
+            batch_size=unique_batch_size,
+            padded_token_budget=padded_token_budget,
+        )
+
+    session_type._score_chunks = score_chunks
+    try:
+        yield
+    finally:
+        session_type._score_chunks = original_score_chunks
+
+
 @contextmanager
 def _patch_evalution_recirculation_scoring(
     session,
@@ -984,7 +1056,7 @@ def _dense_evalution_main(argv: list[str]) -> int:
         type=int,
         default=None,
         help=(
-            "Maximum padded prompt tokens per recirculation likelihood cohort. "
+            "Maximum padded prompt tokens per shared-prefix MMLU likelihood cohort. "
             "CUDA auto mode uses 1,024 tokens per selected unique-prompt slot."
         ),
     )
@@ -1230,49 +1302,72 @@ def _dense_evalution_main(argv: list[str]) -> int:
             live_status["active_suite"] = None
             write_live_status()
 
+        def ensure_evaluation_session() -> None:
+            if evaluation._session is not None:
+                return
+            from evalution.runtime import _describe_execution
+
+            evaluation._session = engine.build(evaluation._model_config)
+            evaluation._execution = _describe_execution(evaluation._session)
+
+        mmlu_scoring_configured = False
+
+        def configure_mmlu_scoring() -> None:
+            nonlocal mmlu_scoring_batch_size
+            nonlocal mmlu_scoring_configured
+            nonlocal mmlu_scoring_token_budget
+            if mmlu_scoring_configured:
+                return
+            ensure_evaluation_session()
+            if args.cuda_auto_optimized:
+                free_device_bytes, _total_device_bytes = torch.cuda.mem_get_info(
+                    torch.device(args.device)
+                )
+                mmlu_scoring_batch_size = _auto_mmlu_unique_batch_size(
+                    free_device_bytes,
+                    minimum=args.batch_size,
+                )
+                logger.info(
+                    "MMLU scoring auto batch: unique_prompts=%d choice_requests=%d "
+                    "free_vram_gib=%.2f",
+                    mmlu_scoring_batch_size,
+                    4 * mmlu_scoring_batch_size,
+                    free_device_bytes / (1 << 30),
+                )
+            if mmlu_scoring_token_budget is None:
+                mmlu_scoring_token_budget = 1024 * mmlu_scoring_batch_size
+            logger.info(
+                "MMLU scoring token budget: padded_tokens=%d",
+                mmlu_scoring_token_budget,
+            )
+            mmlu_scoring_configured = True
+
         try:
             if recirculation_config is None:
-                for index, suite in enumerate(suites):
-                    run_suite(index, suite, nullcontext())
+                for index, (benchmark, suite) in enumerate(
+                    zip(args.benchmark, suites, strict=True)
+                ):
+                    if cuda_device and (
+                        benchmark == "mmlu" or benchmark in MMLU_GROUP_ALIASES
+                    ):
+                        configure_mmlu_scoring()
+                        suite.batch_size = 4 * mmlu_scoring_batch_size
+                        patch = _patch_evalution_dense_shared_prefix_scoring(
+                            evaluation._session,
+                            unique_batch_size=mmlu_scoring_batch_size,
+                            padded_token_budget=mmlu_scoring_token_budget,
+                        )
+                    else:
+                        patch = nullcontext()
+                    run_suite(index, suite, patch)
             else:
-                from evalution.runtime import _describe_execution
-
                 from recirculation.cuda_backend import FusedNormMix
                 from recirculation.transformers_paged_patch import (
                     patch_evalution_paged_prefix_seeding,
                     patch_model_paged_recirculation,
                 )
 
-                evaluation._session = engine.build(evaluation._model_config)
-                evaluation._execution = _describe_execution(evaluation._session)
-                if args.cuda_auto_optimized and any(
-                    benchmark == "mmlu" or benchmark in MMLU_GROUP_ALIASES
-                    for benchmark in args.benchmark
-                ):
-                    free_device_bytes, _total_device_bytes = torch.cuda.mem_get_info(
-                        torch.device(args.device)
-                    )
-                    mmlu_scoring_batch_size = _auto_mmlu_unique_batch_size(
-                        free_device_bytes,
-                        minimum=args.batch_size,
-                    )
-                    logger.info(
-                        "MMLU recirculation auto batch: unique_prompts=%d choice_requests=%d "
-                        "free_vram_gib=%.2f",
-                        mmlu_scoring_batch_size,
-                        4 * mmlu_scoring_batch_size,
-                        free_device_bytes / (1 << 30),
-                    )
-                if mmlu_scoring_token_budget is None:
-                    mmlu_scoring_token_budget = 1024 * mmlu_scoring_batch_size
-                if any(
-                    benchmark == "mmlu" or benchmark in MMLU_GROUP_ALIASES
-                    for benchmark in args.benchmark
-                ):
-                    logger.info(
-                        "MMLU recirculation token budget: padded_tokens=%d",
-                        mmlu_scoring_token_budget,
-                    )
+                ensure_evaluation_session()
                 for index, (benchmark, suite) in enumerate(
                     zip(args.benchmark, suites, strict=True)
                 ):
@@ -1297,6 +1392,7 @@ def _dense_evalution_main(argv: list[str]) -> int:
                         patch = paged_generation_patch()
                     else:
                         if benchmark == "mmlu" or benchmark in MMLU_GROUP_ALIASES:
+                            configure_mmlu_scoring()
                             suite.batch_size = 4 * mmlu_scoring_batch_size
                         patch = _patch_evalution_recirculation_scoring(
                             evaluation._session,
@@ -1327,6 +1423,7 @@ def _dense_evalution_main(argv: list[str]) -> int:
         "paged_attention_requested": args.paged_attention,
         "cuda_graph": args.cuda_graph,
         "mmlu_unique_scoring_batch_size": mmlu_scoring_batch_size,
+        "mmlu_choice_request_batch_size": 4 * mmlu_scoring_batch_size,
         "mmlu_scoring_token_budget": mmlu_scoring_token_budget,
         "recirculation_prefix_seed": getattr(
             getattr(evaluation, "_session", None), "_recirculation_prefix_seed", None
