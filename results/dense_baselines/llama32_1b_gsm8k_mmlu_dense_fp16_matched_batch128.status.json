@@ -1,0 +1,48 @@
+{
+  "active_suite": null,
+  "elapsed_seconds": 245.43719526939094,
+  "output": "/root/Recirculation/results/dense_baselines/llama32_1b_gsm8k_mmlu_dense_fp16_matched_batch128.json",
+  "status": "complete",
+  "suites": [
+    {
+      "benchmark": "gsm8k_platinum",
+      "completed_rows": 1209,
+      "invalid_predictions": 0,
+      "metric_totals": {
+        "acc,num": 588.0
+      },
+      "metrics": {
+        "acc,num": 0.48635235732009924
+      },
+      "name": "gsm8k_platinum_cot_llama",
+      "state": "complete",
+      "total_rows": 1209
+    },
+    {
+      "benchmark": "mmlu_stem",
+      "completed_rows": 3153,
+      "invalid_predictions": 0,
+      "metric_totals": {},
+      "metrics": {
+        "acc,ll": 0.4005708848715509,
+        "acc,ll_avg": 0.4005708848715509
+      },
+      "name": "mmlu_stem",
+      "state": "complete",
+      "total_rows": 3153
+    },
+    {
+      "benchmark": "mmlu_humanities",
+      "completed_rows": 4705,
+      "invalid_predictions": 0,
+      "metric_totals": {},
+      "metrics": {
+        "acc,ll": 0.4308182784272051,
+        "acc,ll_avg": 0.4308182784272051
+      },
+      "name": "mmlu_humanities",
+      "state": "complete",
+      "total_rows": 4705
+    }
+  ]
+}
