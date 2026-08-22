@@ -479,12 +479,54 @@ class PagedRecirculationForward:
         wave["cu_seq_lens_q"] = torch.arange(count + 1, device=device, dtype=cu_dtype)
         wave["max_seqlen_q"] = 1
         kv_lengths = (positions + 1).to(dtype=cu_dtype)
-        wave["cu_seq_lens_k"] = torch.cat(
+        cumulative_full = torch.cat(
             (torch.zeros(1, device=device, dtype=cu_dtype), kv_lengths.cumsum(0))
         )
-        wave["max_seqlen_k"] = (
-            max_kv_length if max_kv_length is not None else int(kv_lengths.max().item())
-        )
+        original_cu_k = kwargs.get("cu_seq_lens_k")
+        if isinstance(original_cu_k, dict) and "sliding_attention" in original_cu_k:
+            # Gemma alternates full and sliding attention groups.  Preserve
+            # both cumulative-length streams; using the full stream for local
+            # layers overstates their KV span for mixed-length cohorts and can
+            # make FA2's sliding sentinel scatter exceed its source tensor.
+            cache = kwargs["cache"]
+            cache_config = getattr(cache, "config", None)
+            sliding_window = int(
+                getattr(cache_config, "sliding_window", None)
+                or getattr(cache, "sliding_window", 1)
+                or 1
+            )
+            sliding_lengths = torch.minimum(
+                kv_lengths,
+                torch.full_like(kv_lengths, sliding_window),
+            )
+            cumulative_sliding = torch.cat(
+                (
+                    torch.zeros(1, device=device, dtype=cu_dtype),
+                    sliding_lengths.cumsum(0),
+                )
+            )
+            wave["cu_seq_lens_k"] = {
+                key: (cumulative_sliding if key == "sliding_attention" else cumulative_full)
+                for key in original_cu_k
+            }
+            wave["max_seqlen_k"] = {
+                key: max(
+                    1,
+                    int(
+                        sliding_lengths.max().item()
+                        if key == "sliding_attention"
+                        else kv_lengths.max().item()
+                    ),
+                )
+                for key in original_cu_k
+            }
+        else:
+            wave["cu_seq_lens_k"] = cumulative_full
+            wave["max_seqlen_k"] = (
+                max_kv_length
+                if max_kv_length is not None
+                else int(kv_lengths.max().item())
+            )
         wave["write_index"] = (
             physical_write_indices
             if isinstance(physical_write_indices, list)
@@ -493,16 +535,9 @@ class PagedRecirculationForward:
 
         original_reads = kwargs["read_index"]
         wave_reads = []
-        concatenated_reads = (
-            torch.cat(physical_read_indices)
-            if physical_read_indices and kwargs.get("block_table") is None
-            else None
-        )
         for group_index, group_reads in enumerate(original_reads):
             if physical_read_indices is None:
                 wave_reads.append(group_reads[:0])
-            elif concatenated_reads is not None:
-                wave_reads.append(concatenated_reads)
             elif group_index < len(physical_read_indices):
                 wave_reads.append(physical_read_indices[group_index])
             else:
@@ -573,22 +608,34 @@ class PagedRecirculationForward:
         original_write_by_group = list(kwargs["write_index"])
         original_write = original_write_by_group[0]
         original_cu_k = self._single_group(kwargs["cu_seq_lens_k"])
-        original_read = kwargs["read_index"][0]
+        original_read = kwargs["read_index"][state.state_group]
+        representative_layers = {}
+        mapping = cache.layer_index_to_group_indices
+        layer_items = mapping.items() if hasattr(mapping, "items") else enumerate(mapping)
+        for layer_index, (group_index, _layer_in_group) in layer_items:
+            representative_layers.setdefault(group_index, layer_index)
+
+        def group_window(group_index: int) -> int:
+            layer_index = representative_layers.get(group_index)
+            windows = getattr(cache, "sliding_windows", {})
+            return int(windows.get(layer_index, 1) or 1)
 
         def read_pieces(active_sequences: list[int], through_offsets: list[int]):
             if kwargs.get("block_table") is not None:
                 return None
-            pieces = []
-            for sequence_index, through_offset in zip(
-                active_sequences, through_offsets, strict=True
-            ):
-                query_start = int(cu_q[sequence_index].item())
-                prefix_length = int(position_ids[0, query_start].item())
-                read_start = int(original_cu_k[sequence_index].item())
-                prefix = original_read[read_start : read_start + prefix_length]
-                current = original_write[query_start : query_start + through_offset + 1]
-                pieces.append(torch.cat((prefix, current)))
-            return pieces
+            group_pieces = []
+            for group_index, group_write in enumerate(original_write_by_group):
+                window = group_window(group_index)
+                pieces = []
+                for sequence_index, through_offset in zip(
+                    active_sequences, through_offsets, strict=True
+                ):
+                    query_start = cu_q_values[sequence_index]
+                    query_end = query_start + through_offset + 1
+                    query_begin = query_start + max(0, through_offset - window + 1)
+                    pieces.append(group_write[query_begin:query_end])
+                group_pieces.append(torch.cat(pieces) if pieces else group_write[:0])
+            return group_pieces
 
         for offset in range(max(lengths)):
             sequence_indices = [index for index, length in enumerate(lengths) if offset < length]
