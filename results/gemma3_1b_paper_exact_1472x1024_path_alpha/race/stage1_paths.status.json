@@ -1,0 +1,2298 @@
+{
+  "active_paths": [],
+  "aggregate": {
+    "active": 0,
+    "complete": 325,
+    "elapsed_seconds": 5329.17197942175,
+    "estimated_path_seconds": 16.3172348291169,
+    "mean_completed_path_seconds": 16.3172348291169,
+    "pending": 0,
+    "sweep_eta_seconds": 0.0,
+    "total": 325
+  },
+  "completed_paths": [
+    {
+      "alpha": 0.05,
+      "destination_layer": 13,
+      "scan_index": 0,
+      "seconds": 14.814958058297634,
+      "source_layer": 19
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 13,
+      "scan_index": 1,
+      "seconds": 14.814958058297634,
+      "source_layer": 18
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 13,
+      "scan_index": 2,
+      "seconds": 14.814958058297634,
+      "source_layer": 14
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 5,
+      "scan_index": 3,
+      "seconds": 17.78959234757349,
+      "source_layer": 23
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 22,
+      "scan_index": 4,
+      "seconds": 11.367785394191742,
+      "source_layer": 24
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 7,
+      "scan_index": 5,
+      "seconds": 16.9921030360274,
+      "source_layer": 24
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 2,
+      "scan_index": 6,
+      "seconds": 18.70014880457893,
+      "source_layer": 11
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 4,
+      "scan_index": 7,
+      "seconds": 18.032032054150477,
+      "source_layer": 19
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 9,
+      "scan_index": 8,
+      "seconds": 15.667086786357686,
+      "source_layer": 21
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 5,
+      "scan_index": 9,
+      "seconds": 17.78959234757349,
+      "source_layer": 10
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 5,
+      "scan_index": 10,
+      "seconds": 17.78959234757349,
+      "source_layer": 11
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 4,
+      "scan_index": 11,
+      "seconds": 18.032032054150477,
+      "source_layer": 25
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 2,
+      "scan_index": 12,
+      "seconds": 18.70014880457893,
+      "source_layer": 17
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 7,
+      "scan_index": 13,
+      "seconds": 16.9921030360274,
+      "source_layer": 8
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 1,
+      "scan_index": 14,
+      "seconds": 18.86056786472909,
+      "source_layer": 7
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 9,
+      "scan_index": 15,
+      "seconds": 15.667086786357686,
+      "source_layer": 12
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 2,
+      "scan_index": 16,
+      "seconds": 18.70014880457893,
+      "source_layer": 24
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 11,
+      "scan_index": 17,
+      "seconds": 15.456547395559028,
+      "source_layer": 21
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 3,
+      "scan_index": 18,
+      "seconds": 18.548317858716473,
+      "source_layer": 8
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 3,
+      "scan_index": 19,
+      "seconds": 18.548317858716473,
+      "source_layer": 13
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 9,
+      "scan_index": 20,
+      "seconds": 15.667086786357686,
+      "source_layer": 11
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 0,
+      "scan_index": 21,
+      "seconds": 19.534919636324048,
+      "source_layer": 17
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 12,
+      "scan_index": 22,
+      "seconds": 15.009387160651386,
+      "source_layer": 23
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 5,
+      "scan_index": 23,
+      "seconds": 17.78959234757349,
+      "source_layer": 18
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 3,
+      "scan_index": 24,
+      "seconds": 18.548317858716473,
+      "source_layer": 9
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 14,
+      "scan_index": 25,
+      "seconds": 14.588032351108268,
+      "source_layer": 23
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 4,
+      "scan_index": 26,
+      "seconds": 18.032032054150477,
+      "source_layer": 15
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 8,
+      "scan_index": 27,
+      "seconds": 16.785965869901702,
+      "source_layer": 21
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 0,
+      "scan_index": 28,
+      "seconds": 19.534919636324048,
+      "source_layer": 24
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 2,
+      "scan_index": 29,
+      "seconds": 18.70014880457893,
+      "source_layer": 22
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 15,
+      "scan_index": 30,
+      "seconds": 14.174939059419557,
+      "source_layer": 16
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 8,
+      "scan_index": 31,
+      "seconds": 16.785965869901702,
+      "source_layer": 22
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 5,
+      "scan_index": 32,
+      "seconds": 17.907393841072917,
+      "source_layer": 24
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 19,
+      "scan_index": 33,
+      "seconds": 12.77465962502174,
+      "source_layer": 22
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 15,
+      "scan_index": 34,
+      "seconds": 14.174939059419557,
+      "source_layer": 23
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 15,
+      "scan_index": 35,
+      "seconds": 14.174939059419557,
+      "source_layer": 25
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 0,
+      "scan_index": 36,
+      "seconds": 19.534919636324048,
+      "source_layer": 10
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 3,
+      "scan_index": 37,
+      "seconds": 18.548317858716473,
+      "source_layer": 7
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 11,
+      "scan_index": 38,
+      "seconds": 15.456547395559028,
+      "source_layer": 12
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 20,
+      "scan_index": 39,
+      "seconds": 12.380102398339659,
+      "source_layer": 24
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 16,
+      "scan_index": 40,
+      "seconds": 13.824461202602834,
+      "source_layer": 20
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 20,
+      "scan_index": 41,
+      "seconds": 12.380102398339659,
+      "source_layer": 21
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 0,
+      "scan_index": 42,
+      "seconds": 19.534919636324048,
+      "source_layer": 23
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 21,
+      "scan_index": 43,
+      "seconds": 11.740845170337707,
+      "source_layer": 23
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 11,
+      "scan_index": 44,
+      "seconds": 15.456547395559028,
+      "source_layer": 16
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 8,
+      "scan_index": 45,
+      "seconds": 16.785965869901702,
+      "source_layer": 25
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 14,
+      "scan_index": 46,
+      "seconds": 14.588032351108268,
+      "source_layer": 17
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 14,
+      "scan_index": 47,
+      "seconds": 14.588032351108268,
+      "source_layer": 16
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 7,
+      "scan_index": 48,
+      "seconds": 16.9921030360274,
+      "source_layer": 25
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 20,
+      "scan_index": 49,
+      "seconds": 12.380102398339659,
+      "source_layer": 23
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 13,
+      "scan_index": 50,
+      "seconds": 14.814958058297634,
+      "source_layer": 15
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 1,
+      "scan_index": 51,
+      "seconds": 18.86056786472909,
+      "source_layer": 21
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 9,
+      "scan_index": 52,
+      "seconds": 15.667086786357686,
+      "source_layer": 10
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 1,
+      "scan_index": 53,
+      "seconds": 18.86056786472909,
+      "source_layer": 4
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 4,
+      "scan_index": 54,
+      "seconds": 18.032032054150477,
+      "source_layer": 10
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 14,
+      "scan_index": 55,
+      "seconds": 14.588032351108268,
+      "source_layer": 18
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 7,
+      "scan_index": 56,
+      "seconds": 16.9921030360274,
+      "source_layer": 15
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 4,
+      "scan_index": 57,
+      "seconds": 17.6292588270735,
+      "source_layer": 22
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 12,
+      "scan_index": 58,
+      "seconds": 15.009387160651386,
+      "source_layer": 20
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 17,
+      "scan_index": 59,
+      "seconds": 13.407382495235652,
+      "source_layer": 20
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 6,
+      "scan_index": 60,
+      "seconds": 17.447669580811635,
+      "source_layer": 12
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 8,
+      "scan_index": 61,
+      "seconds": 16.785965869901702,
+      "source_layer": 19
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 12,
+      "scan_index": 62,
+      "seconds": 15.009387160651386,
+      "source_layer": 18
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 4,
+      "scan_index": 63,
+      "seconds": 17.6292588270735,
+      "source_layer": 11
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 8,
+      "scan_index": 64,
+      "seconds": 16.702913500834256,
+      "source_layer": 15
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 4,
+      "scan_index": 65,
+      "seconds": 17.6292588270735,
+      "source_layer": 7
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 11,
+      "scan_index": 66,
+      "seconds": 15.456547395559028,
+      "source_layer": 20
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 12,
+      "scan_index": 67,
+      "seconds": 15.009387160651386,
+      "source_layer": 25
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 7,
+      "scan_index": 68,
+      "seconds": 17.100531165720895,
+      "source_layer": 18
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 11,
+      "scan_index": 69,
+      "seconds": 15.574613166274503,
+      "source_layer": 18
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 14,
+      "scan_index": 70,
+      "seconds": 14.638423111755401,
+      "source_layer": 20
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 19,
+      "scan_index": 71,
+      "seconds": 12.77465962502174,
+      "source_layer": 24
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 10,
+      "scan_index": 72,
+      "seconds": 16.057464266428724,
+      "source_layer": 24
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 5,
+      "scan_index": 73,
+      "seconds": 17.907393841072917,
+      "source_layer": 13
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 18,
+      "scan_index": 74,
+      "seconds": 13.002417312236503,
+      "source_layer": 21
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 0,
+      "scan_index": 75,
+      "seconds": 19.56061043520458,
+      "source_layer": 13
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 11,
+      "scan_index": 76,
+      "seconds": 15.574613166274503,
+      "source_layer": 24
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 8,
+      "scan_index": 77,
+      "seconds": 16.702913500834256,
+      "source_layer": 11
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 10,
+      "scan_index": 78,
+      "seconds": 16.057464266428724,
+      "source_layer": 14
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 16,
+      "scan_index": 79,
+      "seconds": 13.824461202602834,
+      "source_layer": 23
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 3,
+      "scan_index": 80,
+      "seconds": 18.751085952389985,
+      "source_layer": 23
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 2,
+      "scan_index": 81,
+      "seconds": 18.870146055240184,
+      "source_layer": 5
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 7,
+      "scan_index": 82,
+      "seconds": 17.100531165720895,
+      "source_layer": 17
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 6,
+      "scan_index": 83,
+      "seconds": 17.447669580811635,
+      "source_layer": 23
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 3,
+      "scan_index": 84,
+      "seconds": 18.751085952389985,
+      "source_layer": 15
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 2,
+      "scan_index": 85,
+      "seconds": 18.870146055240184,
+      "source_layer": 9
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 22,
+      "scan_index": 86,
+      "seconds": 11.367785394191742,
+      "source_layer": 23
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 6,
+      "scan_index": 87,
+      "seconds": 17.447669580811635,
+      "source_layer": 17
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 8,
+      "scan_index": 88,
+      "seconds": 16.702913500834256,
+      "source_layer": 18
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 9,
+      "scan_index": 89,
+      "seconds": 16.269144506426528,
+      "source_layer": 19
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 9,
+      "scan_index": 90,
+      "seconds": 16.269144506426528,
+      "source_layer": 15
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 21,
+      "scan_index": 91,
+      "seconds": 11.740845170337707,
+      "source_layer": 25
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 20,
+      "scan_index": 92,
+      "seconds": 12.380102398339659,
+      "source_layer": 22
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 3,
+      "scan_index": 93,
+      "seconds": 18.751085952389985,
+      "source_layer": 20
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 2,
+      "scan_index": 94,
+      "seconds": 18.870146055240184,
+      "source_layer": 25
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 16,
+      "scan_index": 95,
+      "seconds": 13.824461202602834,
+      "source_layer": 19
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 1,
+      "scan_index": 96,
+      "seconds": 18.86056786472909,
+      "source_layer": 20
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 3,
+      "scan_index": 97,
+      "seconds": 18.751085952389985,
+      "source_layer": 19
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 0,
+      "scan_index": 98,
+      "seconds": 19.56061043520458,
+      "source_layer": 2
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 5,
+      "scan_index": 99,
+      "seconds": 17.907393841072917,
+      "source_layer": 9
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 6,
+      "scan_index": 100,
+      "seconds": 17.447669580811635,
+      "source_layer": 11
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 8,
+      "scan_index": 101,
+      "seconds": 16.702913500834256,
+      "source_layer": 24
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 3,
+      "scan_index": 102,
+      "seconds": 18.588817739626393,
+      "source_layer": 10
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 4,
+      "scan_index": 103,
+      "seconds": 17.6292588270735,
+      "source_layer": 14
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 16,
+      "scan_index": 104,
+      "seconds": 13.824461202602834,
+      "source_layer": 25
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 2,
+      "scan_index": 105,
+      "seconds": 18.870146055240184,
+      "source_layer": 21
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 7,
+      "scan_index": 106,
+      "seconds": 17.100531165720895,
+      "source_layer": 11
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 17,
+      "scan_index": 107,
+      "seconds": 13.407382495235652,
+      "source_layer": 23
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 6,
+      "scan_index": 108,
+      "seconds": 17.12228192551993,
+      "source_layer": 16
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 19,
+      "scan_index": 109,
+      "seconds": 12.77465962502174,
+      "source_layer": 25
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 18,
+      "scan_index": 110,
+      "seconds": 13.002417312236503,
+      "source_layer": 25
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 1,
+      "scan_index": 111,
+      "seconds": 18.8893256848678,
+      "source_layer": 15
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 8,
+      "scan_index": 112,
+      "seconds": 16.560722595313564,
+      "source_layer": 20
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 13,
+      "scan_index": 113,
+      "seconds": 14.571070675738156,
+      "source_layer": 20
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 10,
+      "scan_index": 114,
+      "seconds": 16.057464266428724,
+      "source_layer": 20
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 4,
+      "scan_index": 115,
+      "seconds": 17.9076365029905,
+      "source_layer": 24
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 0,
+      "scan_index": 116,
+      "seconds": 19.56061043520458,
+      "source_layer": 25
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 10,
+      "scan_index": 117,
+      "seconds": 16.057464266428724,
+      "source_layer": 15
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 6,
+      "scan_index": 118,
+      "seconds": 17.12228192551993,
+      "source_layer": 19
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 5,
+      "scan_index": 119,
+      "seconds": 17.907393841072917,
+      "source_layer": 17
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 10,
+      "scan_index": 120,
+      "seconds": 15.738930416526273,
+      "source_layer": 18
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 12,
+      "scan_index": 121,
+      "seconds": 15.052593218395486,
+      "source_layer": 24
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 8,
+      "scan_index": 122,
+      "seconds": 16.560722595313564,
+      "source_layer": 10
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 2,
+      "scan_index": 123,
+      "seconds": 18.199898235034198,
+      "source_layer": 7
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 6,
+      "scan_index": 124,
+      "seconds": 17.12228192551993,
+      "source_layer": 18
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 0,
+      "scan_index": 125,
+      "seconds": 19.56061043520458,
+      "source_layer": 5
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 0,
+      "scan_index": 126,
+      "seconds": 18.966950858943164,
+      "source_layer": 20
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 10,
+      "scan_index": 127,
+      "seconds": 15.738930416526273,
+      "source_layer": 23
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 16,
+      "scan_index": 128,
+      "seconds": 13.587849369039759,
+      "source_layer": 18
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 2,
+      "scan_index": 129,
+      "seconds": 18.199898235034198,
+      "source_layer": 10
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 2,
+      "scan_index": 130,
+      "seconds": 18.199898235034198,
+      "source_layer": 23
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 13,
+      "scan_index": 131,
+      "seconds": 14.571070675738156,
+      "source_layer": 24
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 1,
+      "scan_index": 132,
+      "seconds": 18.8893256848678,
+      "source_layer": 22
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 4,
+      "scan_index": 133,
+      "seconds": 17.9076365029905,
+      "source_layer": 21
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 23,
+      "scan_index": 134,
+      "seconds": 11.094721667002887,
+      "source_layer": 25
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 6,
+      "scan_index": 135,
+      "seconds": 17.12228192551993,
+      "source_layer": 8
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 3,
+      "scan_index": 136,
+      "seconds": 18.588817739626393,
+      "source_layer": 12
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 1,
+      "scan_index": 137,
+      "seconds": 18.8893256848678,
+      "source_layer": 6
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 17,
+      "scan_index": 138,
+      "seconds": 13.407382495235652,
+      "source_layer": 19
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 2,
+      "scan_index": 139,
+      "seconds": 18.199898235034198,
+      "source_layer": 19
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 5,
+      "scan_index": 140,
+      "seconds": 17.335508923511952,
+      "source_layer": 22
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 0,
+      "scan_index": 141,
+      "seconds": 18.966950858943164,
+      "source_layer": 8
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 8,
+      "scan_index": 142,
+      "seconds": 16.560722595313564,
+      "source_layer": 23
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 12,
+      "scan_index": 143,
+      "seconds": 15.052593218395486,
+      "source_layer": 13
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 9,
+      "scan_index": 144,
+      "seconds": 16.269144506426528,
+      "source_layer": 25
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 2,
+      "scan_index": 145,
+      "seconds": 18.43521711975336,
+      "source_layer": 20
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 8,
+      "scan_index": 146,
+      "seconds": 16.560722595313564,
+      "source_layer": 17
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 9,
+      "scan_index": 147,
+      "seconds": 16.269144506426528,
+      "source_layer": 22
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 7,
+      "scan_index": 148,
+      "seconds": 17.100531165720895,
+      "source_layer": 14
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 0,
+      "scan_index": 149,
+      "seconds": 18.966950858943164,
+      "source_layer": 19
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 2,
+      "scan_index": 150,
+      "seconds": 18.43521711975336,
+      "source_layer": 14
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 0,
+      "scan_index": 151,
+      "seconds": 18.966950858943164,
+      "source_layer": 4
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 4,
+      "scan_index": 152,
+      "seconds": 17.9076365029905,
+      "source_layer": 18
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 7,
+      "scan_index": 153,
+      "seconds": 16.676625953055918,
+      "source_layer": 21
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 7,
+      "scan_index": 154,
+      "seconds": 16.676625953055918,
+      "source_layer": 13
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 0,
+      "scan_index": 155,
+      "seconds": 19.27363870269619,
+      "source_layer": 1
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 10,
+      "scan_index": 156,
+      "seconds": 15.738930416526273,
+      "source_layer": 13
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 21,
+      "scan_index": 157,
+      "seconds": 11.740845170337707,
+      "source_layer": 24
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 3,
+      "scan_index": 158,
+      "seconds": 18.588817739626393,
+      "source_layer": 4
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 4,
+      "scan_index": 159,
+      "seconds": 17.9076365029905,
+      "source_layer": 23
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 6,
+      "scan_index": 160,
+      "seconds": 16.694240571931005,
+      "source_layer": 25
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 6,
+      "scan_index": 161,
+      "seconds": 16.694240571931005,
+      "source_layer": 22
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 13,
+      "scan_index": 162,
+      "seconds": 14.571070675738156,
+      "source_layer": 22
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 0,
+      "scan_index": 163,
+      "seconds": 19.27363870269619,
+      "source_layer": 21
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 10,
+      "scan_index": 164,
+      "seconds": 15.738930416526273,
+      "source_layer": 11
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 21,
+      "scan_index": 165,
+      "seconds": 11.740845170337707,
+      "source_layer": 22
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 5,
+      "scan_index": 166,
+      "seconds": 17.335508923511952,
+      "source_layer": 6
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 1,
+      "scan_index": 167,
+      "seconds": 18.8893256848678,
+      "source_layer": 14
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 3,
+      "scan_index": 168,
+      "seconds": 18.588817739626393,
+      "source_layer": 25
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 3,
+      "scan_index": 169,
+      "seconds": 17.827038378221914,
+      "source_layer": 16
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 3,
+      "scan_index": 170,
+      "seconds": 17.827038378221914,
+      "source_layer": 21
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 15,
+      "scan_index": 171,
+      "seconds": 14.174939059419557,
+      "source_layer": 24
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 17,
+      "scan_index": 172,
+      "seconds": 13.407382495235652,
+      "source_layer": 18
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 12,
+      "scan_index": 173,
+      "seconds": 15.052593218395486,
+      "source_layer": 22
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 17,
+      "scan_index": 174,
+      "seconds": 12.843275570776314,
+      "source_layer": 24
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 0,
+      "scan_index": 175,
+      "seconds": 19.27363870269619,
+      "source_layer": 9
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 4,
+      "scan_index": 176,
+      "seconds": 17.392014643875882,
+      "source_layer": 13
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 17,
+      "scan_index": 177,
+      "seconds": 12.843275570776314,
+      "source_layer": 21
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 13,
+      "scan_index": 178,
+      "seconds": 14.571070675738156,
+      "source_layer": 25
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 3,
+      "scan_index": 179,
+      "seconds": 17.827038378221914,
+      "source_layer": 17
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 9,
+      "scan_index": 180,
+      "seconds": 15.708470747806132,
+      "source_layer": 17
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 2,
+      "scan_index": 181,
+      "seconds": 18.43521711975336,
+      "source_layer": 18
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 0,
+      "scan_index": 182,
+      "seconds": 19.27363870269619,
+      "source_layer": 6
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 2,
+      "scan_index": 183,
+      "seconds": 18.43521711975336,
+      "source_layer": 4
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 7,
+      "scan_index": 184,
+      "seconds": 16.676625953055918,
+      "source_layer": 16
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 19,
+      "scan_index": 185,
+      "seconds": 12.77465962502174,
+      "source_layer": 23
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 5,
+      "scan_index": 186,
+      "seconds": 17.335508923511952,
+      "source_layer": 15
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 14,
+      "scan_index": 187,
+      "seconds": 14.638423111755401,
+      "source_layer": 25
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 20,
+      "scan_index": 188,
+      "seconds": 11.469611601904035,
+      "source_layer": 25
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 4,
+      "scan_index": 189,
+      "seconds": 17.392014643875882,
+      "source_layer": 20
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 17,
+      "scan_index": 190,
+      "seconds": 12.843275570776314,
+      "source_layer": 25
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 8,
+      "scan_index": 191,
+      "seconds": 16.06886182469316,
+      "source_layer": 14
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 0,
+      "scan_index": 192,
+      "seconds": 18.742916065035388,
+      "source_layer": 7
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 5,
+      "scan_index": 193,
+      "seconds": 17.335508923511952,
+      "source_layer": 7
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 12,
+      "scan_index": 194,
+      "seconds": 15.052593218395486,
+      "source_layer": 14
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 1,
+      "scan_index": 195,
+      "seconds": 18.57302405848168,
+      "source_layer": 9
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 6,
+      "scan_index": 196,
+      "seconds": 16.694240571931005,
+      "source_layer": 15
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 0,
+      "scan_index": 197,
+      "seconds": 18.742916065035388,
+      "source_layer": 16
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 10,
+      "scan_index": 198,
+      "seconds": 15.141155704390258,
+      "source_layer": 25
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 1,
+      "scan_index": 199,
+      "seconds": 18.57302405848168,
+      "source_layer": 19
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 18,
+      "scan_index": 200,
+      "seconds": 13.002417312236503,
+      "source_layer": 19
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 16,
+      "scan_index": 201,
+      "seconds": 13.587849369039759,
+      "source_layer": 21
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 7,
+      "scan_index": 202,
+      "seconds": 16.676625953055918,
+      "source_layer": 12
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 7,
+      "scan_index": 203,
+      "seconds": 16.14082299801521,
+      "source_layer": 10
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 1,
+      "scan_index": 204,
+      "seconds": 18.57302405848168,
+      "source_layer": 10
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 10,
+      "scan_index": 205,
+      "seconds": 15.141155704390258,
+      "source_layer": 16
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 11,
+      "scan_index": 206,
+      "seconds": 15.574613166274503,
+      "source_layer": 19
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 1,
+      "scan_index": 207,
+      "seconds": 18.57302405848168,
+      "source_layer": 13
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 1,
+      "scan_index": 208,
+      "seconds": 18.38983535137959,
+      "source_layer": 12
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 8,
+      "scan_index": 209,
+      "seconds": 16.06886182469316,
+      "source_layer": 9
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 11,
+      "scan_index": 210,
+      "seconds": 15.574613166274503,
+      "source_layer": 17
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 15,
+      "scan_index": 211,
+      "seconds": 13.564863142324612,
+      "source_layer": 18
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 11,
+      "scan_index": 212,
+      "seconds": 15.354215634288266,
+      "source_layer": 13
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 0,
+      "scan_index": 213,
+      "seconds": 18.742916065035388,
+      "source_layer": 18
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 6,
+      "scan_index": 214,
+      "seconds": 16.694240571931005,
+      "source_layer": 13
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 5,
+      "scan_index": 215,
+      "seconds": 16.793921849457547,
+      "source_layer": 19
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 8,
+      "scan_index": 216,
+      "seconds": 16.06886182469316,
+      "source_layer": 12
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 1,
+      "scan_index": 217,
+      "seconds": 18.38983535137959,
+      "source_layer": 2
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 2,
+      "scan_index": 218,
+      "seconds": 18.683317767456174,
+      "source_layer": 3
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 4,
+      "scan_index": 219,
+      "seconds": 17.392014643875882,
+      "source_layer": 8
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 18,
+      "scan_index": 220,
+      "seconds": 13.002417312236503,
+      "source_layer": 23
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 7,
+      "scan_index": 221,
+      "seconds": 16.14082299801521,
+      "source_layer": 22
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 14,
+      "scan_index": 222,
+      "seconds": 14.638423111755401,
+      "source_layer": 24
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 15,
+      "scan_index": 223,
+      "seconds": 13.564863142324612,
+      "source_layer": 17
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 1,
+      "scan_index": 224,
+      "seconds": 18.38983535137959,
+      "source_layer": 25
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 0,
+      "scan_index": 225,
+      "seconds": 18.742916065035388,
+      "source_layer": 3
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 11,
+      "scan_index": 226,
+      "seconds": 15.354215634288266,
+      "source_layer": 15
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 1,
+      "scan_index": 227,
+      "seconds": 18.38983535137959,
+      "source_layer": 23
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 1,
+      "scan_index": 228,
+      "seconds": 18.17526472057216,
+      "source_layer": 18
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 5,
+      "scan_index": 229,
+      "seconds": 16.793921849457547,
+      "source_layer": 12
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 12,
+      "scan_index": 230,
+      "seconds": 14.229330733884126,
+      "source_layer": 17
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 11,
+      "scan_index": 231,
+      "seconds": 15.354215634288266,
+      "source_layer": 25
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 0,
+      "scan_index": 232,
+      "seconds": 18.355060718022287,
+      "source_layer": 12
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 15,
+      "scan_index": 233,
+      "seconds": 13.564863142324612,
+      "source_layer": 22
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 3,
+      "scan_index": 234,
+      "seconds": 17.827038378221914,
+      "source_layer": 14
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 4,
+      "scan_index": 235,
+      "seconds": 17.392014643875882,
+      "source_layer": 9
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 5,
+      "scan_index": 236,
+      "seconds": 16.793921849457547,
+      "source_layer": 8
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 2,
+      "scan_index": 237,
+      "seconds": 18.683317767456174,
+      "source_layer": 15
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 3,
+      "scan_index": 238,
+      "seconds": 17.308784486027434,
+      "source_layer": 11
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 5,
+      "scan_index": 239,
+      "seconds": 16.793921849457547,
+      "source_layer": 21
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 9,
+      "scan_index": 240,
+      "seconds": 15.708470747806132,
+      "source_layer": 24
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 12,
+      "scan_index": 241,
+      "seconds": 14.229330733884126,
+      "source_layer": 19
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 19,
+      "scan_index": 242,
+      "seconds": 11.993792448658496,
+      "source_layer": 21
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 3,
+      "scan_index": 243,
+      "seconds": 17.308784486027434,
+      "source_layer": 5
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 9,
+      "scan_index": 244,
+      "seconds": 15.708470747806132,
+      "source_layer": 13
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 10,
+      "scan_index": 245,
+      "seconds": 15.141155704390258,
+      "source_layer": 21
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 3,
+      "scan_index": 246,
+      "seconds": 17.308784486027434,
+      "source_layer": 18
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 13,
+      "scan_index": 247,
+      "seconds": 14.002818587934598,
+      "source_layer": 23
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 6,
+      "scan_index": 248,
+      "seconds": 18.256645344896242,
+      "source_layer": 21
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 10,
+      "scan_index": 249,
+      "seconds": 15.141155704390258,
+      "source_layer": 12
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 9,
+      "scan_index": 250,
+      "seconds": 15.708470747806132,
+      "source_layer": 14
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 24,
+      "scan_index": 251,
+      "seconds": 9.904179475270212,
+      "source_layer": 25
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 1,
+      "scan_index": 252,
+      "seconds": 18.17526472057216,
+      "source_layer": 24
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 18,
+      "scan_index": 253,
+      "seconds": 12.243718977396687,
+      "source_layer": 22
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 9,
+      "scan_index": 254,
+      "seconds": 16.028270507464185,
+      "source_layer": 16
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 22,
+      "scan_index": 255,
+      "seconds": 11.367785394191742,
+      "source_layer": 25
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 6,
+      "scan_index": 256,
+      "seconds": 18.256645344896242,
+      "source_layer": 20
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 14,
+      "scan_index": 257,
+      "seconds": 14.638423111755401,
+      "source_layer": 19
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 4,
+      "scan_index": 258,
+      "seconds": 17.17777796438895,
+      "source_layer": 12
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 15,
+      "scan_index": 259,
+      "seconds": 13.564863142324612,
+      "source_layer": 21
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 11,
+      "scan_index": 260,
+      "seconds": 15.354215634288266,
+      "source_layer": 14
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 14,
+      "scan_index": 261,
+      "seconds": 13.870985617861152,
+      "source_layer": 15
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 12,
+      "scan_index": 262,
+      "seconds": 14.229330733884126,
+      "source_layer": 16
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 5,
+      "scan_index": 263,
+      "seconds": 16.705881307832897,
+      "source_layer": 14
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 4,
+      "scan_index": 264,
+      "seconds": 17.17777796438895,
+      "source_layer": 16
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 5,
+      "scan_index": 265,
+      "seconds": 16.705881307832897,
+      "source_layer": 16
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 8,
+      "scan_index": 266,
+      "seconds": 16.06886182469316,
+      "source_layer": 13
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 13,
+      "scan_index": 267,
+      "seconds": 14.002818587934598,
+      "source_layer": 21
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 16,
+      "scan_index": 268,
+      "seconds": 13.587849369039759,
+      "source_layer": 17
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 18,
+      "scan_index": 269,
+      "seconds": 12.243718977396687,
+      "source_layer": 20
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 23,
+      "scan_index": 270,
+      "seconds": 11.094721667002887,
+      "source_layer": 24
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 2,
+      "scan_index": 271,
+      "seconds": 18.683317767456174,
+      "source_layer": 16
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 0,
+      "scan_index": 272,
+      "seconds": 18.355060718022287,
+      "source_layer": 15
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 14,
+      "scan_index": 273,
+      "seconds": 13.870985617861152,
+      "source_layer": 22
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 5,
+      "scan_index": 274,
+      "seconds": 16.705881307832897,
+      "source_layer": 20
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 0,
+      "scan_index": 275,
+      "seconds": 18.355060718022287,
+      "source_layer": 11
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 1,
+      "scan_index": 276,
+      "seconds": 18.17526472057216,
+      "source_layer": 3
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 6,
+      "scan_index": 277,
+      "seconds": 18.256645344896242,
+      "source_layer": 9
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 13,
+      "scan_index": 278,
+      "seconds": 14.002818587934598,
+      "source_layer": 16
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 9,
+      "scan_index": 279,
+      "seconds": 16.028270507464185,
+      "source_layer": 23
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 9,
+      "scan_index": 280,
+      "seconds": 16.028270507464185,
+      "source_layer": 20
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 0,
+      "scan_index": 281,
+      "seconds": 18.355060718022287,
+      "source_layer": 22
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 15,
+      "scan_index": 282,
+      "seconds": 13.010557826142758,
+      "source_layer": 19
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 10,
+      "scan_index": 283,
+      "seconds": 14.869856549426913,
+      "source_layer": 17
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 3,
+      "scan_index": 284,
+      "seconds": 17.308784486027434,
+      "source_layer": 24
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 14,
+      "scan_index": 285,
+      "seconds": 13.870985617861152,
+      "source_layer": 21
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 17,
+      "scan_index": 286,
+      "seconds": 12.843275570776314,
+      "source_layer": 22
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 2,
+      "scan_index": 287,
+      "seconds": 18.683317767456174,
+      "source_layer": 13
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 16,
+      "scan_index": 288,
+      "seconds": 13.587849369039759,
+      "source_layer": 22
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 7,
+      "scan_index": 289,
+      "seconds": 16.14082299801521,
+      "source_layer": 9
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 4,
+      "scan_index": 290,
+      "seconds": 17.17777796438895,
+      "source_layer": 17
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 4,
+      "scan_index": 291,
+      "seconds": 17.17777796438895,
+      "source_layer": 6
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 1,
+      "scan_index": 292,
+      "seconds": 18.17526472057216,
+      "source_layer": 17
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 1,
+      "scan_index": 293,
+      "seconds": 19.688111954834312,
+      "source_layer": 8
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 7,
+      "scan_index": 294,
+      "seconds": 16.14082299801521,
+      "source_layer": 19
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 0,
+      "scan_index": 295,
+      "seconds": 17.85471491049975,
+      "source_layer": 14
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 5,
+      "scan_index": 296,
+      "seconds": 16.705881307832897,
+      "source_layer": 25
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 1,
+      "scan_index": 297,
+      "seconds": 19.688111954834312,
+      "source_layer": 5
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 1,
+      "scan_index": 298,
+      "seconds": 19.688111954834312,
+      "source_layer": 11
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 2,
+      "scan_index": 299,
+      "seconds": 17.81718558942278,
+      "source_layer": 6
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 9,
+      "scan_index": 300,
+      "seconds": 16.028270507464185,
+      "source_layer": 18
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 19,
+      "scan_index": 301,
+      "seconds": 11.993792448658496,
+      "source_layer": 20
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 15,
+      "scan_index": 302,
+      "seconds": 13.010557826142758,
+      "source_layer": 20
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 12,
+      "scan_index": 303,
+      "seconds": 14.229330733884126,
+      "source_layer": 15
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 3,
+      "scan_index": 304,
+      "seconds": 17.45244956156239,
+      "source_layer": 6
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 18,
+      "scan_index": 305,
+      "seconds": 12.243718977396687,
+      "source_layer": 24
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 7,
+      "scan_index": 306,
+      "seconds": 15.89218867663294,
+      "source_layer": 20
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 12,
+      "scan_index": 307,
+      "seconds": 14.013691970147192,
+      "source_layer": 21
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 2,
+      "scan_index": 308,
+      "seconds": 17.81718558942278,
+      "source_layer": 12
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 10,
+      "scan_index": 309,
+      "seconds": 14.869856549426913,
+      "source_layer": 22
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 8,
+      "scan_index": 310,
+      "seconds": 15.334528931416571,
+      "source_layer": 16
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 13,
+      "scan_index": 311,
+      "seconds": 14.002818587934598,
+      "source_layer": 17
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 2,
+      "scan_index": 312,
+      "seconds": 17.81718558942278,
+      "source_layer": 8
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 3,
+      "scan_index": 313,
+      "seconds": 17.45244956156239,
+      "source_layer": 22
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 7,
+      "scan_index": 314,
+      "seconds": 15.89218867663294,
+      "source_layer": 23
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 10,
+      "scan_index": 315,
+      "seconds": 14.869856549426913,
+      "source_layer": 19
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 6,
+      "scan_index": 316,
+      "seconds": 18.256645344896242,
+      "source_layer": 10
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 4,
+      "scan_index": 317,
+      "seconds": 20.613851643167436,
+      "source_layer": 5
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 6,
+      "scan_index": 318,
+      "seconds": 16.385630004728835,
+      "source_layer": 7
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 6,
+      "scan_index": 319,
+      "seconds": 16.385630004728835,
+      "source_layer": 24
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 16,
+      "scan_index": 320,
+      "seconds": 12.738287337124348,
+      "source_layer": 24
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 11,
+      "scan_index": 321,
+      "seconds": 14.616354514379054,
+      "source_layer": 22
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 6,
+      "scan_index": 322,
+      "seconds": 16.385630004728835,
+      "source_layer": 14
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 11,
+      "scan_index": 323,
+      "seconds": 14.616354514379054,
+      "source_layer": 23
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 1,
+      "scan_index": 324,
+      "seconds": 19.688111954834312,
+      "source_layer": 16
+    }
+  ],
+  "status": "complete",
+  "telemetry": {
+    "cuda_queries_added": 0,
+    "cuda_synchronizations_added": 0,
+    "interval_seconds": 60.0,
+    "method": "host-side counters updated only after existing scoring batches"
+  },
+  "updated_at": "2026-08-22T17:38:55.190114+00:00"
+}

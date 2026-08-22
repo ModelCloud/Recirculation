@@ -1,0 +1,72 @@
+{
+  "active_paths": [],
+  "aggregate": {
+    "active": 0,
+    "complete": 7,
+    "elapsed_seconds": 4690.841103055514,
+    "estimated_path_seconds": 669.9353181067854,
+    "mean_completed_path_seconds": 669.9353181067854,
+    "pending": 0,
+    "sweep_eta_seconds": 0.0,
+    "total": 7
+  },
+  "completed_paths": [
+    {
+      "alpha": 0.04,
+      "destination_layer": 20,
+      "scan_index": 0,
+      "seconds": 673.6404860895127,
+      "source_layer": 25
+    },
+    {
+      "alpha": 0.08,
+      "destination_layer": 20,
+      "scan_index": 1,
+      "seconds": 675.6583304544911,
+      "source_layer": 25
+    },
+    {
+      "alpha": 0.12,
+      "destination_layer": 20,
+      "scan_index": 2,
+      "seconds": 658.6235973443836,
+      "source_layer": 25
+    },
+    {
+      "alpha": 0.16,
+      "destination_layer": 20,
+      "scan_index": 3,
+      "seconds": 666.6032581049949,
+      "source_layer": 25
+    },
+    {
+      "alpha": 0.2,
+      "destination_layer": 20,
+      "scan_index": 4,
+      "seconds": 669.5143251465634,
+      "source_layer": 25
+    },
+    {
+      "alpha": 0.24,
+      "destination_layer": 20,
+      "scan_index": 5,
+      "seconds": 672.5963150011376,
+      "source_layer": 25
+    },
+    {
+      "alpha": 0.28,
+      "destination_layer": 20,
+      "scan_index": 6,
+      "seconds": 672.9109146064147,
+      "source_layer": 25
+    }
+  ],
+  "status": "complete",
+  "telemetry": {
+    "cuda_queries_added": 0,
+    "cuda_synchronizations_added": 0,
+    "interval_seconds": 60.0,
+    "method": "host-side counters updated only after existing scoring batches"
+  },
+  "updated_at": "2026-08-22T23:05:51.381121+00:00"
+}

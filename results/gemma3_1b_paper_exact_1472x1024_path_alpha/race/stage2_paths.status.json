@@ -1,0 +1,471 @@
+{
+  "active_paths": [],
+  "aggregate": {
+    "active": 0,
+    "complete": 64,
+    "elapsed_seconds": 3780.1432302184403,
+    "estimated_path_seconds": 58.96802976318577,
+    "mean_completed_path_seconds": 58.96802976318577,
+    "pending": 0,
+    "sweep_eta_seconds": 0.0,
+    "total": 64
+  },
+  "completed_paths": [
+    {
+      "alpha": 0.05,
+      "destination_layer": 1,
+      "scan_index": 0,
+      "seconds": 77.96631886654843,
+      "source_layer": 2
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 22,
+      "scan_index": 1,
+      "seconds": 47.57178927026689,
+      "source_layer": 23
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 5,
+      "scan_index": 2,
+      "seconds": 72.55160809727386,
+      "source_layer": 6
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 1,
+      "scan_index": 3,
+      "seconds": 77.96631886654843,
+      "source_layer": 3
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 18,
+      "scan_index": 4,
+      "seconds": 51.87992934882641,
+      "source_layer": 22
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 10,
+      "scan_index": 5,
+      "seconds": 64.11682487465441,
+      "source_layer": 12
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 15,
+      "scan_index": 6,
+      "seconds": 54.95359634049237,
+      "source_layer": 16
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 17,
+      "scan_index": 7,
+      "seconds": 54.32098866533488,
+      "source_layer": 22
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 18,
+      "scan_index": 8,
+      "seconds": 51.87992934882641,
+      "source_layer": 19
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 0,
+      "scan_index": 9,
+      "seconds": 79.90281730215065,
+      "source_layer": 1
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 23,
+      "scan_index": 10,
+      "seconds": 45.89740900602192,
+      "source_layer": 25
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 20,
+      "scan_index": 11,
+      "seconds": 49.941609082045034,
+      "source_layer": 23
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 0,
+      "scan_index": 12,
+      "seconds": 79.90281730215065,
+      "source_layer": 4
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 4,
+      "scan_index": 13,
+      "seconds": 73.5321105637122,
+      "source_layer": 6
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 18,
+      "scan_index": 14,
+      "seconds": 51.87992934882641,
+      "source_layer": 21
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 9,
+      "scan_index": 15,
+      "seconds": 66.78755549807101,
+      "source_layer": 10
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 23,
+      "scan_index": 16,
+      "seconds": 45.89740900602192,
+      "source_layer": 24
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 9,
+      "scan_index": 17,
+      "seconds": 66.78755549807101,
+      "source_layer": 11
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 21,
+      "scan_index": 18,
+      "seconds": 47.84116587834433,
+      "source_layer": 25
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 13,
+      "scan_index": 19,
+      "seconds": 61.303439744127296,
+      "source_layer": 16
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 16,
+      "scan_index": 20,
+      "seconds": 55.92598105687648,
+      "source_layer": 17
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 5,
+      "scan_index": 21,
+      "seconds": 72.55160809727386,
+      "source_layer": 7
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 16,
+      "scan_index": 22,
+      "seconds": 55.92598105687648,
+      "source_layer": 19
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 19,
+      "scan_index": 23,
+      "seconds": 51.43702620151453,
+      "source_layer": 21
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 17,
+      "scan_index": 24,
+      "seconds": 54.32098866533488,
+      "source_layer": 21
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 21,
+      "scan_index": 25,
+      "seconds": 47.84116587834433,
+      "source_layer": 24
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 20,
+      "scan_index": 26,
+      "seconds": 49.941609082045034,
+      "source_layer": 22
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 1,
+      "scan_index": 27,
+      "seconds": 77.96631886654843,
+      "source_layer": 4
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 14,
+      "scan_index": 28,
+      "seconds": 59.27588234702125,
+      "source_layer": 15
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 21,
+      "scan_index": 29,
+      "seconds": 47.84116587834433,
+      "source_layer": 23
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 2,
+      "scan_index": 30,
+      "seconds": 76.43649577815086,
+      "source_layer": 3
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 22,
+      "scan_index": 31,
+      "seconds": 47.57178927026689,
+      "source_layer": 25
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 17,
+      "scan_index": 32,
+      "seconds": 54.32098866533488,
+      "source_layer": 19
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 17,
+      "scan_index": 33,
+      "seconds": 54.32098866533488,
+      "source_layer": 24
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 6,
+      "scan_index": 34,
+      "seconds": 70.3779191756621,
+      "source_layer": 7
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 22,
+      "scan_index": 35,
+      "seconds": 47.57178927026689,
+      "source_layer": 24
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 20,
+      "scan_index": 36,
+      "seconds": 49.941609082045034,
+      "source_layer": 21
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 4,
+      "scan_index": 37,
+      "seconds": 73.5321105637122,
+      "source_layer": 8
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 16,
+      "scan_index": 38,
+      "seconds": 55.92598105687648,
+      "source_layer": 18
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 11,
+      "scan_index": 39,
+      "seconds": 62.84726237785071,
+      "source_layer": 12
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 20,
+      "scan_index": 40,
+      "seconds": 49.941609082045034,
+      "source_layer": 24
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 10,
+      "scan_index": 41,
+      "seconds": 64.11682487465441,
+      "source_layer": 14
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 13,
+      "scan_index": 42,
+      "seconds": 61.303439744127296,
+      "source_layer": 14
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 19,
+      "scan_index": 43,
+      "seconds": 51.43702620151453,
+      "source_layer": 20
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 0,
+      "scan_index": 44,
+      "seconds": 79.90281730215065,
+      "source_layer": 2
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 14,
+      "scan_index": 45,
+      "seconds": 59.27588234702125,
+      "source_layer": 16
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 19,
+      "scan_index": 46,
+      "seconds": 51.43702620151453,
+      "source_layer": 25
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 18,
+      "scan_index": 47,
+      "seconds": 51.87992934882641,
+      "source_layer": 23
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 0,
+      "scan_index": 48,
+      "seconds": 79.90281730215065,
+      "source_layer": 3
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 17,
+      "scan_index": 49,
+      "seconds": 54.96505434655895,
+      "source_layer": 18
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 24,
+      "scan_index": 50,
+      "seconds": 42.15817760769278,
+      "source_layer": 25
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 20,
+      "scan_index": 51,
+      "seconds": 47.767246627248824,
+      "source_layer": 25
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 18,
+      "scan_index": 52,
+      "seconds": 53.27997098211199,
+      "source_layer": 24
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 18,
+      "scan_index": 53,
+      "seconds": 53.27997098211199,
+      "source_layer": 20
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 21,
+      "scan_index": 54,
+      "seconds": 47.84116587834433,
+      "source_layer": 22
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 13,
+      "scan_index": 55,
+      "seconds": 61.303439744127296,
+      "source_layer": 15
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 10,
+      "scan_index": 56,
+      "seconds": 64.11682487465441,
+      "source_layer": 11
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 4,
+      "scan_index": 57,
+      "seconds": 73.5321105637122,
+      "source_layer": 7
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 19,
+      "scan_index": 58,
+      "seconds": 51.43702620151453,
+      "source_layer": 24
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 17,
+      "scan_index": 59,
+      "seconds": 54.96505434655895,
+      "source_layer": 20
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 17,
+      "scan_index": 60,
+      "seconds": 54.96505434655895,
+      "source_layer": 23
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 4,
+      "scan_index": 61,
+      "seconds": 73.5321105637122,
+      "source_layer": 5
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 19,
+      "scan_index": 62,
+      "seconds": 51.428771215491,
+      "source_layer": 23
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 19,
+      "scan_index": 63,
+      "seconds": 51.428771215491,
+      "source_layer": 22
+    }
+  ],
+  "status": "complete",
+  "telemetry": {
+    "cuda_queries_added": 0,
+    "cuda_synchronizations_added": 0,
+    "interval_seconds": 60.0,
+    "method": "host-side counters updated only after existing scoring batches"
+  },
+  "updated_at": "2026-08-22T18:42:15.079464+00:00"
+}

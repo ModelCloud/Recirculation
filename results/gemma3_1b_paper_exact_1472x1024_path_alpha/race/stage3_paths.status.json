@@ -1,0 +1,135 @@
+{
+  "active_paths": [],
+  "aggregate": {
+    "active": 0,
+    "complete": 16,
+    "elapsed_seconds": 11106.06606101431,
+    "estimated_path_seconds": 693.8568007036811,
+    "mean_completed_path_seconds": 693.8568007036811,
+    "pending": 0,
+    "sweep_eta_seconds": 0.0,
+    "total": 16
+  },
+  "completed_paths": [
+    {
+      "alpha": 0.05,
+      "destination_layer": 20,
+      "scan_index": 0,
+      "seconds": 663.3255565606523,
+      "source_layer": 21
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 20,
+      "scan_index": 1,
+      "seconds": 663.3255565606523,
+      "source_layer": 22
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 19,
+      "scan_index": 2,
+      "seconds": 695.0198799977079,
+      "source_layer": 23
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 1,
+      "scan_index": 3,
+      "seconds": 1018.5696645472199,
+      "source_layer": 3
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 24,
+      "scan_index": 4,
+      "seconds": 561.8387642446905,
+      "source_layer": 25
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 20,
+      "scan_index": 5,
+      "seconds": 663.3255565606523,
+      "source_layer": 24
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 19,
+      "scan_index": 6,
+      "seconds": 695.0198799977079,
+      "source_layer": 21
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 22,
+      "scan_index": 7,
+      "seconds": 639.1741956104524,
+      "source_layer": 23
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 19,
+      "scan_index": 8,
+      "seconds": 695.0198799977079,
+      "source_layer": 24
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 22,
+      "scan_index": 9,
+      "seconds": 639.1741956104524,
+      "source_layer": 24
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 10,
+      "scan_index": 10,
+      "seconds": 846.9367664828897,
+      "source_layer": 11
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 20,
+      "scan_index": 11,
+      "seconds": 663.3255565606523,
+      "source_layer": 25
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 21,
+      "scan_index": 12,
+      "seconds": 630.6506758285686,
+      "source_layer": 23
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 20,
+      "scan_index": 13,
+      "seconds": 654.4356225123629,
+      "source_layer": 23
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 19,
+      "scan_index": 14,
+      "seconds": 695.0198799977079,
+      "source_layer": 22
+    },
+    {
+      "alpha": 0.05,
+      "destination_layer": 19,
+      "scan_index": 15,
+      "seconds": 677.5471801888198,
+      "source_layer": 25
+    }
+  ],
+  "status": "complete",
+  "telemetry": {
+    "cuda_queries_added": 0,
+    "cuda_synchronizations_added": 0,
+    "interval_seconds": 60.0,
+    "method": "host-side counters updated only after existing scoring batches"
+  },
+  "updated_at": "2026-08-22T21:47:30.356700+00:00"
+}
