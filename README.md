@@ -89,82 +89,44 @@ recirculation produced 42 wrong→correct and 35 correct→wrong flips, a paired
 | Evaluation toolkit | [Evalution](https://github.com/ModelCloud/Evalution) `0.0.12`; GSM8K `cot_llama` natural generation; MMLU five-shot A/B/C/D likelihood |
 | CUDA execution | FP16, paged FlashAttention 2, continuous batching, engine batch 32, MMLU suite batch 128, 512-prompt scoring cohorts |
 
-The GSM8K comparison remains provisional: the unseeded continuous scheduler was not bit-for-bit stable across two
-dense runs, shifting five row scores and the aggregate by three correct answers. MMLU reproduced exactly. See the
-detailed report for this repeatability limitation rather than interpreting the one-shot GSM8K delta as deterministic.
+The GSM8K delta is provisional: two unseeded dense runs differed on five row scores and three aggregate correct
+answers. MMLU reproduced exactly; see the [detailed report](results/dense_baselines/llama32_1b_gsm8k_mmlu_dense_vs_recirc_10_1_alpha004_fp16.md).
 
-For a paper-style language-modeling shortlist, corpus mode reads fixed windows from local arXiv, C4, and PG-19
-training shards. By default it takes at most two complete 1024-token windows from each document, matching the paper's
-sampling policy. The paper reports 484 arXiv, 488 C4, and 500 PG-19 windows (roughly 1.5 million predicted tokens).
-It does not add an answer cue; GSM8K natural generation remains the downstream promotion gate.
+### Paper-style path screening
 
-The Torch and CUDA paths support Hugging Face Llama, Qwen3, and Gemma 3 text causal-LM checkpoints. This includes
-Gemma 3's alternating local/global RoPE, four decoder normalization sites, GELU-gated MLP, sliding-window KV rollback,
-and the same candidate-batch search API. Gemma keeps separate replay/current BF16 layer calls because merging their
-large projections exceeded the repository's 2e-3 real-checkpoint accuracy gate. Widths above one currently use an
-accuracy-preserving serial fallback for Gemma for the same reason; Llama and Qwen3 retain true fused candidate batches.
-Tokenicer preserves each model's
-special-token contract: Llama and Gemma corpus windows begin after the checkpoint BOS, while Qwen3—which intentionally
-has no BOS—starts from an empty KV cache and scores the second text token from the first. Recirculation does not
-substitute EOS or PAD as a synthetic Qwen3 BOS. Chat evaluation uses the checkpoint's own chat template.
+Corpus screening reads local arXiv, C4, and PG-19 shards, takes at most two complete 1,024-token windows per document,
+and adds no answer cue. The paper reports 484, 488, and 500 windows respectively (about 1.5 million predicted tokens).
+The arXiv shard is a documented best-effort choice because the paper does not identify its source dataset. Raw shards
+default to `/local-models/datasets/recirculation-paper`; downloads require explicit `--allow-download`.
 
-Raw corpus shards are resolved locally from `/local-models/datasets/recirculation-paper` unless
-`--corpus-data-root` overrides it. Network streaming is disabled unless `--allow-download` is explicit. The local
-arXiv source is a documented best-effort reproduction choice because the paper does not publish its exact dataset ID.
+Llama, Qwen3, and Gemma 3 use the same Torch/CUDA screening interface. Tokenicer preserves checkpoint special-token
+behavior: Llama and Gemma use their BOS contract, while Qwen3 starts without a synthetic BOS, EOS, or PAD token. Llama
+and Qwen3 support fused candidate batches; Gemma widths above one currently use the accuracy-gated serial fallback.
+Batched/fused forwards allow mean absolute error up to `4e-3`; unfused, unbatched forwards allow `2e-3`.
 
-```bash
-python scripts/screen_cuda_recirculation.py \
-  --model /local-models/Llama-3.2-1B-Instruct \
-  --corpus c4 \
-  --corpus pg19 \
-  --windows-per-corpus 256 \
-  --window-tokens 1024 \
-  --corpus-artifact results/c4_pg19_256x1024_windows.json \
-  --row-batch-size 256 \
-  --alpha 0.10 \
-  --output results/cuda_c4_pg19_paths.json
-```
-
-Gemma 3 1B supports the same fused, candidate-batched CUDA search. A paper-shaped path/alpha sweep can be launched as:
+A paper-scale, unrestricted Llama path scan is:
 
 ```bash
 python -X gil=0 scripts/screen_cuda_recirculation.py \
-  --model /local-models/gemma-3-1b-it \
-  --dtype bfloat16 \
+  --model /local-models/Llama-3.2-1B-Instruct \
+  --dtype float16 \
   --corpus arxiv --corpus c4 --corpus pg19 \
-  --windows-per-corpus 500 \
+  --corpus-window-count arxiv=484 \
+  --corpus-window-count c4=488 \
+  --corpus-window-count pg19=500 \
   --windows-per-document 2 \
   --window-tokens 1024 \
-  --max-distance 12 \
-  --alpha 0.04 --alpha 0.07 --alpha 0.10 --alpha 0.16 \
+  --alpha 0.10 \
   --scheduler concurrent --dual-gemm \
   --candidate-batch-size 8 \
-  --corpus-artifact results/gemma3_paper_corpora_windows.json \
-  --output results/gemma3_cuda_paths.json
+  --corpus-artifact results/llama32_1b_paper_windows.json \
+  --output results/llama32_1b_paper_paths.json
 ```
 
-The paper's final cross-corpus path comparison fixes `alpha=0.10`; its four-alpha arXiv heatmap uses the values shown
-above. Use a separate fixed-`0.10` run when reproducing that exact path-selection step.
-
-For the locally downloaded Qwen3-8B checkpoint, the same search is selected with:
-
-```bash
-python scripts/screen_cuda_recirculation.py \
-  --model /local-models/Qwen3-8B \
-  --corpus c4 \
-  --corpus pg19 \
-  --windows-per-corpus 256 \
-  --window-tokens 1024 \
-  --corpus-artifact results/qwen3_c4_pg19_256x1024_windows.json \
-  --alpha 0.05 \
-  --output results/qwen3_cuda_paths.json
-```
-
-Qwen3-8B has 36 decoder layers, so an unrestricted scan contains 630 ordered `source > destination` paths per alpha.
-Use repeated `--path SOURCE:DESTINATION` arguments to smoke-test or refine a shortlist before launching the full grid.
-Candidate execution is deterministically randomized by default so partial runs sample the layer space instead of always
-starting at 1→0, 2→0, 3→0. JSON and Markdown ledgers store the full scan-index→path/alpha schedule and each result's
-scan index. Set `--scan-seed` to choose a different reproducible order or `--scan-order sequential` for legacy order.
+Omitting `--max-distance` scans every `source > destination` pair. Candidate order is deterministically randomized;
+use `--scan-seed` to change it or repeated `--path SOURCE:DESTINATION` options for a shortlist. The paper's final
+cross-corpus comparison fixes `alpha=0.10`; its arXiv heatmap instead uses `0.04`, `0.07`, `0.10`, and `0.16`. Swap the
+model path (and dtype when appropriate) to run the same search on Qwen3 or Gemma 3.
 
 ## Install and test
 
