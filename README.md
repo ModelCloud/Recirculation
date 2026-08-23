@@ -70,6 +70,8 @@ and MMLU token-budgeted cohorts. Full commands, environment versions, resolved s
 Humanities flip accounting are in the
 [detailed reproducibility report](results/dense_baselines/llama32_1b_gsm8k_mmlu_dense_vs_recirc_10_1_alpha004_fp16.md).
 
+### Llama 3.2 1B Instruct
+
 | Full benchmark | Dense score | Dense accuracy | Recirculation score | Recirculation accuracy | Delta | Relative accuracy change |
 |---|---:|---:|---:|---:|---:|---:|
 | GSM8K Platinum | 588/1,209 | 48.64% | **597/1,209** | **49.38%** | **+9 / +0.74 pp** | **+1.53%** |
@@ -91,6 +93,24 @@ recirculation produced 42 wrong→correct and 35 correct→wrong flips, a paired
 
 The GSM8K delta is provisional: two unseeded dense runs differed on five row scores and three aggregate correct
 answers. MMLU reproduced exactly; see the [detailed report](results/dense_baselines/llama32_1b_gsm8k_mmlu_dense_vs_recirc_10_1_alpha004_fp16.md).
+
+### Gemma 3 1B Instruct
+
+The Gemma 3 1B Instruct evaluation uses the paper-corpus-selected `25→20`, `alpha=0.04` intervention. The complete
+path/alpha funnel, commands, shard provenance, and backend limitation are recorded in the
+[Gemma evaluation report](results/evaluations/gemma3_1b_paper_path_25_20_alpha004_eval_report.md).
+
+| Full benchmark | Dense score | Dense accuracy | Recirculation score | Recirculation accuracy | Delta | Relative accuracy change |
+|---|---:|---:|---:|---:|---:|---:|
+| GSM8K Platinum | 540/1,209 | 44.67% | **554/1,209** | **45.82%** | **+14 / +1.16 pp** | **+2.59%** |
+| MMLU-STEM | 1,084/3,153 | 34.38% | **1,083/3,153** | **34.35%** | **−1 / −0.03 pp** | **−0.09%** |
+| MMLU-Humanities | 1,736/4,705 | 36.90% | **1,737/4,705** | **36.92%** | **+1 / +0.02 pp** | **+0.06%** |
+
+Gemma GSM8K recirculation and dense runs had zero invalid predictions. The dense GSM8K score is the
+correctness-validated eager, non-paged baseline; the native dense paged FlashAttention 2 continuous path emitted
+corrupted output and is not used as a score. See the
+[full Gemma report](results/evaluations/gemma3_1b_paper_path_25_20_alpha004_eval_report.md) for the exact commands,
+settings, and raw artifacts.
 
 ### Paper-style path screening
 
