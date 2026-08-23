@@ -76,9 +76,9 @@ def log_concurrency_mode() -> bool:
     gil_enabled = bool(getattr(sys, "_is_gil_enabled", lambda: True)())
     if gil_enabled:
         LOG.info.once(
-            "GIL=1 detected: CUDAConcurrentRunner is enabled because PyTorch CUDA operations can release the GIL. "
-            "A free-threaded build such as CPython 3.14t with -X gil=0 or PYTHON_GIL=0 may further reduce host-side "
-            "scheduling overhead."
+            "GIL=1 detected: CUDAConcurrentRunner Python workers are disabled; using the serial CUDA-stream "
+            "fallback. A free-threaded CPython 3.14t process with -X gil=0 or PYTHON_GIL=0 enables the parallel "
+            "worker scheduler for faster inference."
         )
     else:
         LOG.info.once(
@@ -279,6 +279,7 @@ class CUDAPrefillRunner:
         self.model = model
         self.decoder = model.get_decoder()
         self.output_embeddings = model.get_output_embeddings()
+        self.device = next(model.parameters()).device
         self.controller = RecirculationController(
             model,
             config,
@@ -291,6 +292,11 @@ class CUDAPrefillRunner:
             raise ValueError("projection_chunk_tokens must be positive")
         self.projection_chunk_tokens = projection_chunk_tokens
         self.mask_free_unpadded = mask_free_unpadded
+
+    def close(self) -> None:
+        """Compatibility no-op for the continuous-batching manager."""
+
+        return None
 
     def _attach_controller_state(
         self,
@@ -422,6 +428,47 @@ class CUDAPrefillRunner:
             collect_logits=collect_logits,
             attention_mask=attention_mask,
         )
+
+    @torch.inference_mode()
+    def generate(
+        self,
+        input_ids: torch.Tensor,
+        *,
+        max_new_tokens: int,
+        eos_token_id: int | None = None,
+    ) -> torch.Tensor:
+        """Generate serially through the validated Torch-controller path.
+
+        This is the GIL=1 fallback for Evalution's continuous manager.  It
+        deliberately uses the same tokenwise prefill/rollback implementation
+        as MMLU scoring instead of constructing a CUDAConcurrentRunner.
+        """
+
+        if max_new_tokens < 0:
+            raise ValueError("max_new_tokens must be non-negative")
+        prompt = input_ids.to(device=next(self.model.parameters()).device, dtype=torch.long)
+        if prompt.ndim != 2 or prompt.shape[0] < 1 or prompt.shape[1] < 1:
+            raise ValueError("generate requires input_ids with shape [batch, sequence]")
+        logits, cache, pending, _ = self.prefill(prompt)
+        generated = torch.empty(
+            (prompt.shape[0], prompt.shape[1] + max_new_tokens),
+            dtype=torch.long,
+            device=prompt.device,
+        )
+        generated[:, : prompt.shape[1]] = prompt
+        if max_new_tokens == 0:
+            return generated[:, : prompt.shape[1]]
+        finished = torch.zeros(prompt.shape[0], dtype=torch.bool, device=prompt.device)
+        for offset in range(max_new_tokens):
+            token = logits[:, -1, :].argmax(dim=-1, keepdim=True)
+            if eos_token_id is not None:
+                token = torch.where(finished[:, None], eos_token_id, token)
+                finished |= token[:, 0] == eos_token_id
+            generated[:, prompt.shape[1] + offset : prompt.shape[1] + offset + 1] = token
+            if eos_token_id is not None and bool(finished.all()):
+                break
+            logits, cache, pending, _ = self.prefill(token, cache=cache, pending=pending)
+        return generated[:, : prompt.shape[1] + offset + 1]
 
     @torch.inference_mode()
     def score(
@@ -760,6 +807,12 @@ class CUDAConcurrentRunner:
         self.mixer = FusedNormMix() if fused else mix_reference
         self.device = device
         self.stream_priority = stream_priority
+        # Python worker overlap is explicitly gated on a free-threaded build.
+        # CUDA streams remain available with GIL=1, but dispatching two Python
+        # workers there adds contention and can deadlock Transformers' manager.
+        self.gil_enabled = log_concurrency_mode()
+        if self.gil_enabled and use_python_threads:
+            use_python_threads = False
         self.use_python_threads = use_python_threads
         if dual_gemm and not Qwen3DualTokenLayer.supports(model):
             raise ValueError("dual-GEMM upper stacks require eager Qwen3, Llama, or Gemma 3")
@@ -774,7 +827,6 @@ class CUDAConcurrentRunner:
             if use_python_threads
             else None
         )
-        self.gil_enabled = log_concurrency_mode()
 
     def close(self) -> None:
         if self.executor is not None:

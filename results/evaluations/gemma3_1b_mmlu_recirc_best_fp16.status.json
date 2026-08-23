@@ -1,0 +1,34 @@
+{
+  "active_suite": null,
+  "elapsed_seconds": 6080.538131678477,
+  "output": "/root/Recirculation/results/evaluations/gemma3_1b_mmlu_recirc_best_fp16.json",
+  "status": "complete",
+  "suites": [
+    {
+      "benchmark": "mmlu_stem",
+      "completed_rows": 3153,
+      "invalid_predictions": 0,
+      "metric_totals": {},
+      "metrics": {
+        "acc,ll": 0.3434823977164605,
+        "acc,ll_avg": 0.3434823977164605
+      },
+      "name": "mmlu_stem",
+      "state": "complete",
+      "total_rows": 3153
+    },
+    {
+      "benchmark": "mmlu_humanities",
+      "completed_rows": 4705,
+      "invalid_predictions": 0,
+      "metric_totals": {},
+      "metrics": {
+        "acc,ll": 0.3691817215727949,
+        "acc,ll_avg": 0.3691817215727949
+      },
+      "name": "mmlu_humanities",
+      "state": "complete",
+      "total_rows": 4705
+    }
+  ]
+}

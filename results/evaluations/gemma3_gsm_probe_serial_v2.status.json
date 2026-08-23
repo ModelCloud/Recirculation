@@ -1,0 +1,19 @@
+{
+  "active_suite": null,
+  "elapsed_seconds": 326.4249545140192,
+  "output": "/root/Recirculation/results/evaluations/gemma3_gsm_probe_serial_v2.json",
+  "status": "failed",
+  "suites": [
+    {
+      "benchmark": "gsm8k_platinum",
+      "completed_rows": 0,
+      "error": "AcceleratorError: CUDA error: device-side assert triggered\nSearch for `cudaErrorAssert' in https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__TYPES.html for more information.\nCUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.\nFor debugging consider passing CUDA_LAUNCH_BLOCKING=1\n",
+      "invalid_predictions": 0,
+      "metric_totals": {},
+      "metrics": {},
+      "name": "gsm8k_platinum_cot_llama",
+      "state": "failed",
+      "total_rows": 1
+    }
+  ]
+}

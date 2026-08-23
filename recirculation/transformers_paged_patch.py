@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import queue
 import os
+import sys
 import threading
 import time
 from collections import defaultdict
@@ -370,12 +371,25 @@ def patch_evalution_paged_prefix_seeding(
                     yield from original_generate(cohort, batch_size=cohort_width)
                 return
 
-            from .cuda_backend import CUDAConcurrentRunner
+            from .cuda_backend import CUDAPrefillRunner, CUDAConcurrentRunner
 
             prefix = torch.tensor(
                 [prefix_ids], dtype=torch.long, device=next(self.model.parameters()).device
             )
-            runner = CUDAConcurrentRunner(self.model, config, use_python_threads=True)
+            gil_enabled = bool(getattr(sys, "_is_gil_enabled", lambda: True)())
+            if gil_enabled:
+                LOG.info.once(
+                    "GIL=1 detected: using serial CUDAPrefillRunner for generation; "
+                    "CUDAConcurrentRunner is reserved for free-threaded GIL=0 Python."
+                )
+                runner = CUDAPrefillRunner(
+                    self.model,
+                    config,
+                    fused=True,
+                    allow_terminal_padding=True,
+                )
+            else:
+                runner = CUDAConcurrentRunner(self.model, config, use_python_threads=True)
             try:
                 _, cache, pending, _ = runner.prefill(prefix)
                 snapshot = runner.snapshot(cache, pending)
