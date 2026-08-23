@@ -72,11 +72,11 @@ Humanities flip accounting are in the
 
 ### Llama 3.2 1B Instruct
 
-| Full benchmark | Dense score | Dense accuracy | Recirculation score | Recirculation accuracy | Delta | Relative accuracy change |
+| Benchmark | Dense | Dense acc | Recirc | Recirc acc | Delta | Rel |
 |---|---:|---:|---:|---:|---:|---:|
-| GSM8K Platinum | 588/1,209 | 48.64% | **597/1,209** | **49.38%** | **+9 / +0.74 pp** | **+1.53%** |
-| MMLU-STEM | 1,263/3,153 | 40.06% | **1,268/3,153** | **40.22%** | **+5 / +0.16 pp** | **+0.40%** |
-| MMLU-Humanities | 2,027/4,705 | 43.08% | **2,034/4,705** | **43.23%** | **+7 / +0.15 pp** | **+0.35%** |
+| <span style="white-space:nowrap">GSM8K Platinum</span> | <span style="white-space:nowrap">588/1,209</span> | <span style="white-space:nowrap">48.64%</span> | <span style="white-space:nowrap"><strong>597/1,209</strong></span> | <span style="white-space:nowrap"><strong>49.38%</strong></span> | <span style="white-space:nowrap"><strong>+9 / +0.74 pp</strong></span> | <span style="white-space:nowrap"><strong>+1.53%</strong></span> |
+| <span style="white-space:nowrap">MMLU-STEM</span> | <span style="white-space:nowrap">1,263/3,153</span> | <span style="white-space:nowrap">40.06%</span> | <span style="white-space:nowrap"><strong>1,268/3,153</strong></span> | <span style="white-space:nowrap"><strong>40.22%</strong></span> | <span style="white-space:nowrap"><strong>+5 / +0.16 pp</strong></span> | <span style="white-space:nowrap"><strong>+0.40%</strong></span> |
+| <span style="white-space:nowrap">MMLU-Humanities</span> | <span style="white-space:nowrap">2,027/4,705</span> | <span style="white-space:nowrap">43.08%</span> | <span style="white-space:nowrap"><strong>2,034/4,705</strong></span> | <span style="white-space:nowrap"><strong>43.23%</strong></span> | <span style="white-space:nowrap"><strong>+7 / +0.15 pp</strong></span> | <span style="white-space:nowrap"><strong>+0.35%</strong></span> |
 
 Relative change is `(recirculation accuracy - dense accuracy) / dense accuracy`. The three suites have different
 scoring contracts, so their correct counts and accuracies must not be combined. On the 4,705 aligned Humanities rows,
@@ -100,11 +100,11 @@ The Gemma 3 1B Instruct evaluation uses the paper-corpus-selected `25→20`, `al
 path/alpha funnel, commands, shard provenance, and backend limitation are recorded in the
 [Gemma evaluation report](results/evaluations/gemma3_1b_paper_path_25_20_alpha004_eval_report.md).
 
-| Full benchmark | Dense score | Dense accuracy | Recirculation score | Recirculation accuracy | Delta | Relative accuracy change |
+| Benchmark | Dense | Dense acc | Recirc | Recirc acc | Delta | Rel |
 |---|---:|---:|---:|---:|---:|---:|
-| GSM8K Platinum | 540/1,209 | 44.67% | **554/1,209** | **45.82%** | **+14 / +1.16 pp** | **+2.59%** |
-| MMLU-STEM | 1,084/3,153 | 34.38% | **1,083/3,153** | **34.35%** | **−1 / −0.03 pp** | **−0.09%** |
-| MMLU-Humanities | 1,736/4,705 | 36.90% | **1,737/4,705** | **36.92%** | **+1 / +0.02 pp** | **+0.06%** |
+| <span style="white-space:nowrap">GSM8K Platinum</span> | <span style="white-space:nowrap">540/1,209</span> | <span style="white-space:nowrap">44.67%</span> | <span style="white-space:nowrap"><strong>554/1,209</strong></span> | <span style="white-space:nowrap"><strong>45.82%</strong></span> | <span style="white-space:nowrap"><strong>+14 / +1.16 pp</strong></span> | <span style="white-space:nowrap"><strong>+2.59%</strong></span> |
+| <span style="white-space:nowrap">MMLU-STEM</span> | <span style="white-space:nowrap">1,084/3,153</span> | <span style="white-space:nowrap">34.38%</span> | <span style="white-space:nowrap"><strong>1,083/3,153</strong></span> | <span style="white-space:nowrap"><strong>34.35%</strong></span> | <span style="white-space:nowrap"><strong>−1 / −0.03 pp</strong></span> | <span style="white-space:nowrap"><strong>−0.09%</strong></span> |
+| <span style="white-space:nowrap">MMLU-Humanities</span> | <span style="white-space:nowrap">1,736/4,705</span> | <span style="white-space:nowrap">36.90%</span> | <span style="white-space:nowrap"><strong>1,737/4,705</strong></span> | <span style="white-space:nowrap"><strong>36.92%</strong></span> | <span style="white-space:nowrap"><strong>+1 / +0.02 pp</strong></span> | <span style="white-space:nowrap"><strong>+0.06%</strong></span> |
 
 Gemma GSM8K recirculation and dense runs had zero invalid predictions. The dense GSM8K score is the
 correctness-validated eager, non-paged baseline; the native dense paged FlashAttention 2 continuous path emitted
