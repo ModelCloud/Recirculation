@@ -620,6 +620,34 @@ class PagedRecirculationForward:
             windows = getattr(cache, "sliding_windows", {})
             return int(windows.get(layer_index, 1) or 1)
 
+        def physical_for_position(group_index: int, sequence_index: int, position: int) -> torch.Tensor:
+            """Return a rolling-window address even when native prefill used trash slots.
+
+            Transformers' sliding allocator intentionally writes the prefix
+            tokens that fall outside the final window to a trash block during
+            a multi-token prefill.  Recirculation replays that prefill one
+            token at a time, so it must address the allocated rolling blocks
+            directly instead of inheriting those trash indices.
+            """
+            group_write = original_write_by_group[group_index]
+            window = group_window(group_index)
+            query_index = cu_q_values[sequence_index] + position
+            if window == 1:
+                return group_write[query_index]
+            managers = getattr(cache, "group_cache_managers", ())
+            manager = managers[group_index] if group_index < len(managers) else None
+            tables = list(getattr(manager, "block_table", {}).values()) if manager is not None else []
+            blocks = tables[sequence_index] if sequence_index < len(tables) else ()
+            logical = int(position) % window
+            block_index = logical // cache.block_size
+            if block_index < len(blocks):
+                return torch.as_tensor(
+                    blocks[block_index] * cache.block_size + logical % cache.block_size,
+                    device=group_write.device,
+                    dtype=group_write.dtype,
+                )
+            return group_write[query_index]
+
         def read_pieces(active_sequences: list[int], through_offsets: list[int]):
             if kwargs.get("block_table") is not None:
                 return None
@@ -630,10 +658,28 @@ class PagedRecirculationForward:
                 for sequence_index, through_offset in zip(
                     active_sequences, through_offsets, strict=True
                 ):
+                    if through_offset < 0:
+                        # A decode-time replay reads the already-cached
+                        # prefix; the native read tensor is the authoritative
+                        # address list for this case.
+                        native_reads = kwargs["read_index"][group_index]
+                        if len(active_sequences) == 1:
+                            pieces.append(native_reads)
+                        else:
+                            start = int(self._single_group(kwargs["cu_seq_lens_k"])[sequence_index].item())
+                            pieces.append(native_reads[start:])
+                        continue
                     query_start = cu_q_values[sequence_index]
-                    query_end = query_start + through_offset + 1
-                    query_begin = query_start + max(0, through_offset - window + 1)
-                    pieces.append(group_write[query_begin:query_end])
+                    del query_start
+                    start_position = max(0, through_offset - window + 1)
+                    pieces.append(
+                        torch.stack(
+                            [
+                                physical_for_position(group_index, sequence_index, position)
+                                for position in range(start_position, through_offset + 1)
+                            ]
+                        )
+                    )
                 group_pieces.append(torch.cat(pieces) if pieces else group_write[:0])
             return group_pieces
 
@@ -646,8 +692,13 @@ class PagedRecirculationForward:
             block_table = kwargs.get("block_table")
             if block_table is None:
                 current_writes_by_group = [
-                    group_write.index_select(0, query_tensor)
-                    for group_write in original_write_by_group
+                    torch.stack(
+                        [
+                            physical_for_position(group_index, sequence_index, offset)
+                            for sequence_index in sequence_indices
+                        ]
+                    )
+                    for group_index in range(len(original_write_by_group))
                 ]
             else:
                 representative_layers = {}
@@ -701,7 +752,7 @@ class PagedRecirculationForward:
                         previous_query = cu_q_values[sequence_index] + offset - 1
                         replay_query_indices.append(previous_query)
                         replay_physical.append(
-                            original_write_by_group[state.state_group][previous_query]
+                            physical_for_position(state.state_group, sequence_index, offset - 1)
                         )
                     else:
                         read_start = int(original_cu_k[sequence_index].item())
