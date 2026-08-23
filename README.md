@@ -72,7 +72,7 @@ Humanities flip accounting are in the
 
 ### Llama 3.2 1B Instruct
 
-| Benchmark | Dense | Dense acc | Recirc | Recirc acc | Delta | Rel |
+| <span style="white-space:nowrap">Benchmark</span> | <span style="white-space:nowrap">Dense</span> | <span style="white-space:nowrap">Dense acc</span> | <span style="white-space:nowrap">Recirc</span> | <span style="white-space:nowrap">Recirc acc</span> | <span style="white-space:nowrap">Delta</span> | <span style="white-space:nowrap">Rel</span> |
 |---|---:|---:|---:|---:|---:|---:|
 | <span style="white-space:nowrap">GSM8K Platinum</span> | <span style="white-space:nowrap">588/1,209</span> | <span style="white-space:nowrap">48.64%</span> | <span style="white-space:nowrap"><strong>597/1,209</strong></span> | <span style="white-space:nowrap"><strong>49.38%</strong></span> | <span style="white-space:nowrap"><strong>+9 / +0.74 pp</strong></span> | <span style="white-space:nowrap"><strong>+1.53%</strong></span> |
 | <span style="white-space:nowrap">MMLU-STEM</span> | <span style="white-space:nowrap">1,263/3,153</span> | <span style="white-space:nowrap">40.06%</span> | <span style="white-space:nowrap"><strong>1,268/3,153</strong></span> | <span style="white-space:nowrap"><strong>40.22%</strong></span> | <span style="white-space:nowrap"><strong>+5 / +0.16 pp</strong></span> | <span style="white-space:nowrap"><strong>+0.40%</strong></span> |
@@ -82,7 +82,7 @@ Relative change is `(recirculation accuracy - dense accuracy) / dense accuracy`.
 scoring contracts, so their correct counts and accuracies must not be combined. On the 4,705 aligned Humanities rows,
 recirculation produced 42 wrong→correct and 35 correct→wrong flips, a paired net of +7.
 
-| Evaluation detail | Value |
+| <span style="white-space:nowrap">Evaluation detail</span> | <span style="white-space:nowrap">Value</span> |
 |---|---|
 | Model | [`meta-llama/Llama-3.2-1B-Instruct`](https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct), dense and unquantized |
 | Evaluation datasets | [`madrylab/gsm8k-platinum`](https://huggingface.co/datasets/madrylab/gsm8k-platinum) full `main/test` split; [`cais/mmlu`](https://huggingface.co/datasets/cais/mmlu) full STEM and Humanities test groups |
@@ -100,7 +100,7 @@ The Gemma 3 1B Instruct evaluation uses the paper-corpus-selected `25→20`, `al
 path/alpha funnel, commands, shard provenance, and backend limitation are recorded in the
 [Gemma evaluation report](results/evaluations/gemma3_1b_paper_path_25_20_alpha004_eval_report.md).
 
-| Benchmark | Dense | Dense acc | Recirc | Recirc acc | Delta | Rel |
+| <span style="white-space:nowrap">Benchmark</span> | <span style="white-space:nowrap">Dense</span> | <span style="white-space:nowrap">Dense acc</span> | <span style="white-space:nowrap">Recirc</span> | <span style="white-space:nowrap">Recirc acc</span> | <span style="white-space:nowrap">Delta</span> | <span style="white-space:nowrap">Rel</span> |
 |---|---:|---:|---:|---:|---:|---:|
 | <span style="white-space:nowrap">GSM8K Platinum</span> | <span style="white-space:nowrap">540/1,209</span> | <span style="white-space:nowrap">44.67%</span> | <span style="white-space:nowrap"><strong>554/1,209</strong></span> | <span style="white-space:nowrap"><strong>45.82%</strong></span> | <span style="white-space:nowrap"><strong>+14 / +1.16 pp</strong></span> | <span style="white-space:nowrap"><strong>+2.59%</strong></span> |
 | <span style="white-space:nowrap">MMLU-STEM</span> | <span style="white-space:nowrap">1,084/3,153</span> | <span style="white-space:nowrap">34.38%</span> | <span style="white-space:nowrap"><strong>1,083/3,153</strong></span> | <span style="white-space:nowrap"><strong>34.35%</strong></span> | <span style="white-space:nowrap"><strong>−1 / −0.03 pp</strong></span> | <span style="white-space:nowrap"><strong>−0.09%</strong></span> |
@@ -111,6 +111,15 @@ correctness-validated eager, non-paged baseline; the native dense paged FlashAtt
 corrupted output and is not used as a score. See the
 [full Gemma report](results/evaluations/gemma3_1b_paper_path_25_20_alpha004_eval_report.md) for the exact commands,
 settings, and raw artifacts.
+
+| <span style="white-space:nowrap">Evaluation detail</span> | <span style="white-space:nowrap">Value</span> |
+|---|---|
+| Model | [`google/gemma-3-1b-it`](https://huggingface.co/google/gemma-3-1b-it), dense and unquantized |
+| Evaluation datasets | [`madrylab/gsm8k-platinum`](https://huggingface.co/datasets/madrylab/gsm8k-platinum) full `main/test` split; [`cais/mmlu`](https://huggingface.co/datasets/cais/mmlu) full STEM and Humanities test groups |
+| Evaluation rows | 1,209 GSM8K Platinum; 3,153 MMLU-STEM; 4,705 MMLU-Humanities |
+| Path/alpha search data | Local paper-aligned arXiv, C4, and PG-19 windows; disjoint from GSM8K and MMLU evaluation data |
+| Evaluation toolkit | [Evalution](https://github.com/ModelCloud/Evalution) `0.0.12`; GSM8K `cot_llama` natural generation; MMLU five-shot A/B/C/D likelihood |
+| CUDA execution | FP16. MMLU used paged FlashAttention 2, continuous batching, batch 128, and a 16,384-token budget. GSM8K recirculation used the validated CUDA prefill/snapshot path; dense GSM8K used eager, non-paged, non-continuous execution because native paged generation was corrupted. |
 
 ### Paper-style path screening
 
