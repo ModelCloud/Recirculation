@@ -22,6 +22,11 @@ independently verified.
   MMLU-STEM from 1,263/3,153 to 1,268/3,153, and MMLU-Humanities from 2,027/4,705 to 2,034/4,705.
   The matched dense baseline, exact commands, resolved CUDA settings, artifact checksums, and paired Humanities flips
   are recorded in the [full evaluation report](results/dense_baselines/llama32_1b_gsm8k_mmlu_dense_vs_recirc_10_1_alpha004_fp16.md).
+- 2026-08-23 — Completed full-split FP16 evaluation of Gemma 3 1B Instruct with the paper-corpus-selected
+  `25→20`, `alpha=0.04` intervention. Recirculation improved GSM8K Platinum from 540/1,209 to 554/1,209,
+  MMLU-Humanities from 1,736/4,705 to 1,737/4,705, and changed MMLU-STEM from 1,084/3,153 to 1,083/3,153.
+  Commands, shard provenance, backend caveats, and raw artifacts are recorded in the
+  [full Gemma evaluation report](results/evaluations/gemma3_1b_paper_path_25_20_alpha004_eval_report.md).
 - 2026-08-21 — Added Qwen3-8B support across Torch/CUDA inference and path/alpha screening, including its no-BOS
   tokenizer contract. Qwen3-8B recirculation runs faster on Torch/MPS and MLX (MLX preferred on Apple Silicon), with
   1.57x prefill speedup at matching outputs and 1.82x faster prompt processing from fixed-prefix reuse.
