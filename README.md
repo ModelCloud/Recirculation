@@ -17,16 +17,16 @@ independently verified.
 
 ## Progress
 
-- 2026-08-22 — Completed full-split FP16 evaluation of Llama 3.2 1B Instruct with the paper-corpus-selected
-  `10→1`, `alpha=0.04` intervention. Recirculation improved GSM8K Platinum from 588/1,209 to 597/1,209,
-  MMLU-STEM from 1,263/3,153 to 1,268/3,153, and MMLU-Humanities from 2,027/4,705 to 2,034/4,705.
-  The matched dense baseline, exact commands, resolved CUDA settings, artifact checksums, and paired Humanities flips
-  are recorded in the [full evaluation report](results/dense_baselines/llama32_1b_gsm8k_mmlu_dense_vs_recirc_10_1_alpha004_fp16.md).
 - 2026-08-23 — Completed full-split FP16 evaluation of Gemma 3 1B Instruct with the paper-corpus-selected
   `25→20`, `alpha=0.04` intervention. Recirculation improved GSM8K Platinum from 540/1,209 to 554/1,209,
   MMLU-Humanities from 1,736/4,705 to 1,737/4,705, and changed MMLU-STEM from 1,084/3,153 to 1,083/3,153.
   Commands, shard provenance, backend caveats, and raw artifacts are recorded in the
   [full Gemma evaluation report](results/evaluations/gemma3_1b_paper_path_25_20_alpha004_eval_report.md).
+- 2026-08-22 — Completed full-split FP16 evaluation of Llama 3.2 1B Instruct with the paper-corpus-selected
+  `10→1`, `alpha=0.04` intervention. Recirculation improved GSM8K Platinum from 588/1,209 to 597/1,209,
+  MMLU-STEM from 1,263/3,153 to 1,268/3,153, and MMLU-Humanities from 2,027/4,705 to 2,034/4,705.
+  The matched dense baseline, exact commands, resolved CUDA settings, artifact checksums, and paired Humanities flips
+  are recorded in the [full evaluation report](results/dense_baselines/llama32_1b_gsm8k_mmlu_dense_vs_recirc_10_1_alpha004_fp16.md).
 - 2026-08-21 — Added Qwen3-8B support across Torch/CUDA inference and path/alpha screening, including its no-BOS
   tokenizer contract. Qwen3-8B recirculation runs faster on Torch/MPS and MLX (MLX preferred on Apple Silicon), with
   1.57x prefill speedup at matching outputs and 1.82x faster prompt processing from fixed-prefix reuse.
@@ -68,36 +68,11 @@ branches before `t+1` enters the upper stack. The intervention changes neither m
 ## Evaluation status
 
 Results produced before the same-token replay correction measured a different delayed cross-token intervention and
-are withdrawn as recirculation evidence. The current result uses Llama 3.2 1B Instruct in FP16 and evaluates the full
-reported test splits with the paper-corpus-selected `10→1`, `alpha=0.04`, `beta=0.96` intervention. The dense and
-recirculation arms use the same model, prompts, scoring contracts, engine batch sizes, paged FlashAttention 2 settings,
-and MMLU token-budgeted cohorts. Full commands, environment versions, resolved settings, checksums, and row-level
-Humanities flip accounting are in the
-[detailed reproducibility report](results/dense_baselines/llama32_1b_gsm8k_mmlu_dense_vs_recirc_10_1_alpha004_fp16.md).
+are withdrawn as recirculation evidence. The model-specific results below evaluate the full reported test splits in
+FP16 with paper-corpus-selected interventions. Full commands, environment versions, resolved settings, checksums, and
+row-level accounting are in each model's detailed reproducibility report.
 
-### Llama 3.2 1B Instruct
-
-| <span style="white-space:nowrap">Benchmark</span> | <span style="white-space:nowrap">Dense</span> | <span style="white-space:nowrap">Dense acc</span> | <span style="white-space:nowrap">Recirc</span> | <span style="white-space:nowrap">Recirc acc</span> | <span style="white-space:nowrap">Delta</span> | <span style="white-space:nowrap">Rel</span> |
-|---|---:|---:|---:|---:|---:|---:|
-| <span style="white-space:nowrap">GSM8K Platinum</span> | <span style="white-space:nowrap">588/1,209</span> | <span style="white-space:nowrap">48.64%</span> | <span style="white-space:nowrap"><strong>597/1,209</strong></span> | <span style="white-space:nowrap"><strong>49.38%</strong></span> | <span style="white-space:nowrap"><strong>+9 / +0.74</strong></span> | <span style="white-space:nowrap"><strong>+1.53%</strong></span> |
-| <span style="white-space:nowrap">MMLU-STEM</span> | <span style="white-space:nowrap">1,263/3,153</span> | <span style="white-space:nowrap">40.06%</span> | <span style="white-space:nowrap"><strong>1,268/3,153</strong></span> | <span style="white-space:nowrap"><strong>40.22%</strong></span> | <span style="white-space:nowrap"><strong>+5 / +0.16</strong></span> | <span style="white-space:nowrap"><strong>+0.40%</strong></span> |
-| <span style="white-space:nowrap">MMLU-Humanities</span> | <span style="white-space:nowrap">2,027/4,705</span> | <span style="white-space:nowrap">43.08%</span> | <span style="white-space:nowrap"><strong>2,034/4,705</strong></span> | <span style="white-space:nowrap"><strong>43.23%</strong></span> | <span style="white-space:nowrap"><strong>+7 / +0.15</strong></span> | <span style="white-space:nowrap"><strong>+0.35%</strong></span> |
-
-Relative change is `(recirculation accuracy - dense accuracy) / dense accuracy`. The three suites have different
-scoring contracts, so their correct counts and accuracies must not be combined. On the 4,705 aligned Humanities rows,
-recirculation produced 42 wrong→correct and 35 correct→wrong flips, a paired net of +7.
-
-| <span style="white-space:nowrap">Evaluation detail</span> | <span style="white-space:nowrap">Value</span> |
-|---|---|
-| Model | [`meta-llama/Llama-3.2-1B-Instruct`](https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct), dense and unquantized |
-| Evaluation datasets | [`madrylab/gsm8k-platinum`](https://huggingface.co/datasets/madrylab/gsm8k-platinum) full `main/test` split; [`cais/mmlu`](https://huggingface.co/datasets/cais/mmlu) full STEM and Humanities test groups |
-| Evaluation rows | 1,209 GSM8K Platinum; 3,153 MMLU-STEM; 4,705 MMLU-Humanities |
-| Path/alpha search data | arXiv, C4, and PG-19 language-modeling windows; disjoint from GSM8K and MMLU evaluation data |
-| Evaluation toolkit | [Evalution](https://github.com/ModelCloud/Evalution) `0.0.12`; GSM8K `cot_llama` natural generation; MMLU five-shot A/B/C/D likelihood |
-| CUDA execution | FP16, paged FlashAttention 2, continuous batching, engine batch 32, MMLU suite batch 128, 512-prompt scoring cohorts |
-
-The GSM8K delta is provisional: two unseeded dense runs differed on five row scores and three aggregate correct
-answers. MMLU reproduced exactly; see the [detailed report](results/dense_baselines/llama32_1b_gsm8k_mmlu_dense_vs_recirc_10_1_alpha004_fp16.md).
+---
 
 ### Gemma 3 1B Instruct
 
@@ -125,6 +100,32 @@ settings, and raw artifacts.
 | Path/alpha search data | Local paper-aligned arXiv, C4, and PG-19 windows; disjoint from GSM8K and MMLU evaluation data |
 | Evaluation toolkit | [Evalution](https://github.com/ModelCloud/Evalution) `0.0.12`; GSM8K `cot_llama` natural generation; MMLU five-shot A/B/C/D likelihood |
 | CUDA execution | FP16. MMLU used paged FlashAttention 2, continuous batching, batch 128, and a 16,384-token budget. GSM8K recirculation used the validated CUDA prefill/snapshot path; dense GSM8K used eager, non-paged, non-continuous execution because native paged generation was corrupted. |
+
+---
+
+### Llama 3.2 1B Instruct
+
+| <span style="white-space:nowrap">Benchmark</span> | <span style="white-space:nowrap">Dense</span> | <span style="white-space:nowrap">Dense acc</span> | <span style="white-space:nowrap">Recirc</span> | <span style="white-space:nowrap">Recirc acc</span> | <span style="white-space:nowrap">Delta</span> | <span style="white-space:nowrap">Rel</span> |
+|---|---:|---:|---:|---:|---:|---:|
+| <span style="white-space:nowrap">GSM8K Platinum</span> | <span style="white-space:nowrap">588/1,209</span> | <span style="white-space:nowrap">48.64%</span> | <span style="white-space:nowrap"><strong>597/1,209</strong></span> | <span style="white-space:nowrap"><strong>49.38%</strong></span> | <span style="white-space:nowrap"><strong>+9 / +0.74</strong></span> | <span style="white-space:nowrap"><strong>+1.53%</strong></span> |
+| <span style="white-space:nowrap">MMLU-STEM</span> | <span style="white-space:nowrap">1,263/3,153</span> | <span style="white-space:nowrap">40.06%</span> | <span style="white-space:nowrap"><strong>1,268/3,153</strong></span> | <span style="white-space:nowrap"><strong>40.22%</strong></span> | <span style="white-space:nowrap"><strong>+5 / +0.16</strong></span> | <span style="white-space:nowrap"><strong>+0.40%</strong></span> |
+| <span style="white-space:nowrap">MMLU-Humanities</span> | <span style="white-space:nowrap">2,027/4,705</span> | <span style="white-space:nowrap">43.08%</span> | <span style="white-space:nowrap"><strong>2,034/4,705</strong></span> | <span style="white-space:nowrap"><strong>43.23%</strong></span> | <span style="white-space:nowrap"><strong>+7 / +0.15</strong></span> | <span style="white-space:nowrap"><strong>+0.35%</strong></span> |
+
+Relative change is `(recirculation accuracy - dense accuracy) / dense accuracy`. The three suites have different
+scoring contracts, so their correct counts and accuracies must not be combined. On the 4,705 aligned Humanities rows,
+recirculation produced 42 wrong→correct and 35 correct→wrong flips, a paired net of +7.
+
+| <span style="white-space:nowrap">Evaluation detail</span> | <span style="white-space:nowrap">Value</span> |
+|---|---|
+| Model | [`meta-llama/Llama-3.2-1B-Instruct`](https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct), dense and unquantized |
+| Evaluation datasets | [`madrylab/gsm8k-platinum`](https://huggingface.co/datasets/madrylab/gsm8k-platinum) full `main/test` split; [`cais/mmlu`](https://huggingface.co/datasets/cais/mmlu) full STEM and Humanities test groups |
+| Evaluation rows | 1,209 GSM8K Platinum; 3,153 MMLU-STEM; 4,705 MMLU-Humanities |
+| Path/alpha search data | arXiv, C4, and PG-19 language-modeling windows; disjoint from GSM8K and MMLU evaluation data |
+| Evaluation toolkit | [Evalution](https://github.com/ModelCloud/Evalution) `0.0.12`; GSM8K `cot_llama` natural generation; MMLU five-shot A/B/C/D likelihood |
+| CUDA execution | FP16, paged FlashAttention 2, continuous batching, engine batch 32, MMLU suite batch 128, 512-prompt scoring cohorts |
+
+The GSM8K delta is provisional: two unseeded dense runs differed on five row scores and three aggregate correct
+answers. MMLU reproduced exactly; see the [detailed report](results/dense_baselines/llama32_1b_gsm8k_mmlu_dense_vs_recirc_10_1_alpha004_fp16.md).
 
 ### Paper-style path screening
 
