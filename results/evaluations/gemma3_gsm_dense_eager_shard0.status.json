@@ -1,0 +1,22 @@
+{
+  "active_suite": null,
+  "elapsed_seconds": 624.91002173163,
+  "output": "/root/Recirculation/results/evaluations/gemma3_gsm_dense_eager_shard0.json",
+  "status": "complete",
+  "suites": [
+    {
+      "benchmark": "gsm8k_platinum",
+      "completed_rows": 303,
+      "invalid_predictions": 0,
+      "metric_totals": {
+        "acc,num": 136.0
+      },
+      "metrics": {
+        "acc,num": 0.44884488448844884
+      },
+      "name": "gsm8k_platinum_cot_llama",
+      "state": "complete",
+      "total_rows": 303
+    }
+  ]
+}

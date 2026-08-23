@@ -1,0 +1,19 @@
+{
+  "status": "complete",
+  "output": "/root/Recirculation/results/evaluations/gemma3_1b_gsm8k_recirc_best_fp16.json",
+  "active_suite": null,
+  "elapsed_seconds": 6666.496992405504,
+  "suites": [
+    {
+      "benchmark": "gsm8k_platinum",
+      "name": "gsm8k_platinum_cot_llama",
+      "state": "complete",
+      "completed_rows": 1209,
+      "total_rows": 1209,
+      "invalid_predictions": 0,
+      "metrics": {
+        "acc,num": 0.45822994210090984
+      }
+    }
+  ]
+}

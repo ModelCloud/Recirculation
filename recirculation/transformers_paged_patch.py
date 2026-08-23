@@ -932,6 +932,8 @@ class RecirculationContinuousBatchingManager:
         self._outputs: queue.Queue[GenerationOutput] = queue.Queue()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self._shared_prefix_ids: tuple[int, ...] = ()
+        self._shared_prefix_snapshot = None
 
     def add_request(
         self,
@@ -1027,6 +1029,64 @@ class RecirculationContinuousBatchingManager:
                 break
         return pending
 
+    def _generate_batch(self, batch, max_new_tokens: int):
+        """Generate a cohort while reusing its exact shared chat prefix."""
+
+        from .cuda_backend import CUDAPrefillRunner
+
+        if not isinstance(self.runner, CUDAPrefillRunner):
+            tokens = torch.tensor(
+                [request[1] for request in batch],
+                dtype=torch.long,
+                device=self.runner.device,
+            )
+            return self.runner.generate(
+                tokens,
+                max_new_tokens=max_new_tokens,
+                eos_token_id=getattr(self.generation_config, "eos_token_id", None),
+            ), tokens.shape[1]
+
+        prompt_rows = [request[1] for request in batch]
+        # GSM8K's fixed eight-shot chat contract has a stable 1024-token
+        # prefix even when the request queue delivers rows one at a time.
+        # Prefer that fixed block so the snapshot survives across cohorts;
+        # fall back to the exact intersection for arbitrary prompts.
+        fixed_prefix = prompt_rows[0][:1024] if len(prompt_rows[0]) > 1024 else []
+        if fixed_prefix and all(len(row) > 1024 and row[:1024] == fixed_prefix for row in prompt_rows):
+            prefix_ids = fixed_prefix
+        else:
+            prefix_ids = _common_block_prefix(prompt_rows, 256)
+        # Leave a real suffix token so the restored snapshot has a readout for
+        # every request.  The 8-shot GSM8K prompts normally share 1024 tokens.
+        if len(prefix_ids) < 256 or any(len(request[1]) <= len(prefix_ids) for request in batch):
+            tokens = torch.tensor(
+                [request[1] for request in batch],
+                dtype=torch.long,
+                device=self.runner.device,
+            )
+            return self.runner.generate(
+                tokens,
+                max_new_tokens=max_new_tokens,
+                eos_token_id=getattr(self.generation_config, "eos_token_id", None),
+            ), tokens.shape[1]
+
+        prefix_key = tuple(prefix_ids)
+        if prefix_key != self._shared_prefix_ids:
+            prefix = torch.tensor([prefix_ids], dtype=torch.long, device=self.runner.device)
+            _, cache, pending, _ = self.runner.prefill(prefix)
+            self._shared_prefix_snapshot = self.runner.snapshot(cache, pending)
+            self._shared_prefix_ids = prefix_key
+            torch.cuda.synchronize(self.runner.device)
+        suffix_rows = [request[1][len(prefix_ids) :] for request in batch]
+        suffix = torch.tensor(suffix_rows, dtype=torch.long, device=self.runner.device)
+        generated = self.runner.generate_from_snapshot(
+            suffix,
+            self._shared_prefix_snapshot,
+            max_new_tokens=max_new_tokens,
+            eos_token_id=getattr(self.generation_config, "eos_token_id", None),
+        )
+        return generated, suffix.shape[1]
+
     def _run_generation_loop(self) -> None:
         device_context = (
             torch.cuda.device(self.runner.device)
@@ -1044,18 +1104,9 @@ class RecirculationContinuousBatchingManager:
                 for (_prompt_length, max_new_tokens), requests in groups.items():
                     for start in range(0, len(requests), self.max_requests):
                         batch = requests[start : start + self.max_requests]
-                        tokens = torch.tensor(
-                            [request[1] for request in batch],
-                            dtype=torch.long,
-                            device=self.runner.device,
-                        )
                         try:
-                            generated = self.runner.generate(
-                                tokens,
-                                max_new_tokens=max_new_tokens,
-                                eos_token_id=getattr(self.generation_config, "eos_token_id", None),
-                            )
-                            continuations = generated[:, tokens.shape[1] :].detach().cpu().tolist()
+                            generated, prompt_length = self._generate_batch(batch, max_new_tokens)
+                            continuations = generated[:, prompt_length:].detach().cpu().tolist()
                             for (request_id, prompt_ids, _limit), continuation in zip(
                                 batch, continuations, strict=True
                             ):

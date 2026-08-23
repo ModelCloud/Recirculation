@@ -1,0 +1,17 @@
+{
+  "status": "complete",
+  "active_suite": "gsm8k_platinum",
+  "suites": [
+    {
+      "name": "gsm8k_platinum",
+      "completed_rows": 1209,
+      "total_rows": 1209,
+      "metrics": {
+        "acc,num": 0.4466501240694789
+      },
+      "invalid_predictions": 0
+    }
+  ],
+  "elapsed_seconds": 624.8800213718787,
+  "updated_at": 1787460626.2664123
+}

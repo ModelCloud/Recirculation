@@ -2,9 +2,7 @@
 
 Model: `/local-models/gemma-3-1b-it` (FP16). The path/alpha search selected the
 robust paper-aligned arm `25->20, alpha=0.04` from
-`results/gemma3_1b_paper_exact_1472x1024_path_alpha/race/`. The MMLU runs below
-use the same CUDA settings; the dense run differs only by omitting
-`--path/--alpha`.
+`results/gemma3_1b_paper_exact_1472x1024_path_alpha/race/`.
 
 ## MMLU results
 
@@ -45,12 +43,64 @@ VECLIB_MAXIMUM_THREADS=16 NUMEXPR_NUM_THREADS=16 \
   --output results/evaluations/gemma3_1b_mmlu_dense_fp16.json
 ```
 
-## GSM8K status
+## GSM8K-Platinum results
 
-The full GSM8K-Platinum score is **not recorded**. A one-row natural-generation
-probe with the same path, chat template, and paged FA2 configuration failed at
-runtime with a CUDA device-side assertion after 326.4 s (`gemma3_gsm_probe_serial_v2.status.json`). Earlier paged runs that emitted gibberish are intentionally not treated as scores. The generation path must be fixed and revalidated before launching a 1209-row comparison.
+| Suite | Rows | Recirculation | Dense correctness baseline | Delta |
+|---|---:|---:|---:|---:|
+| GSM8K-Platinum | 1209 | 554/1209 (45.82%) | 540/1209 (44.67%) | +14 / +1.16 pp |
 
-The evaluator did confirm the intended runtime selection (`paged|flash_attention_2`,
-continuous batching). With GIL=1, the new serial `CUDAPrefillRunner` fallback is
-used; `CUDAConcurrentRunner` Python workers are reserved for GIL=0.
+Both full runs used the same model, FP16 dtype, GSM8K-Platinum split, eight-shot
+chat template, row order, and 256-token generation limit. Recirculation used
+`25->20, alpha=0.04`, while dense omitted recurrence. Four row partitions were
+run in parallel and merged with exact global coverage `0..1208`; both have zero
+invalid predictions. Recirculation wall time was 6666.5 s (0.181 rows/s across
+the four shards); the dense eager baseline wall time was 624.9 s (1.935 rows/s).
+
+The dense correctness baseline deliberately uses eager, non-paged,
+non-continuous generation. A native dense run with paged FlashAttention-2 and
+continuous batching completed but produced corrupted/repetitive outputs (623
+invalid rows and 11/1209 correct), so it is retained only as a diagnostic and
+is not used for the score comparison. This backend limitation is recorded here
+so the result is reproducible rather than silently presenting an invalid
+baseline.
+
+Both runs used four explicit `row_indices` partitions: `0..302`, `303..605`,
+`606..908`, and `909..1208`. The following command template was run once per
+partition, with `ROW_INDICES_JSON` set to the corresponding JSON array and
+`SHARD` set to `0`, `1`, `2`, or `3`:
+
+Recirculation shard command:
+
+```bash
+HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
+OMP_NUM_THREADS=16 OPENBLAS_NUM_THREADS=16 MKL_NUM_THREADS=16 BLIS_NUM_THREADS=16 \
+PYTHONUNBUFFERED=1 /root/venv-py3.14t-gil0/bin/python3 scripts/evaluate.py run \
+  --model /local-models/gemma-3-1b-it --device cuda \
+  --attention-backend flash_attention_2 --continuous-batching --paged-attention \
+  --benchmark gsm8k_platinum --benchmark-arg gsm8k_platinum.row_indices="$ROW_INDICES_JSON" \
+  --path 25:20 --alpha 0.04 --batch-size 8 --max-batch-tokens 16384 \
+  --report-every-seconds 30 \
+  --output results/evaluations/gemma3_gsm_recirc_shard${SHARD}.json
+```
+
+Dense baseline shard command (the only semantic change is recurrence disabled;
+eager/non-paged/non-continuous is required for valid Gemma generation):
+
+```bash
+HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
+OMP_NUM_THREADS=16 OPENBLAS_NUM_THREADS=16 MKL_NUM_THREADS=16 BLIS_NUM_THREADS=16 \
+PYTHONUNBUFFERED=1 /root/venv-py3.14t-gil0/bin/python3 scripts/evaluate.py run \
+  --model /local-models/gemma-3-1b-it --device cuda \
+  --attention-backend eager --no-paged-attention --no-continuous-batching \
+  --benchmark gsm8k_platinum --benchmark-arg gsm8k_platinum.row_indices="$ROW_INDICES_JSON" \
+  --batch-size 8 --max-batch-tokens 16384 \
+  --report-every-seconds 30 \
+  --output results/evaluations/gemma3_gsm_dense_eager_shard${SHARD}.json
+```
+
+Merged artifacts are `gemma3_1b_gsm8k_recirc_best_fp16.json` and
+`gemma3_1b_gsm8k_dense_fp16.json`, with matching `.status.json` files. The
+per-shard JSON and logs are retained alongside them.
+
+With GIL=1, the serial `CUDAPrefillRunner` fallback is used;
+`CUDAConcurrentRunner` Python workers are reserved for GIL=0.

@@ -1363,8 +1363,8 @@ def _dense_evalution_main(argv: list[str]) -> int:
             else:
                 from recirculation.cuda_backend import FusedNormMix
                 from recirculation.transformers_paged_patch import (
-                    patch_evalution_paged_prefix_seeding,
                     patch_model_paged_recirculation,
+                    patch_transformers_continuous_batching,
                 )
 
                 ensure_evaluation_session()
@@ -1372,6 +1372,22 @@ def _dense_evalution_main(argv: list[str]) -> int:
                     zip(args.benchmark, suites, strict=True)
                 ):
                     if benchmark == "gsm8k_platinum":
+                        from recirculation.cuda_backend import CUDAPrefillRunner, CUDAConcurrentRunner
+
+                        if bool(getattr(sys, "_is_gil_enabled", lambda: True)()):
+                            generation_runner = CUDAPrefillRunner(
+                                evaluation._session.model,
+                                recirculation_config,
+                                fused=True,
+                                allow_terminal_padding=True,
+                            )
+                        else:
+                            generation_runner = CUDAConcurrentRunner(
+                                evaluation._session.model,
+                                recirculation_config,
+                                use_python_threads=True,
+                            )
+
                         @contextmanager
                         def paged_generation_patch():
                             with (
@@ -1380,14 +1396,15 @@ def _dense_evalution_main(argv: list[str]) -> int:
                                     recirculation_config,
                                     FusedNormMix(),
                                 ),
-                                patch_evalution_paged_prefix_seeding(
-                                    evaluation._session,
-                                    recirculation_config,
-                                    block_size=args.paged_block_size,
-                                    preview_size=args.batch_size,
+                                patch_transformers_continuous_batching(
+                                    evaluation._session.model,
+                                    generation_runner,
                                 ),
                             ):
-                                yield
+                                try:
+                                    yield
+                                finally:
+                                    generation_runner.close()
 
                         patch = paged_generation_patch()
                     else:

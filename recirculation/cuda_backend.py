@@ -70,6 +70,20 @@ def _trim_recorded_upper_cache(cache, top_stack_start: int) -> None:
             cache_layer.crop(0)
 
 
+def _normalize_eos_token_ids(eos_token_id):
+    """Normalize Transformers' scalar-or-list EOS contract for CUDA decode."""
+
+    if eos_token_id is None:
+        return None
+    if isinstance(eos_token_id, (list, tuple, set)):
+        values = tuple(int(value) for value in eos_token_id)
+    else:
+        values = (int(eos_token_id),)
+    if not values:
+        return None
+    return values
+
+
 def log_concurrency_mode() -> bool:
     """Log and return the GIL mode used by the concurrent CUDA scheduler."""
 
@@ -350,6 +364,15 @@ class CUDAPrefillRunner:
         if tokens.ndim != 2 or tokens.shape[0] == 0 or tokens.shape[1] == 0:
             raise ValueError("prefill requires tokens with shape [sequence] or [batch, sequence]")
         prefix_length = 0 if cache is None else cache.get_seq_length()
+        # DynamicCache reports the first layer's logical length, which can be
+        # zero for a restored Gemma grouped/sliding cache even though the
+        # recurrent state and other layer groups already contain the prefix.
+        # The pending state is authoritative for snapshot continuation.
+        if pending is not None:
+            pending_length = pending.input_step + 1
+            if pending_length < 1:
+                raise ValueError("pending recirculation state has an invalid input step")
+            prefix_length = pending_length
         total_length = prefix_length + tokens.shape[1]
         if attention_mask is None:
             attention_mask = torch.ones((tokens.shape[0], total_length), dtype=torch.long, device=device)
@@ -409,6 +432,14 @@ class CUDAPrefillRunner:
                 pending.source_residual.repeat_interleave(repeats, dim=0),
                 pending.input_step,
             )
+        # DynamicSlidingWindowLayer.update() reconstructs only the retained
+        # window and consequently resets cumulative_length to the physical
+        # tensor length. Restore the logical position so RoPE, KV offsets, and
+        # the next recurrent replay continue at the original token index.
+        logical_length = pending.input_step + 1
+        for layer in cache.layers:
+            if getattr(layer, "is_sliding", False):
+                layer.cumulative_length = logical_length
         return cache, pending
 
     def prefill_from_snapshot(
@@ -458,14 +489,57 @@ class CUDAPrefillRunner:
         generated[:, : prompt.shape[1]] = prompt
         if max_new_tokens == 0:
             return generated[:, : prompt.shape[1]]
+        eos_ids = _normalize_eos_token_ids(eos_token_id)
         finished = torch.zeros(prompt.shape[0], dtype=torch.bool, device=prompt.device)
         for offset in range(max_new_tokens):
             token = logits[:, -1, :].argmax(dim=-1, keepdim=True)
-            if eos_token_id is not None:
-                token = torch.where(finished[:, None], eos_token_id, token)
-                finished |= token[:, 0] == eos_token_id
+            if eos_ids is not None:
+                token = torch.where(finished[:, None], eos_ids[0], token)
+                finished |= torch.isin(
+                    token[:, 0], torch.tensor(eos_ids, device=token.device, dtype=token.dtype)
+                )
             generated[:, prompt.shape[1] + offset : prompt.shape[1] + offset + 1] = token
-            if eos_token_id is not None and bool(finished.all()):
+            if eos_ids is not None and bool(finished.all()):
+                break
+            logits, cache, pending, _ = self.prefill(token, cache=cache, pending=pending)
+        return generated[:, : prompt.shape[1] + offset + 1]
+
+    @torch.inference_mode()
+    def generate_from_snapshot(
+        self,
+        input_ids: torch.Tensor,
+        snapshot: CUDAPrefillSnapshot,
+        *,
+        max_new_tokens: int,
+        eos_token_id: int | None = None,
+    ) -> torch.Tensor:
+        """Generate after restoring a shared-prefix KV/recurrent snapshot."""
+
+        if max_new_tokens < 0:
+            raise ValueError("max_new_tokens must be non-negative")
+        prompt = input_ids.to(device=self.device, dtype=torch.long)
+        if prompt.ndim != 2 or prompt.shape[0] < 1 or prompt.shape[1] < 1:
+            raise ValueError("generate_from_snapshot requires [batch, suffix] input_ids")
+        logits, cache, pending, _ = self.prefill_from_snapshot(prompt, snapshot)
+        generated = torch.empty(
+            (prompt.shape[0], prompt.shape[1] + max_new_tokens),
+            dtype=torch.long,
+            device=prompt.device,
+        )
+        generated[:, : prompt.shape[1]] = prompt
+        if max_new_tokens == 0:
+            return generated[:, : prompt.shape[1]]
+        eos_ids = _normalize_eos_token_ids(eos_token_id)
+        finished = torch.zeros(prompt.shape[0], dtype=torch.bool, device=prompt.device)
+        for offset in range(max_new_tokens):
+            token = logits[:, -1, :].argmax(dim=-1, keepdim=True)
+            if eos_ids is not None:
+                token = torch.where(finished[:, None], eos_ids[0], token)
+                finished |= torch.isin(
+                    token[:, 0], torch.tensor(eos_ids, device=token.device, dtype=token.dtype)
+                )
+            generated[:, prompt.shape[1] + offset : prompt.shape[1] + offset + 1] = token
+            if eos_ids is not None and bool(finished.all()):
                 break
             logits, cache, pending, _ = self.prefill(token, cache=cache, pending=pending)
         return generated[:, : prompt.shape[1] + offset + 1]
@@ -1183,16 +1257,19 @@ class CUDAConcurrentRunner:
         generated[:, :prompt_length] = prompt
         if max_new_tokens == 0:
             return generated[:, :prompt_length]
+        eos_ids = _normalize_eos_token_ids(eos_token_id)
         finished = torch.zeros(batch_size, dtype=torch.bool, device=self.device)
         for offset in range(max_new_tokens):
             token = logits[:, -1, :].argmax(dim=-1, keepdim=True)
-            if eos_token_id is not None:
+            if eos_ids is not None:
                 # Keep completed rows inert while the remaining rows continue. Repeating EOS is
                 # removed by special-token decoding and preserves each row's single-item output.
-                token = torch.where(finished[:, None], eos_token_id, token)
-                finished |= token[:, 0] == eos_token_id
+                token = torch.where(finished[:, None], eos_ids[0], token)
+                finished |= torch.isin(
+                    token[:, 0], torch.tensor(eos_ids, device=token.device, dtype=token.dtype)
+                )
             generated[:, prompt_length + offset : prompt_length + offset + 1] = token
-            if eos_token_id is not None and bool(finished.all()):
+            if eos_ids is not None and bool(finished.all()):
                 break
             logits, cache, pending = self.step(token, cache, pending)
         return generated[:, : prompt_length + offset + 1]
